@@ -1,0 +1,30 @@
+# Editors
+.DS_Store
+.vscode/
+.idea/
+.*.swp
+
+# Rust/Cargo
+/target/
+/target_codex/
+
+# Local traces and captures
+*.log
+*.qlog
+*.perf
+/logs/
+/log/
+/qlog/
+/qlogs/
+/target/machina-captures/
+
+# Temporary build artifacts
+*.d
+*.o
+core
+
+# Local environments
+.env
+.venv/
+venv/
+log.txt

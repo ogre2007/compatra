@@ -1,0 +1,21 @@
+[package]
+name = "machina"
+version = "0.1.0"
+edition = "2021"
+description = "Machina - macOS-focused Mach-O emulation in Rust"
+license = "GPL-2.0"
+build = "build.rs"
+
+[dependencies]
+bitflags = "2"
+thiserror = "1"
+log = "0.4"
+libc = "0.2"
+byteorder = "1"
+unicorn-engine-sys = "2.1.5"
+unicorn-engine = "2.1.5"
+
+
+[lib]
+name = "machina"
+path = "src/lib.rs"
