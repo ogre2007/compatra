@@ -10,6 +10,7 @@
 ## Code organization rules
 
 - Keep architecture-neutral logic outside arm64-specific files when possible.
+- `src/macos/core` is for architecture-neutral orchestration, tracing, and runtime/plugin façades.
 - `src/macos/arch_arm64` is the grouped entrypoint for arm64-only implementation details.
 - `src/macos/platform_apple` is for CoreFoundation, Security, XPC, and other Apple-facing synthetic runtime services.
 - `src/macos/guest_model` is for guest filesystem, guest memory, and synthetic OS-visible resources.

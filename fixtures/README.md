@@ -19,3 +19,7 @@ This corpus is intentionally small and is used for:
 
 Current execution and analysis notes live in
 [docs/sample-status.md](D:/dev/quiling/qiling/docs/sample-status.md).
+
+The AMOS fixture is also used by CI as an integration check: emulator output
+must show that execution reaches stealer logic and attempts to access private
+browser/wallet paths.

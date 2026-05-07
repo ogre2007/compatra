@@ -1262,35 +1262,3 @@ fn read_u64(cursor: &mut Cursor<&[u8]>, big_endian: bool) -> Result<u64, MacOsEr
         u64::from_le_bytes(bytes)
     })
 }
-
-fn read_u64_from_slice(data: &[u8], offset: usize, big_endian: bool) -> Result<u64, MacOsError> {
-    if offset + 8 > data.len() {
-        return Err(MacOsError::LoaderError(format!(
-            "Not enough data to read u64 at offset {} (have {} bytes)",
-            offset,
-            data.len()
-        )));
-    }
-    let bytes = &data[offset..offset + 8];
-    Ok(if big_endian {
-        u64::from_be_bytes(bytes.try_into().unwrap())
-    } else {
-        u64::from_le_bytes(bytes.try_into().unwrap())
-    })
-}
-
-fn read_u32_from_slice(data: &[u8], offset: usize, big_endian: bool) -> Result<u32, MacOsError> {
-    if offset + 4 > data.len() {
-        return Err(MacOsError::LoaderError(format!(
-            "Not enough data to read u32 at offset {} (have {} bytes)",
-            offset,
-            data.len()
-        )));
-    }
-    let bytes = &data[offset..offset + 4];
-    Ok(if big_endian {
-        u32::from_be_bytes(bytes.try_into().unwrap())
-    } else {
-        u32::from_le_bytes(bytes.try_into().unwrap())
-    })
-}

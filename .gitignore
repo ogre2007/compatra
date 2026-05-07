@@ -28,3 +28,4 @@ core
 .venv/
 venv/
 log.txt
+amos-trace.jsonl

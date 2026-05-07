@@ -16,6 +16,7 @@ is:
 
 - [src/bin/machina.rs](D:/dev/quiling/qiling/src/bin/machina.rs): CLI entrypoint
 - [src/macos](D:/dev/quiling/qiling/src/macos): macOS emulation code
+- [src/macos/core/mod.rs](D:/dev/quiling/qiling/src/macos/core/mod.rs): architecture-neutral emulation pipeline, tracing, and runtime façades
 - [src/macos/arch_arm64/mod.rs](D:/dev/quiling/qiling/src/macos/arch_arm64/mod.rs): grouped view of arm64-specific modules
 - [src/macos/platform_apple/mod.rs](D:/dev/quiling/qiling/src/macos/platform_apple/mod.rs): grouped view of Apple compatibility layers
 - [src/macos/guest_model/mod.rs](D:/dev/quiling/qiling/src/macos/guest_model/mod.rs): grouped view of guest filesystem and memory helpers
@@ -55,6 +56,20 @@ cargo build --bin machina
 cargo run --bin machina -- fixtures\macos\bin\arm64_hello
 ```
 
+## Local AMOS integration check
+
+Generate a JSONL trace:
+
+```powershell
+cargo run --bin machina -- fixtures\macos\bin\2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho > amos-trace.jsonl
+```
+
+Validate that execution reached stealer logic and private-file access:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\ci\check_amos_trace.ps1 amos-trace.jsonl
+```
+
 ## Sample corpus
 
 The project keeps a small local corpus in
@@ -65,7 +80,7 @@ Two important analysis targets today:
 - `2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho`
   AMOS stealer sample used to drive browser/wallet compatibility work
 - `0393e898f4425195d780346634e619b80f283a8223b9724db56dee87afbba486.macho`
-  large arm64 sample with accompanying reverse-engineering artifacts
+  large arm64 sample used for deeper runtime and synthetic API coverage work
 
 See [fixtures/README.md](D:/dev/quiling/qiling/fixtures/README.md) and
 [docs/sample-status.md](D:/dev/quiling/qiling/docs/sample-status.md).

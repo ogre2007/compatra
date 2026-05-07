@@ -10,7 +10,6 @@ macro_rules! println {
     };
 }
 /// for Machina's macOS userland emulation.
-
 use crate::macos::imports::{
     notify_synthetic_fd_close, notify_synthetic_fd_read, notify_synthetic_fd_write,
 };

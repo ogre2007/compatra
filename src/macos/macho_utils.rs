@@ -127,10 +127,6 @@ pub fn reload_file_backed_range(
         }
         offset += chunk_len;
     }
-    println!(
-        "[PATCH][arm64] Reloaded {} at 0x{:X} (size 0x{:X})",
-        label, addr, size
-    );
     Ok(())
 }
 

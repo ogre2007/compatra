@@ -468,7 +468,7 @@ pub fn install_arm64_process_imports(
                 } else {
                     0
                 };
-                let lr_code = emu.read_memory(lr.saturating_sub(8), 24).unwrap_or_default();
+                let _lr_code = emu.read_memory(lr.saturating_sub(8), 24).unwrap_or_default();
                 let current_tid = thread_runtime
                     .lock()
                     .ok()

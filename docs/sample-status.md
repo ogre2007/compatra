@@ -22,6 +22,7 @@ emulator behavior.
   - reaches `_main.GrabFirefox`
   - probes browser and wallet paths
   - reads synthetic fallback content from guest filesystem policy
+  - CI regression guard verifies these milestones from JSONL trace output on Ubuntu
 - Important implication:
   - emulator is already past bootstrap/runtime-only execution and into real stealer logic
   - next compatibility work should focus on richer profile traversal and artifact semantics rather than simple `ENOENT` fixes

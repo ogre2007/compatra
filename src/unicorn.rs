@@ -19,9 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use unicorn_engine::{unicorn_const::HookType, Arch, MemType, Mode, Prot, RegisterARM64, Unicorn};
 
-use crate::macos::arm64_runner_support::{
-    arm64_memory_event, arm64_thread_event, emit_arm64_event,
-};
+use crate::macos::arm64_runner_support::{arm64_memory_event, emit_arm64_event};
 use crate::macos::os::{ArchType, Emulator as EmulatorTrait, LogLevel, MacOsError};
 use crate::SharedTraceBus;
 
