@@ -123,10 +123,10 @@ pub fn materialize_synthetic_file_bytes(raw_path: &str, size: usize) -> Vec<u8> 
         || lower.ends_with(".log")
         || lower.ends_with(".txt")
     {
-        return pseudo_random_bytes(raw_path, size);
+        return pseudo_random_bytes(raw_path, size.clamp(256, 1024));
     }
     if lower.contains("wallet") || lower.contains("seed") || lower.contains("key") {
-        return pseudo_random_bytes(raw_path, size.max(1024));
+        return pseudo_random_bytes(raw_path, size.clamp(512, 1024));
     }
     pseudo_random_bytes(raw_path, size)
 }
@@ -207,8 +207,8 @@ fn synthetic_directory_entries(raw_path: &str) -> Vec<GuestDirectoryEntry> {
         push_file(&mut entries, "CURRENT", 16);
         push_file(&mut entries, "MANIFEST-000001", 2048);
     } else if lower.contains("wallet") || lower.contains("exodus") || lower.contains("coinomi") {
-        push_file(&mut entries, "wallet.dat", 4096);
-        push_file(&mut entries, "seed.seco", 1024);
+        push_file(&mut entries, "wallet.dat", 512);
+        push_file(&mut entries, "seed.seco", 512);
         push_file(&mut entries, "config.json", 512);
     } else if lower.ends_with("/default") || lower.ends_with("\\default") {
         push_file(&mut entries, "Cookies", 8192);
@@ -227,6 +227,17 @@ fn synthetic_directory_entries(raw_path: &str) -> Vec<GuestDirectoryEntry> {
 
 fn synthetic_path_size(raw_path: &str, policy: &GuestPathPolicy) -> u64 {
     materialize_synthetic_file_bytes(raw_path, policy.synthetic_file_size).len() as u64
+}
+
+fn should_materialize_missing_path(raw_path: &str) -> bool {
+    let Some(name) = raw_path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+    else {
+        return true;
+    };
+    !name.starts_with(".inj_")
 }
 
 fn synthesize_missing_open_target(
@@ -323,7 +334,10 @@ pub fn open_guest_path(
 
     let meta = match std::fs::metadata(&resolved) {
         Ok(meta) => meta,
-        Err(_) if table.policy.materialize_missing_paths => {
+        Err(_)
+            if table.policy.materialize_missing_paths
+                && should_materialize_missing_path(raw_path) =>
+        {
             return Ok(synthesize_missing_open_target(
                 table, pid, fd, raw_path, &resolved,
             ));
@@ -405,7 +419,10 @@ pub fn stat_guest_path(table: &GuestFileTable, raw_path: &str) -> Result<(u64, P
         "/dev/urandom" => Ok((0, resolved)),
         _ => match std::fs::metadata(&resolved) {
             Ok(meta) => Ok((meta.len(), resolved)),
-            Err(_) if table.policy.materialize_missing_paths => {
+            Err(_)
+                if table.policy.materialize_missing_paths
+                    && should_materialize_missing_path(raw_path) =>
+            {
                 Ok((synthetic_path_size(raw_path, &table.policy), resolved))
             }
             Err(_) => Err(2),
@@ -444,4 +461,32 @@ pub fn read_guest_directory_entry(
         .directory_offsets
         .insert((pid, fd), current_offset.saturating_add(1));
     Some(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> GuestFileTable {
+        GuestFileTable::new(std::env::temp_dir().join("machina-guest-files-test"))
+    }
+
+    #[test]
+    fn stat_materializes_missing_analysis_artifacts() {
+        let table = table();
+        assert!(stat_guest_path(
+            &table,
+            "/Users/analyst/Library/Application Support/Google/Chrome/Default/Login Data"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn stat_does_not_materialize_injection_markers() {
+        let table = table();
+        assert_eq!(
+            stat_guest_path(&table, "/Users/analyst/.docks/.inj_launch_chr"),
+            Err(2)
+        );
+    }
 }

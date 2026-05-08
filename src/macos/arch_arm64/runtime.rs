@@ -113,6 +113,7 @@ pub struct Arm64SyntheticOsRuntime {
     pub pipes: HashMap<u64, SyntheticPipe>,
     pub guest_files: GuestFileTable,
     pub last_pipe_reads: HashMap<(u64, u64), VecDeque<Vec<u8>>>,
+    pub pipe_empty_eof_reads: HashMap<(u64, u64, u64), u64>,
     pub kqueues: HashMap<u64, Vec<SyntheticKeventRegistration>>,
 }
 
@@ -253,6 +254,49 @@ pub fn resolve_process_fd_target(
         .get(&(pid, fd))
         .cloned()
         .or_else(|| os.fd_targets.get(&fd).cloned())
+}
+
+pub fn duplicate_synthetic_fd(
+    os: &mut Arm64SyntheticOsRuntime,
+    pid: u64,
+    fd: u64,
+    min_fd: u64,
+) -> Result<u64, u32> {
+    let target = resolve_process_fd_target(os, pid, fd).ok_or(9u32)?;
+    let mut new_fd = os.next_fd.max(min_fd).max(3);
+    while os.process_fd_targets.contains_key(&(pid, new_fd)) || os.fd_targets.contains_key(&new_fd)
+    {
+        new_fd = new_fd.saturating_add(1);
+    }
+    os.next_fd = new_fd.saturating_add(1);
+    bind_process_fd_target(os, pid, new_fd, target.clone());
+    if let Some(flags) = os.fd_flags.get(&fd).copied() {
+        os.fd_flags.insert(new_fd, flags);
+    }
+    match target {
+        SyntheticFdTarget::File(_) => {
+            let offset = os
+                .guest_files
+                .file_offsets
+                .get(&(pid, fd))
+                .copied()
+                .unwrap_or(0);
+            os.guest_files.file_offsets.insert((pid, new_fd), offset);
+        }
+        SyntheticFdTarget::Directory(_) => {
+            let offset = os
+                .guest_files
+                .directory_offsets
+                .get(&(pid, fd))
+                .copied()
+                .unwrap_or(0);
+            os.guest_files
+                .directory_offsets
+                .insert((pid, new_fd), offset);
+        }
+        SyntheticFdTarget::PipeRead(_) | SyntheticFdTarget::PipeWrite(_) => {}
+    }
+    Ok(new_fd)
 }
 
 pub fn has_pipe_endpoint_ref(
@@ -635,4 +679,30 @@ pub fn wake_arm64_cond_waiters(runtime: &mut Arm64ThreadRuntime, limit: usize) -
         woken.push((cond, tid));
     }
     woken
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os_runtime() -> Arm64SyntheticOsRuntime {
+        Arm64SyntheticOsRuntime {
+            guest_files: GuestFileTable::new(std::env::temp_dir().join("machina-runtime-test")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn duplicate_fd_preserves_directory_target() {
+        let mut os = os_runtime();
+        let (fd, _) = open_guest_file(&mut os, 1, "/Users/analyst/.electrum/wallets/").unwrap();
+        let dup_fd = duplicate_synthetic_fd(&mut os, 1, fd, 0).unwrap();
+
+        assert_ne!(fd, dup_fd);
+        assert!(matches!(
+            resolve_process_fd_target(&os, 1, dup_fd),
+            Some(SyntheticFdTarget::Directory(_))
+        ));
+        assert!(open_directory_stream(&mut os, 1, dup_fd).is_ok());
+    }
 }

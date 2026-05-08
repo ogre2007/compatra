@@ -493,13 +493,19 @@ impl UnicornEmulator {
                     if let Some((reg, original, rewritten)) =
                         rewrite_tagged_mem_base(uc, instr, addr, pc)
                     {
-                        let event = arm64_memory_event("tagged-pointer-rewrite")
+                        let alias = map_tagged_alias_page(uc, addr, pc);
+                        let mut event = arm64_memory_event("tagged-pointer-rewrite")
                             .arg("FaultAddr", format!("0x{:X}", addr))
                             .arg("Reg", format!("x{}", reg))
                             .arg("Original", format!("0x{:X}", original))
                             .arg("Rewritten", format!("0x{:X}", rewritten))
                             .arg("Memtype", format!("{:?}", mem_type))
                             .arg("pc", format!("0x{:X}", pc));
+                        if let Some((fault_addr, candidate)) = alias {
+                            event = event
+                                .arg("AliasFaultAddr", format!("0x{:X}", fault_addr))
+                                .arg("AliasCandidate", format!("0x{:X}", candidate));
+                        }
                         emit_arm64_event(&trace_bus_for_memhook, event);
                         return true;
                     }

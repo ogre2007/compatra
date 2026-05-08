@@ -303,6 +303,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
             import_count,
             last_stub,
             recent_imports,
+            synthetic_stop_reason: shared_state.synthetic_stop_reason.clone(),
             trace_bus: trace_bus.clone(),
             process_name: process_name.to_string(),
         },

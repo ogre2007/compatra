@@ -33,9 +33,22 @@ pub fn setup_arm64_stack_bootstrap(
     binary_path: &str,
     sp: u64,
 ) -> Result<GuestProcessBootstrap, MacOsError> {
-    let argc = 1u64;
     let program_name = program_name(binary_path);
-    let arg0_addr = alloc_cstr(emulator, heap_cursor, &program_name)?;
+    let mut argv_values = vec![program_name.clone()];
+    if let Ok(extra_argv) = std::env::var("MACHINA_ARGV_APPEND") {
+        argv_values.extend(
+            extra_argv
+                .split_whitespace()
+                .filter(|arg| !arg.is_empty())
+                .map(str::to_string),
+        );
+    }
+    let argc = argv_values.len() as u64;
+    let mut argv_addrs = Vec::with_capacity(argv_values.len());
+    for value in &argv_values {
+        argv_addrs.push(alloc_cstr(emulator, heap_cursor, value)?);
+    }
+    let arg0_addr = argv_addrs.first().copied().unwrap_or(0);
     let env_values = [
         "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME=/Users/analyst",
@@ -61,7 +74,10 @@ pub fn setup_arm64_stack_bootstrap(
         envp_addr = stack_push_u64(emulator, &mut stack_sp, env_addr)?;
     }
     stack_push_u64(emulator, &mut stack_sp, 0)?;
-    let argv_addr = stack_push_u64(emulator, &mut stack_sp, arg0_addr)?;
+    let mut argv_addr = 0;
+    for &arg_addr in argv_addrs.iter().rev() {
+        argv_addr = stack_push_u64(emulator, &mut stack_sp, arg_addr)?;
+    }
     let argc_addr = stack_push_u64(emulator, &mut stack_sp, argc)?;
 
     emulator.write_reg("sp", argc_addr & !0xF)?;

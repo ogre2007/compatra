@@ -28,6 +28,264 @@ fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
 }
 
+fn extract_log_stream_event_messages(predicate: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut rest = predicate;
+    while let Some(idx) = rest.find("eventMessage contains") {
+        rest = &rest[idx + "eventMessage contains".len()..];
+        let Some(start) = rest.find('"') else {
+            break;
+        };
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('"') else {
+            break;
+        };
+        messages.push(after_start[..end].to_string());
+        rest = &after_start[end + 1..];
+    }
+    messages
+}
+
+fn synthetic_log_stream_messages(path: &str, argv: &[String]) -> Vec<String> {
+    if path != "log" || !argv.iter().any(|arg| arg == "stream") {
+        return Vec::new();
+    }
+    let mut messages = argv
+        .iter()
+        .flat_map(|arg| extract_log_stream_event_messages(arg))
+        .collect::<Vec<_>>();
+    messages.sort();
+    messages.dedup();
+    messages
+}
+
+fn synthetic_log_stream_output(messages: &[String]) -> Vec<u8> {
+    let mut output =
+        "Timestamp                       Thread     Type        Activity             PID    TTL  \n"
+            .as_bytes()
+            .to_vec();
+    for message in messages {
+        output.extend_from_slice(
+            format!(
+                "2026-05-08 20:00:00.000000+0300 0x000000   Info        0x0                  0      0    {}\n",
+                message
+            )
+            .as_bytes(),
+        );
+    }
+    output
+}
+
+fn install_posix_spawn_hook(
+    emulator: &mut UnicornEmulator,
+    addr: u64,
+    call_name: &'static str,
+    errno_ptr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    shared_state: &Arm64SharedState,
+    import_tracker: &Arm64ImportTracker,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let os_runtime = shared_state.os_runtime.clone();
+    let posix_spawn_file_actions = shared_state.posix_spawn_file_actions.clone();
+    let thread_runtime = shared_state.thread_runtime.clone();
+    let import_tracker = import_tracker.clone();
+    let trace_bus_for_hook = trace_bus.clone();
+    emulator.add_code_hook(
+        addr,
+        addr + 4,
+        move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+            let pid_ptr = emu.read_reg("x0").unwrap_or(0);
+            let path_ptr = emu.read_reg("x1").unwrap_or(0);
+            let file_actions_ptr = emu.read_reg("x2").unwrap_or(0);
+            let attr_ptr = emu.read_reg("x3").unwrap_or(0);
+            let argv_ptr = emu.read_reg("x4").unwrap_or(0);
+            let envp_ptr = emu.read_reg("x5").unwrap_or(0);
+            let path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
+            let argv = if argv_ptr != 0 {
+                read_arm64_argv(emu, argv_ptr, 16, 256)
+            } else {
+                Vec::new()
+            };
+            let file_actions = posix_spawn_file_actions
+                .lock()
+                .ok()
+                .and_then(|actions| actions.get(&file_actions_ptr).cloned())
+                .unwrap_or_default();
+            let log_stream_messages = synthetic_log_stream_messages(&path, &argv);
+            let synthesize_log_stream = !log_stream_messages.is_empty();
+            let current_tid = thread_runtime
+                .lock()
+                .ok()
+                .map(|rt| rt.current_thread_id.max(1))
+                .unwrap_or(1);
+            let current_pid = os_runtime
+                .lock()
+                .ok()
+                .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                .unwrap_or(1);
+            let (child_pid, result, errno) = {
+                let mut os = match os_runtime.lock() {
+                    Ok(os) => os,
+                    Err(_) => return,
+                };
+                let pid = os.next_process_id.max(2);
+                os.next_process_id = pid.saturating_add(1);
+                os.processes.insert(
+                    pid,
+                    SyntheticProcess {
+                        pid,
+                        parent_pid: current_pid,
+                        exit_status: 0,
+                        running: false,
+                        reaped: false,
+                        exec_path: Some(path.clone()),
+                    },
+                );
+                if synthesize_log_stream {
+                    let output = synthetic_log_stream_output(&log_stream_messages);
+                    for (fd, newfd) in &file_actions {
+                        if *newfd != 1 && *newfd != 2 {
+                            continue;
+                        }
+                        if let Some(SyntheticFdTarget::PipeWrite(pipe_id)) =
+                            resolve_process_fd_target(&os, current_pid, *fd)
+                        {
+                            if let Some(pipe) = os.pipes.get_mut(&pipe_id) {
+                                pipe.buffer.extend(output.iter().copied());
+                                pipe.write_open = false;
+                            }
+                        }
+                    }
+                }
+                (pid, 0u64, 0u32)
+            };
+            if pid_ptr != 0 {
+                let _ = emu.write_memory(pid_ptr, &(child_pid as u32).to_le_bytes());
+            }
+            let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+            let lr = emu.read_reg("lr").unwrap_or(0);
+            let _ = emu.write_reg("x0", result);
+            if lr != 0 {
+                let _ = emu.write_reg("pc", lr);
+            }
+            record_arm64_import(
+                &import_tracker,
+                format!(
+                    "{}(pid=0x{:X}, path={:?}, argv={:?}, file_actions=0x{:X}, dup2={:?}, attr=0x{:X}, envp=0x{:X}) -> result={} child_pid={} synthetic_log_stream={}",
+                    call_name, pid_ptr, path, argv, file_actions_ptr, file_actions, attr_ptr, envp_ptr, result, child_pid, synthesize_log_stream
+                ),
+            );
+            let event = arm64_process_event(current_pid, current_tid, call_name, call_name)
+                .arg("PidPtr", format!("0x{:X}", pid_ptr))
+                .arg("ChildPid", child_pid.to_string())
+                .arg("Path", path)
+                .arg("Argv", format!("{:?}", argv))
+                .arg("FileActions", format!("0x{:X}", file_actions_ptr))
+                .arg("Dup2", format!("{:?}", file_actions))
+                .arg("Attr", format!("0x{:X}", attr_ptr))
+                .arg("Envp", format!("0x{:X}", envp_ptr))
+                .arg("SyntheticLogStream", synthesize_log_stream.to_string())
+                .arg("SyntheticLogMessages", format!("{:?}", log_stream_messages))
+                .arg("Errno", errno.to_string())
+                .arg("Result", result.to_string());
+            emit_arm64_event(&trace_bus_for_hook, event);
+        },
+    )?;
+    Ok(())
+}
+
+fn install_posix_spawn_file_action_hooks(
+    emulator: &mut UnicornEmulator,
+    stub_map: &HashMap<String, u64>,
+    shared_state: &Arm64SharedState,
+    import_tracker: &Arm64ImportTracker,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(&addr) = stub_map.get("_posix_spawn_file_actions_init") {
+        let actions = shared_state.posix_spawn_file_actions.clone();
+        let import_tracker = import_tracker.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let actions_ptr = emu.read_reg("x0").unwrap_or(0);
+                if let Ok(mut actions) = actions.lock() {
+                    actions.insert(actions_ptr, Vec::new());
+                }
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_posix_spawn_file_actions_init(actions=0x{:X}) -> 0",
+                        actions_ptr
+                    ),
+                );
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_posix_spawn_file_actions_adddup2") {
+        let actions = shared_state.posix_spawn_file_actions.clone();
+        let import_tracker = import_tracker.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let actions_ptr = emu.read_reg("x0").unwrap_or(0);
+                let fd = emu.read_reg("x1").unwrap_or(0);
+                let newfd = emu.read_reg("x2").unwrap_or(0);
+                if let Ok(mut actions) = actions.lock() {
+                    actions.entry(actions_ptr).or_default().push((fd, newfd));
+                }
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_posix_spawn_file_actions_adddup2(actions=0x{:X}, fd={}, newfd={}) -> 0",
+                        actions_ptr, fd, newfd
+                    ),
+                );
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_posix_spawn_file_actions_destroy") {
+        let actions = shared_state.posix_spawn_file_actions.clone();
+        let import_tracker = import_tracker.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let actions_ptr = emu.read_reg("x0").unwrap_or(0);
+                if let Ok(mut actions) = actions.lock() {
+                    actions.remove(&actions_ptr);
+                }
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_posix_spawn_file_actions_destroy(actions=0x{:X}) -> 0",
+                        actions_ptr
+                    ),
+                );
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
 pub fn install_arm64_process_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
@@ -38,6 +296,8 @@ pub fn install_arm64_process_imports(
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    install_posix_spawn_file_action_hooks(emulator, stub_map, shared_state, import_tracker)?;
+
     if let Some(&addr) = stub_map.get("_fork") {
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
@@ -160,7 +420,9 @@ pub fn install_arm64_process_imports(
                             }
                         } else if runtime.active_thread.is_none() && !runtime.pending_threads.is_empty()
                         {
-                            let _ = dispatch_pending_arm64_thread(emu, &mut runtime);
+                            if let Ok(true) = dispatch_pending_arm64_thread(emu, &mut runtime) {
+                                yielded_to = Some((parent_tid, child_tid));
+                            }
                         }
                     }
                 } else {
@@ -203,6 +465,30 @@ pub fn install_arm64_process_imports(
                     .arg("ParentSp", format!("0x{:X}", parent_ctx.sp));
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_posix_spawn") {
+        install_posix_spawn_hook(
+            emulator,
+            addr,
+            "posix_spawn",
+            errno_ptr,
+            trace_bus,
+            shared_state,
+            import_tracker,
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_posix_spawnp") {
+        install_posix_spawn_hook(
+            emulator,
+            addr,
+            "posix_spawnp",
+            errno_ptr,
+            trace_bus,
+            shared_state,
+            import_tracker,
         )?;
     }
 

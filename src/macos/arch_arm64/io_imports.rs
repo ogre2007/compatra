@@ -10,7 +10,7 @@ macro_rules! println {
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::macos::arm64_runner_support::{
     arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
@@ -18,14 +18,17 @@ use crate::macos::arm64_runner_support::{
 };
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
-    extract_ascii_indicators, fnv1a64_hex, fstat_guest_file, lossy_data_preview,
-    open_directory_stream, open_guest_file, read_guest_directory_entry, read_guest_file,
-    register_process_fd, resolve_directory_stream_fd, resolve_guest_path,
+    duplicate_synthetic_fd, extract_ascii_indicators, fnv1a64_hex, fstat_guest_file,
+    lossy_data_preview, open_directory_stream, open_guest_file, read_guest_directory_entry,
+    read_guest_file, register_process_fd, resolve_directory_stream_fd, resolve_guest_path,
     resolve_process_fd_target, sanitize_capture_label, shannon_entropy, stat_guest_path,
     terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
     SyntheticKeventRegistration, SyntheticPipe,
 };
 use crate::UnicornEmulator;
+
+const ARM64_MALLOC_CHUNK_SIZE: u64 = 0x10_0000;
+const ARM64_PIPE_IDLE_EOF_READ_LIMIT: u64 = 256;
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
@@ -67,13 +70,13 @@ fn read_guest_memory_resolving_tags(
     addr: u64,
     len: usize,
 ) -> Option<(Vec<u8>, u64)> {
-    if let Ok(bytes) = emu.read_memory(addr, len) {
-        return Some((bytes, addr));
-    }
     for candidate in tagged_addr_candidates(addr) {
         if let Ok(bytes) = emu.read_memory(candidate, len) {
             return Some((bytes, candidate));
         }
+    }
+    if let Ok(bytes) = emu.read_memory(addr, len) {
+        return Some((bytes, addr));
     }
     None
 }
@@ -83,15 +86,42 @@ fn write_guest_memory_resolving_tags(
     addr: u64,
     bytes: &[u8],
 ) -> Option<u64> {
-    if emu.write_memory(addr, bytes).is_ok() {
-        return Some(addr);
-    }
     for candidate in tagged_addr_candidates(addr) {
         if emu.write_memory(candidate, bytes).is_ok() {
             return Some(candidate);
         }
     }
+    if emu.write_memory(addr, bytes).is_ok() {
+        return Some(addr);
+    }
     None
+}
+
+fn ensure_malloc_range_mapped(
+    emu: &mut UnicornEmulator,
+    mapped_until: &Arc<Mutex<u64>>,
+    addr: u64,
+    size: u64,
+) -> bool {
+    let end = align_up(addr.saturating_add(size), 0x1000);
+    let Ok(mut mapped_until) = mapped_until.lock() else {
+        return false;
+    };
+    while *mapped_until < end {
+        let chunk_start = *mapped_until;
+        let chunk_end = align_up(
+            end.max(chunk_start.saturating_add(ARM64_MALLOC_CHUNK_SIZE)),
+            0x1000,
+        );
+        if emu
+            .map_data_memory(chunk_start, chunk_end.saturating_sub(chunk_start))
+            .is_err()
+        {
+            return false;
+        }
+        *mapped_until = chunk_end;
+    }
+    true
 }
 
 fn find_env_value_ptr(
@@ -167,6 +197,7 @@ fn write_fake_dirent(
 
 fn fcntl_cmd_name(cmd: u64) -> &'static str {
     match cmd {
+        0 => "F_DUPFD",
         1 => "F_GETFD",
         2 => "F_SETFD",
         3 => "F_GETFL",
@@ -197,7 +228,9 @@ pub fn install_arm64_io_imports(
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let malloc_allocations = shared_state.malloc_allocations.clone();
+    let malloc_mapped_until = shared_state.malloc_mapped_until.clone();
     let malloc_next_addr = shared_state.malloc_next_addr.clone();
+    let synthetic_stop_reason = shared_state.synthetic_stop_reason.clone();
     let process_bootstrap = shared_state.process_bootstrap;
 
     if let Some(&addr) = stub_map.get("_kqueue") {
@@ -599,21 +632,26 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
-                let result = {
+                let (result, errno) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
                         Err(_) => return,
                     };
                     match cmd {
-                        1 => os.fd_flags.get(&fd).copied().unwrap_or(0),
+                        0 | 67 => match duplicate_synthetic_fd(&mut os, current_pid, fd, arg) {
+                            Ok(new_fd) => (new_fd, 0u32),
+                            Err(errno) => (u64::MAX, errno),
+                        },
+                        1 => (os.fd_flags.get(&fd).copied().unwrap_or(0), 0u32),
                         2 => {
                             os.fd_flags.insert(fd, arg);
-                            0
+                            (0, 0u32)
                         }
-                        3 | 4 => 0,
-                        _ => 0,
+                        3 | 4 => (0, 0u32),
+                        _ => (0, 0u32),
                     }
                 };
+                let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
                 let lr = emu.read_reg("lr").unwrap_or(0);
                 let _ = emu.write_reg("x0", result);
                 if lr != 0 {
@@ -631,7 +669,8 @@ pub fn install_arm64_io_imports(
                     .arg("Cmd", cmd.to_string())
                     .arg("CmdName", fcntl_cmd_name(cmd))
                     .arg("Arg", format!("0x{:X}", arg))
-                    .arg("Result", format!("0x{:X}", result));
+                    .arg("Result", format!("0x{:X}", result))
+                    .arg("Errno", errno.to_string());
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
@@ -688,9 +727,18 @@ pub fn install_arm64_io_imports(
                 let dst = emu.read_reg("x0").unwrap_or(0);
                 let src = emu.read_reg("x1").unwrap_or(0);
                 let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                let mut resolved_src = src;
+                let mut resolved_dst = dst;
                 if dst != 0 && src != 0 && len != 0 {
-                    if let Ok(bytes) = emu.read_memory(src, len) {
-                        let _ = emu.write_memory(dst, &bytes);
+                    if let Some((bytes, source_addr)) =
+                        read_guest_memory_resolving_tags(emu, src, len)
+                    {
+                        resolved_src = source_addr;
+                        if let Some(target_addr) =
+                            write_guest_memory_resolving_tags(emu, dst, &bytes)
+                        {
+                            resolved_dst = target_addr;
+                        }
                     }
                 }
                 let current_tid = thread_runtime
@@ -718,6 +766,8 @@ pub fn install_arm64_io_imports(
                 let event = arm64_memory_event("memcpy")
                     .arg("Dst", format!("0x{:X}", dst))
                     .arg("Src", format!("0x{:X}", src))
+                    .arg("ResolvedDst", format!("0x{:X}", resolved_dst))
+                    .arg("ResolvedSrc", format!("0x{:X}", resolved_src))
                     .arg("Len", format!("0x{:X}", len))
                     .arg("Pid", current_pid.to_string())
                     .arg("Tid", current_tid.to_string());
@@ -738,9 +788,18 @@ pub fn install_arm64_io_imports(
                 let dst = emu.read_reg("x0").unwrap_or(0);
                 let src = emu.read_reg("x1").unwrap_or(0);
                 let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                let mut resolved_src = src;
+                let mut resolved_dst = dst;
                 if dst != 0 && src != 0 && len != 0 {
-                    if let Ok(bytes) = emu.read_memory(src, len) {
-                        let _ = emu.write_memory(dst, &bytes);
+                    if let Some((bytes, source_addr)) =
+                        read_guest_memory_resolving_tags(emu, src, len)
+                    {
+                        resolved_src = source_addr;
+                        if let Some(target_addr) =
+                            write_guest_memory_resolving_tags(emu, dst, &bytes)
+                        {
+                            resolved_dst = target_addr;
+                        }
                     }
                 }
                 let current_tid = thread_runtime
@@ -768,6 +827,8 @@ pub fn install_arm64_io_imports(
                 let event = arm64_memory_event("memmove")
                     .arg("Dst", format!("0x{:X}", dst))
                     .arg("Src", format!("0x{:X}", src))
+                    .arg("ResolvedDst", format!("0x{:X}", resolved_dst))
+                    .arg("ResolvedSrc", format!("0x{:X}", resolved_src))
                     .arg("Len", format!("0x{:X}", len))
                     .arg("Pid", current_pid.to_string())
                     .arg("Tid", current_tid.to_string());
@@ -788,8 +849,13 @@ pub fn install_arm64_io_imports(
                 let dst = emu.read_reg("x0").unwrap_or(0);
                 let value = emu.read_reg("x1").unwrap_or(0) as u8;
                 let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                let mut resolved_dst = dst;
                 if dst != 0 && len != 0 {
-                    let _ = emu.write_memory(dst, &vec![value; len]);
+                    if let Some(target_addr) =
+                        write_guest_memory_resolving_tags(emu, dst, &vec![value; len])
+                    {
+                        resolved_dst = target_addr;
+                    }
                 }
                 let current_tid = thread_runtime
                     .lock()
@@ -815,6 +881,7 @@ pub fn install_arm64_io_imports(
                 );
                 let event = arm64_memory_event("memset")
                     .arg("Dst", format!("0x{:X}", dst))
+                    .arg("ResolvedDst", format!("0x{:X}", resolved_dst))
                     .arg("Value", format!("0x{:X}", value))
                     .arg("Len", format!("0x{:X}", len))
                     .arg("Pid", current_pid.to_string())
@@ -836,11 +903,18 @@ pub fn install_arm64_io_imports(
                 let left = emu.read_reg("x0").unwrap_or(0);
                 let right = emu.read_reg("x1").unwrap_or(0);
                 let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                let mut resolved_left = left;
+                let mut resolved_right = right;
                 let result = if left == 0 || right == 0 || len == 0 {
                     0i64
                 } else {
-                    let left_bytes = emu.read_memory(left, len).unwrap_or_default();
-                    let right_bytes = emu.read_memory(right, len).unwrap_or_default();
+                    let (left_bytes, left_addr) = read_guest_memory_resolving_tags(emu, left, len)
+                        .unwrap_or_else(|| (Vec::new(), left));
+                    let (right_bytes, right_addr) =
+                        read_guest_memory_resolving_tags(emu, right, len)
+                            .unwrap_or_else(|| (Vec::new(), right));
+                    resolved_left = left_addr;
+                    resolved_right = right_addr;
                     let mut cmp = 0i64;
                     for (lhs, rhs) in left_bytes.iter().zip(right_bytes.iter()) {
                         if lhs != rhs {
@@ -875,6 +949,8 @@ pub fn install_arm64_io_imports(
                 let event = arm64_memory_event("memcmp")
                     .arg("Left", format!("0x{:X}", left))
                     .arg("Right", format!("0x{:X}", right))
+                    .arg("ResolvedLeft", format!("0x{:X}", resolved_left))
+                    .arg("ResolvedRight", format!("0x{:X}", resolved_right))
                     .arg("Len", format!("0x{:X}", len))
                     .arg("Result", result.to_string())
                     .arg("Pid", current_pid.to_string())
@@ -890,6 +966,7 @@ pub fn install_arm64_io_imports(
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
         let malloc_next_addr = malloc_next_addr.clone();
+        let malloc_mapped_until = malloc_mapped_until.clone();
         let malloc_allocations = malloc_allocations.clone();
         emulator.add_code_hook(
             addr,
@@ -906,7 +983,9 @@ pub fn install_arm64_io_imports(
                     };
                     let addr = (*next + 0xF) & !0xF;
                     *next = addr.saturating_add(aligned);
-                    let _ = emu.map_data_memory(addr, aligned);
+                    if !ensure_malloc_range_mapped(emu, &malloc_mapped_until, addr, aligned) {
+                        return;
+                    }
                     let _ = emu.write_memory(addr, &vec![0u8; total as usize]);
                     if let Ok(mut allocations) = malloc_allocations.lock() {
                         allocations.insert(addr, total);
@@ -952,6 +1031,7 @@ pub fn install_arm64_io_imports(
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
         let malloc_next_addr = malloc_next_addr.clone();
+        let malloc_mapped_until = malloc_mapped_until.clone();
         let malloc_allocations = malloc_allocations.clone();
         emulator.add_code_hook(
             addr,
@@ -967,7 +1047,9 @@ pub fn install_arm64_io_imports(
                     };
                     let new_ptr = (*next + 0xF) & !0xF;
                     *next = new_ptr.saturating_add(aligned);
-                    let _ = emu.map_data_memory(new_ptr, aligned);
+                    if !ensure_malloc_range_mapped(emu, &malloc_mapped_until, new_ptr, aligned) {
+                        return;
+                    }
                     let old_size = malloc_allocations
                         .lock()
                         .ok()
@@ -1688,6 +1770,7 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let synthetic_stop_reason = synthetic_stop_reason.clone();
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1705,7 +1788,7 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
-                let (result, preview, eof) = {
+                let (result, preview, eof, idle_stop_reason) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
                         Err(_) => return,
@@ -1731,17 +1814,37 @@ pub fn install_arm64_io_imports(
                                         recent_reads.pop_front();
                                     }
                                 }
-                                (data.len() as u64, data, eof)
+                                let result = data.len() as u64;
+                                let idle_stop_reason = if result == 0 && eof {
+                                    let empty_reads = os
+                                        .pipe_empty_eof_reads
+                                        .entry((current_pid, current_tid, fd))
+                                        .or_default();
+                                    *empty_reads = empty_reads.saturating_add(1);
+                                    if *empty_reads >= ARM64_PIPE_IDLE_EOF_READ_LIMIT {
+                                        Some(format!(
+                                            "idle_pipe_eof_loop(fd={}, reads={})",
+                                            fd, *empty_reads
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    os.pipe_empty_eof_reads
+                                        .remove(&(current_pid, current_tid, fd));
+                                    None
+                                };
+                                (result, data, eof, idle_stop_reason)
                             } else {
-                                (0, Vec::new(), true)
+                                (0, Vec::new(), true, None)
                             }
                         }
                         Some(SyntheticFdTarget::File(_)) => {
                             read_guest_file(&mut os, current_pid, fd, count)
-                                .map(|(chunk, eof)| (chunk.len() as u64, chunk, eof))
-                                .unwrap_or((0, Vec::new(), true))
+                                .map(|(chunk, eof)| (chunk.len() as u64, chunk, eof, None))
+                                .unwrap_or((0, Vec::new(), true, None))
                         }
-                        _ => (0, Vec::new(), true),
+                        _ => (0, Vec::new(), true, None),
                     }
                 };
                 if buf != 0 && !preview.is_empty() {
@@ -1766,6 +1869,14 @@ pub fn install_arm64_io_imports(
                     .arg("Eof", eof.to_string())
                     .arg("Preview", lossy_data_preview(&preview, 128));
                 emit_arm64_event(&trace_bus_for_hook, event);
+                if let Some(reason) = idle_stop_reason {
+                    if let Ok(mut stop_reason) = synthetic_stop_reason.lock() {
+                        if stop_reason.is_none() {
+                            *stop_reason = Some(reason);
+                        }
+                    }
+                    let _ = emu.stop_emulation();
+                }
             },
         )?;
     }
@@ -2096,6 +2207,7 @@ pub fn install_arm64_io_imports(
 
     if let Some(&addr) = stub_map.get("_malloc") {
         let malloc_next_addr = shared_state.malloc_next_addr.clone();
+        let malloc_mapped_until = shared_state.malloc_mapped_until.clone();
         let malloc_allocations = shared_state.malloc_allocations.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
@@ -2113,7 +2225,9 @@ pub fn install_arm64_io_imports(
                     };
                     let addr = *next;
                     *next = next.saturating_add(page_size);
-                    let _ = emu.map_data_memory(addr, page_size);
+                    if !ensure_malloc_range_mapped(emu, &malloc_mapped_until, addr, page_size) {
+                        return;
+                    }
                     let _ = emu.write_memory(addr, &vec![0u8; alloc_size as usize]);
                     addr
                 };

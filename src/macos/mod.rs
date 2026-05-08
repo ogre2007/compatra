@@ -97,8 +97,8 @@ pub fn debug_stdout_enabled() -> bool {
 
 pub use apple_runtime::{AppleObject, AppleRuntime};
 pub use arm64_runtime::{
-    restore_arm64_context, save_arm64_context, wake_arm64_cond_waiters, wake_one_arm64_cond_waiter,
-    Arm64SyntheticOsRuntime, Arm64ThreadContext,
+    duplicate_synthetic_fd, restore_arm64_context, save_arm64_context, wake_arm64_cond_waiters,
+    wake_one_arm64_cond_waiter, Arm64SyntheticOsRuntime, Arm64ThreadContext,
 };
 pub use bootstrap::{setup_arm64_stack_bootstrap, GuestProcessBootstrap};
 pub use capture::{

@@ -44,11 +44,15 @@ emulator behavior.
   - exercises TLV bootstrap, signal/bootstrap imports, heap growth, `memcmp`, `memmove`, `memcpy`, `malloc`, `realloc`, and `free`
   - now synthetically handles arm64 LSE `ldadd`, `ldapr`, and `cas` runtime atomics that previously consumed the execution budget
   - resolves bootstrap environment lookups such as `getenv("HOME")` from the synthetic guest envp
-  - currently ends with `timeout_budget_exhausted` rather than an unmapped branch/fetch crash
-  - current hot path has moved beyond the first Rust runtime startup guard and into later runtime panic/assert paths around `brk #0x1`
+  - resolves high/tagged literal pointers in libc memory imports, including the path build for `/Users/analyst/.docks`
+  - uses chunked synthetic heap mapping so Rust runtime allocation churn no longer exhausts Unicorn memory sections
+  - records `posix_spawnp` for `log stream --predicate ... restartInitiated/shutdownInitiated ... --info` and can feed synthetic matching log events into the redirected pipe
+  - treats hidden `.inj_*` marker files as absent by default, so RustDoor does not falsely assume Chrome injection already happened
+  - progresses through the daemonization path (`fork`, `chdir`, `setsid`, second `fork`) and opens `/tmp/com.apple.lock`
+  - currently stops after daemon/lock setup rather than reaching the later remote command execution commands listed in the local analysis article
 - Important implication:
-  - the main blocker has moved from import coverage and missing arm64 atomic semantics into later runtime/control-flow behavior
-  - next compatibility work for this family should focus on reducing artificial libc/runtime churn and improving higher-level Apple runtime progress
+  - the main blocker has moved from import coverage, LSE atomics, heap mapping, and long-running `log stream` output into daemon lifecycle and lock-file semantics
+  - next compatibility work for this family should focus on parent/child process lifecycle after daemonization and whether lock-file creation should keep the child active for the later command loop
 
 ## Corpus hygiene
 

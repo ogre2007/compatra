@@ -294,6 +294,7 @@ pub struct Arm64RunReport {
     pub import_count: Arc<AtomicUsize>,
     pub last_stub: Arc<Mutex<Option<String>>>,
     pub recent_imports: Arc<Mutex<VecDeque<String>>>,
+    pub synthetic_stop_reason: Arc<Mutex<Option<String>>>,
     pub trace_bus: Option<SharedTraceBus>,
     pub process_name: String,
 }
@@ -358,6 +359,13 @@ pub fn run_arm64_with_diagnostics(
                 "done_addr".to_string()
             } else if report.saw_exit.load(std::sync::atomic::Ordering::Relaxed) {
                 "post_exit".to_string()
+            } else if let Some(reason) = report
+                .synthetic_stop_reason
+                .lock()
+                .ok()
+                .and_then(|reason| reason.clone())
+            {
+                reason
             } else if timed_out {
                 "timeout_budget_exhausted".to_string()
             } else if instruction_count != 0 {
