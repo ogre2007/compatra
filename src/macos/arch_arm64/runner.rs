@@ -21,6 +21,34 @@ use crate::macos::{
 };
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
+const INDIRECT_BRANCH_MODE_ENV: &str = "MACHINA_INDIRECT_BRANCH_MODE";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndirectBranchMode {
+    Fast,
+    Sanitize,
+}
+
+impl IndirectBranchMode {
+    fn from_env() -> (Self, Option<String>) {
+        let Ok(raw) = std::env::var(INDIRECT_BRANCH_MODE_ENV) else {
+            return (Self::Fast, None);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "fast" => (Self::Fast, None),
+            "sanitize" => (Self::Sanitize, None),
+            _ => (Self::Fast, Some(raw)),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Sanitize => "sanitize",
+        }
+    }
+}
+
 pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let raw_data = std::fs::read(binary_path)?;
     let binary = MachoBinary::parse(&raw_data)?;
@@ -201,7 +229,30 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         &process_name,
     )?;
     install_arm64_lse_atomic_hooks(&mut emulator, &binary, &trace_bus, process_name)?;
-    install_arm64_indirect_branch_hooks(&mut emulator, &binary, &trace_bus, process_name)?;
+    let (indirect_branch_mode, invalid_indirect_branch_mode) = IndirectBranchMode::from_env();
+    if let Some(bus) = &trace_bus {
+        let mut event = process_event(&metadata, "indirect-branch-mode", "indirect_branch_mode")
+            .arg("Mode", indirect_branch_mode.as_str())
+            .arg("Env", INDIRECT_BRANCH_MODE_ENV);
+        if let Some(raw) = invalid_indirect_branch_mode {
+            event = event.arg("Requested", raw).arg("Fallback", "fast");
+        }
+        let _ = bus.send(event);
+    }
+    if indirect_branch_mode == IndirectBranchMode::Sanitize {
+        install_arm64_indirect_branch_hooks(&mut emulator, &binary, &trace_bus, process_name)?;
+    } else {
+        if let Some(bus) = &trace_bus {
+            let _ = bus.send(
+                process_event(
+                    &metadata,
+                    "indirect-branch-hooks-skipped",
+                    "install_indirect_branch_hooks",
+                )
+                .arg("Reason", "mode-fast"),
+            );
+        }
+    }
 
     let runtime_context = RuntimeContext::new(
         process_name,

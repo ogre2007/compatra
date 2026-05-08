@@ -111,7 +111,7 @@ fn rewrite_tagged_mem_base<'a>(
     fault_addr: u64,
     pc: u64,
 ) -> Option<(u8, u64, u64)> {
-    if fault_addr < 0x1000 {
+    if fault_addr < 0x1000 || (fault_addr >> 48) == 0 {
         return None;
     }
     let reg = arm64_mem_base_reg(instr)?;
