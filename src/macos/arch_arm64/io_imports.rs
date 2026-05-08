@@ -1976,9 +1976,6 @@ pub fn install_arm64_io_imports(
                 let signum = emu.read_reg("x0").unwrap_or(0);
                 let act = emu.read_reg("x1").unwrap_or(0);
                 let oldact = emu.read_reg("x2").unwrap_or(0);
-                if oldact != 0 {
-                    let _ = emu.write_memory(oldact, &[0u8; 32]);
-                }
                 let current_tid = thread_runtime
                     .lock()
                     .ok()

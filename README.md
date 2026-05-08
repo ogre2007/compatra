@@ -43,6 +43,8 @@ Useful knobs:
 - `MACHINA_PLUGIN_TRACE=1`: enable plugin trace bus
 - `MACHINA_TRACE_FORMAT=jsonl`: force JSONL output
 - `MACHINA_TRACE_FORMAT=human`: legacy human-readable sink for debugging
+- `MACHINA_INDIRECT_BRANCH_MODE=fast`: default; skip expensive indirect-branch sanitizers
+- `MACHINA_INDIRECT_BRANCH_MODE=sanitize`: enable indirect-branch sanitizers for debugging signed or tagged branch targets
 
 ## Build
 
