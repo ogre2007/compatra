@@ -369,6 +369,8 @@ impl UnicornEmulator {
                     .add_intr_hook(move |_uc, intno| unsafe {
                         // AArch64 SVC triggers interrupt number 2 in Unicorn.
                         if intno != 2 {
+                            let emu = &mut *self_ptr;
+                            let _ = emu.uc.emu_stop();
                             return;
                         }
                         let emu = &mut *self_ptr;

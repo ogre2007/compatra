@@ -51,6 +51,49 @@ fn read_cstring(emu: &mut dyn Emulator, addr: u64, max_len: usize) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn tagged_addr_candidates(addr: u64) -> Vec<u64> {
+    if addr < 0x1000 || (addr >> 48) == 0 {
+        return Vec::new();
+    }
+    let low32 = addr & 0xFFFF_FFFF;
+    let mut candidates = vec![low32, 0x1_0000_0000 | low32];
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn read_guest_memory_resolving_tags(
+    emu: &mut dyn Emulator,
+    addr: u64,
+    len: usize,
+) -> Option<(Vec<u8>, u64)> {
+    if let Ok(bytes) = emu.read_memory(addr, len) {
+        return Some((bytes, addr));
+    }
+    for candidate in tagged_addr_candidates(addr) {
+        if let Ok(bytes) = emu.read_memory(candidate, len) {
+            return Some((bytes, candidate));
+        }
+    }
+    None
+}
+
+fn write_guest_memory_resolving_tags(
+    emu: &mut dyn Emulator,
+    addr: u64,
+    bytes: &[u8],
+) -> Option<u64> {
+    if emu.write_memory(addr, bytes).is_ok() {
+        return Some(addr);
+    }
+    for candidate in tagged_addr_candidates(addr) {
+        if emu.write_memory(candidate, bytes).is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn find_env_value_ptr(
     emu: &mut dyn Emulator,
     envp_addr: u64,

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::macos::{
-    emit_runner_trace_event, process_event, runtime_process_metadata, SharedTraceBus,
+    emit_runner_trace_event, lossy_data_preview, process_event, runtime_process_metadata,
+    SharedTraceBus,
 };
 use crate::{Emulator, MachoBinary, UnicornEmulator};
 
@@ -72,6 +73,26 @@ fn read_qword_preview(emu: &mut UnicornEmulator, addr: u64, count: usize) -> Opt
         parts.push(format!("0x{:X}", value));
     }
     Some(parts.join(","))
+}
+
+fn read_byte_preview(emu: &mut UnicornEmulator, addr: u64, count: usize) -> Option<String> {
+    if addr < 0x1000 || count == 0 {
+        return None;
+    }
+    let bytes = emu.read_memory(addr, count).ok()?;
+    Some(lossy_data_preview(&bytes, count))
+}
+
+fn current_arm64_brk_immediate(emu: &mut UnicornEmulator) -> Option<u16> {
+    let pc = emu.read_reg("pc").ok()?;
+    let bytes = emu.read_memory(pc, 4).ok()?;
+    let raw = <[u8; 4]>::try_from(bytes.as_slice()).ok()?;
+    let instr = u32::from_le_bytes(raw);
+    if (instr & 0xFFE0_001F) == 0xD420_0000 {
+        Some(((instr >> 5) & 0xFFFF) as u16)
+    } else {
+        None
+    }
 }
 
 pub fn install_arm64_diagnostic_hooks(
@@ -157,23 +178,29 @@ pub fn install_arm64_diagnostic_hooks(
                 let x11 = emu.read_reg("x11").unwrap_or(0);
                 let bytes = emu.read_memory(address, size as usize).unwrap_or_default();
                 let metadata = runtime_process_metadata(process_name.clone());
-                emit_runner_trace_event(
-                    &trace_bus_for_hook,
-                    &metadata,
-                    process_event(&metadata, "trace-window", "trace-window")
-                        .arg("Pc", format!("0x{:X}", address))
-                        .arg("Lr", format!("0x{:X}", lr))
-                        .arg("Sp", format!("0x{:X}", sp))
-                        .arg("X0", format!("0x{:X}", x0))
-                        .arg("X1", format!("0x{:X}", x1))
-                        .arg("X2", format!("0x{:X}", x2))
-                        .arg("X3", format!("0x{:X}", x3))
-                        .arg("X8", format!("0x{:X}", x8))
-                        .arg("X9", format!("0x{:X}", x9))
-                        .arg("X10", format!("0x{:X}", x10))
-                        .arg("X11", format!("0x{:X}", x11))
-                        .arg("Bytes", format!("{:02X?}", bytes)),
-                );
+                let mut event = process_event(&metadata, "trace-window", "trace-window")
+                    .arg("Pc", format!("0x{:X}", address))
+                    .arg("Lr", format!("0x{:X}", lr))
+                    .arg("Sp", format!("0x{:X}", sp))
+                    .arg("X0", format!("0x{:X}", x0))
+                    .arg("X1", format!("0x{:X}", x1))
+                    .arg("X2", format!("0x{:X}", x2))
+                    .arg("X3", format!("0x{:X}", x3))
+                    .arg("X8", format!("0x{:X}", x8))
+                    .arg("X9", format!("0x{:X}", x9))
+                    .arg("X10", format!("0x{:X}", x10))
+                    .arg("X11", format!("0x{:X}", x11))
+                    .arg("Bytes", format!("{:02X?}", bytes));
+                if let Some(preview) = read_byte_preview(emu, x0, 64) {
+                    event = event.arg("X0Preview", preview);
+                }
+                if let Some(preview) = read_byte_preview(emu, x1, 64) {
+                    event = event.arg("X1Preview", preview);
+                }
+                if let Some(preview) = read_byte_preview(emu, x2, 64) {
+                    event = event.arg("X2Preview", preview);
+                }
+                emit_runner_trace_event(&trace_bus_for_hook, &metadata, event);
             },
         )?;
     }
@@ -325,18 +352,20 @@ pub fn run_arm64_with_diagnostics(
             let elapsed_usecs = start.elapsed().as_micros() as u64;
             let timed_out =
                 timeout_usecs != 0 && elapsed_usecs >= timeout_usecs.saturating_sub(5_000);
-            let detail = if pc == report.done_addr {
-                "done_addr"
+            let detail = if let Some(imm) = current_arm64_brk_immediate(emulator) {
+                format!("brk_trap_0x{:X}", imm)
+            } else if pc == report.done_addr {
+                "done_addr".to_string()
             } else if report.saw_exit.load(std::sync::atomic::Ordering::Relaxed) {
-                "post_exit"
+                "post_exit".to_string()
             } else if timed_out {
-                "timeout_budget_exhausted"
+                "timeout_budget_exhausted".to_string()
             } else if instruction_count != 0 {
-                "instruction_budget_exhausted"
+                "instruction_budget_exhausted".to_string()
             } else {
-                "returned_without_done_addr"
+                "returned_without_done_addr".to_string()
             };
-            emit_stop_status("ok", detail, emulator);
+            emit_stop_status("ok", &detail, emulator);
         }
         Err(e) => {
             let pc = emulator.read_reg("pc").unwrap_or(0);

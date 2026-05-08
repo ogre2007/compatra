@@ -680,12 +680,7 @@ fn emulate_arm64_lse_ldadd(
         ("Address", format!("0x{:X}", addr)),
         (
             "Kind",
-            if is_64 {
-                "ldadd64"
-            } else {
-                "ldadd32"
-            }
-            .to_string(),
+            if is_64 { "ldadd64" } else { "ldadd32" }.to_string(),
         ),
         ("Acquire", acquire.to_string()),
         ("Release", release.to_string()),
