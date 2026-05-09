@@ -162,6 +162,49 @@ fn map_tagged_alias_page<'a>(
     None
 }
 
+/// Map a fresh writable page at an "off-canvas" tagged data address.
+///
+/// `map_tagged_alias_page` only fires when bits 48+ of the fault address are
+/// set (TBI top-byte tagging). Rust binaries also produce wide tagged
+/// pointers in lower nibbles — for example RustDoor's post-`waitpid`
+/// `WaitStatus` write at `[x19, #8]` resolves to `0xA0000000A` because the
+/// caller packs an enum discriminant into bits 32–35. The canonical low-32
+/// candidate (`0xA`) is in PAGEZERO and the high-only candidate is unmapped,
+/// so the existing alias mapper gives up and the run fails on
+/// `WRITE_UNMAPPED`.
+///
+/// As a permissive fallback, when a data fault hits an address that is
+/// clearly above the legitimate user-space heap/mmap arena (high bits 32–47
+/// non-zero) and below the TBI range, just synthesize a writable page so the
+/// store can proceed. This is a "ghost" page — reads later return whatever
+/// the program wrote — which is enough to let the emulation move past these
+/// pointer-tagged structs into the malware's interesting behavior.
+fn map_off_canvas_data_page<'a>(
+    uc: &mut Unicorn<'a, ()>,
+    fault_addr: u64,
+) -> Option<u64> {
+    // Only kick in for pointers far outside any mapped region; bail early
+    // for anything Unicorn would already accept (low-32 or kernel-tag).
+    if fault_addr < 0x1_0000_0000 {
+        return None;
+    }
+    if (fault_addr >> 48) != 0 {
+        // Already covered by `map_tagged_alias_page`.
+        return None;
+    }
+    let alias_page = fault_addr & !0xFFF;
+    if uc.mem_read_as_vec(alias_page, 1).is_ok() {
+        return None;
+    }
+    if uc
+        .mem_map(alias_page, 0x1000, Prot::READ | Prot::WRITE)
+        .is_err()
+    {
+        return None;
+    }
+    Some(alias_page)
+}
+
 /// After mapping a copy of a canonical page at the tagged PC alias, also
 /// redirect PC to the canonical address. Without this, instructions in the
 /// alias page execute with PC-relative addressing producing more tagged
@@ -549,6 +592,20 @@ impl UnicornEmulator {
                     }
                     emit_arm64_event(&trace_bus_for_memhook, event);
                     return true;
+                }
+                if matches!(
+                    mem_type,
+                    MemType::WRITE_UNMAPPED | MemType::READ_UNMAPPED
+                ) {
+                    if let Some(alias_page) = map_off_canvas_data_page(uc, addr) {
+                        let event = arm64_memory_event("off-canvas-data-page")
+                            .arg("FaultAddr", format!("0x{:X}", addr))
+                            .arg("AliasPage", format!("0x{:X}", alias_page))
+                            .arg("Memtype", format!("{:?}", mem_type))
+                            .arg("pc", format!("0x{:X}", pc));
+                        emit_arm64_event(&trace_bus_for_memhook, event);
+                        return true;
+                    }
                 }
                 let code = uc.mem_read_as_vec(pc, 8).unwrap_or_default();
                 let value_bytes = format_memory_value(value, size as usize);

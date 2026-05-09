@@ -61,10 +61,19 @@ emulator behavior.
     - `_stat /Applications/Google Chrome.app/Contents/MacOS/Google Chrome` (Chrome detection)
     - `_stat /Users/analyst/.docks/.inj_rc_chr` → `ENOENT` (Chrome rc-injection marker)
     - `_stat /Users/analyst/.docks/.inj_launch_chr` → `ENOENT` (Chrome launch-injection marker)
-  - currently stops with `WRITE_UNMAPPED` to a tagged pointer (`x0=0xA00000002`, tag `0xA`) downstream of the second `_waitpid`/`__error` poll, before the Chrome injection actually runs. The tagged data-write fault is not yet handled by the alias-page mapper.
+  - the LSE atomic SWP `0x10018242C` now correctly transitions `0x10026D450`/`0x10026D1D8` from `RUNNING` (2) to `COMPLETE` (3), so the OnceLock release returns instead of looping
+  - the `_exit` libc symbol is now hooked in addition to the BSD `__exit` syscall wrapper, so the daemon's clean shutdown actually terminates
+  - the `done_addr` cleanup hook now honors `stop_now` even when an `exited_pid` is also reported — the previous `else if` chain meant the runner kept running the dead caller's tail after the daemon exit
+  - off-canvas data pages (e.g. `0xA00000000`) are now synthesized for tagged data writes that fall outside the canonical heap/mmap arena, so the post-`waitpid` `WaitStatus` store at `[x19, #8]` succeeds
+  - the daemon now runs all the way through its persistence-and-Chrome-probing path and **terminates cleanly with `_exit(0)`**:
+    - opens `~/.zshrc`, reads it in 32→2048-byte windows, then re-opens it `read_write` and writes injected lines
+    - opens `~/.docks/cron` and `/tmp/com.apple.lock.<timestamp>` for cron-style and lock persistence
+    - `_stat`s the `~/.local` and `~/.zshrc` parents during persistence prep
+    - Stops with `Detail:"done_addr"` and `SawExit:true` (`Imports:10592`), no error
 - Important implication:
-  - the main blocker has moved from the daemon's parking_lot-style atomic loop into a tagged-pointer data-write fault during Chrome injection bookkeeping
-  - next compatibility work should extend the tagged-pointer alias mapper to write-side faults that synthesize a writable canonical-aliased page, then verify whether the parent reaches the actual `posix_spawnp` of `osascript` / `chflags hidden npm` / `curl` / `zsh -c zip -r ...` commands
+  - all of the in-process compatibility blockers (TLV bootstrap, LSE atomics, daemonization, lock-file singleton, parking_lot mutex/condvar, `waitpid` poll, exit dispatch) are resolved
+  - what RustDoor doesn't do in-process is the actual remote command list (`curl`, `chflags hidden npm`, `zsh -c zip -r ...`, `mdfind -name .pem`, reverse-shell `back.sh`/`sh.sh`); per the Unit42 article those run later via the cron and `~/.zshrc` persistence we now write, not from the originally executed binary
+  - next compatibility work for this family should focus on simulating the second-stage execution paths (e.g. driving a fake shell login that re-reads `~/.zshrc`, or executing the cron entry) rather than coaxing more behavior out of the first-stage binary, which is now reaching `_exit(0)` cleanly
 
 ## Corpus hygiene
 
