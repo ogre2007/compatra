@@ -34,6 +34,53 @@ fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
 }
 
+/// Append bytes from a guest `_write(fd, ...)` to a host file under
+/// `target/machina-captures/`. The file is named after the (pid, fd, raw
+/// path) triple so multiple guest fds — including the typical
+/// re-open-as-RW-then-write pattern RustDoor uses on `~/.zshrc` — get
+/// independent dumps. Returns the path where data was appended on
+/// success.
+///
+/// This is best-effort: failures to create the directory or open/append
+/// the file are silently swallowed so the emulator keeps running.
+fn append_file_write_payload_to_capture(
+    pid: u64,
+    fd: u64,
+    raw_path: &str,
+    data: &[u8],
+) -> Option<std::path::PathBuf> {
+    if data.is_empty() {
+        return None;
+    }
+    let capture_dir = std::env::var_os("MACHINA_PAYLOAD_DUMP_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new("target").join("machina-captures"));
+    if std::fs::create_dir_all(&capture_dir).is_err() {
+        return None;
+    }
+    let safe_label = sanitize_capture_label(raw_path);
+    let file_path = capture_dir.join(format!(
+        "file_pid{}_fd{}_{}.bin",
+        pid,
+        fd,
+        if safe_label.is_empty() { "unknown" } else { safe_label.as_str() }
+    ));
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&file_path)
+    {
+        Ok(mut handle) => {
+            if handle.write_all(data).is_err() {
+                return None;
+            }
+        }
+        Err(_) => return None,
+    }
+    Some(file_path)
+}
+
 fn read_cstring(emu: &mut dyn Emulator, addr: u64, max_len: usize) -> String {
     if addr == 0 {
         return String::new();
@@ -2264,8 +2311,15 @@ pub fn install_arm64_io_imports(
                 let buf = emu.read_reg("x1").unwrap_or(0);
                 let count = emu.read_reg("x2").unwrap_or(0) as usize;
                 let capture_len = count.min(4 * 1024 * 1024);
-                let mut data = if buf != 0 && count > 0 {
-                    emu.read_memory(buf, capture_len).unwrap_or_default()
+                let mut data = if buf != 0 && capture_len > 0 {
+                    // RustDoor's `~/.zshrc` injection writes one byte at a
+                    // time from a tagged literal pointer (e.g.
+                    // `0x200000001DB020`); plain `read_memory` fails so the
+                    // dumped payload was empty. Resolve tagged buffers via
+                    // the same helper the read/stat hooks use.
+                    read_guest_memory_resolving_tags(emu, buf, capture_len)
+                        .map(|(bytes, _)| bytes)
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -2352,7 +2406,27 @@ pub fn install_arm64_io_imports(
                 }
                 let mut pipe_capture = None;
                 let mut substituted_recent_read = false;
+                let mut file_payload_dump: Option<(String, std::path::PathBuf, usize)> = None;
                 if !data.is_empty() {
+                    if let Ok(os_guard) = os_runtime.lock() {
+                        if let Some(SyntheticFdTarget::File(file_id)) =
+                            resolve_process_fd_target(&os_guard, current_pid, fd)
+                        {
+                            if let Some(file) = os_guard.guest_files.files.get(&file_id) {
+                                let raw_path = file.raw_path.clone();
+                                drop(os_guard);
+                                if let Some(dump_path) = append_file_write_payload_to_capture(
+                                    current_pid,
+                                    fd,
+                                    &raw_path,
+                                    &data,
+                                ) {
+                                    file_payload_dump =
+                                        Some((raw_path, dump_path, data.len()));
+                                }
+                            }
+                        }
+                    }
                     if let Ok(mut os) = os_runtime.lock() {
                         if let Some(SyntheticFdTarget::PipeWrite(pipe_id)) =
                             resolve_process_fd_target(&os, current_pid, fd)
@@ -2442,12 +2516,27 @@ pub fn install_arm64_io_imports(
                 } else {
                     lossy_data_preview(&data, 128)
                 };
-                let event = arm64_io_event(current_pid, current_tid, "write")
+                let mut event = arm64_io_event(current_pid, current_tid, "write")
                     .arg("Fd", fd.to_string())
                     .arg("Count", count.to_string())
                     .arg("Captured", data.len().to_string())
                     .arg("Buf", format!("0x{:X}", buf))
                     .arg("Preview", preview);
+                if let Some((raw_path, dump_path, dumped_bytes)) = &file_payload_dump {
+                    event = event
+                        .arg("PayloadPath", raw_path.clone())
+                        .arg("PayloadDumpFile", dump_path.display().to_string())
+                        .arg("PayloadDumpedBytes", dumped_bytes.to_string());
+                    println!(
+                        "[CAPTURE][arm64] file-write payload pid={} tid={} fd={} path={} dump={} bytes={}",
+                        current_pid,
+                        current_tid,
+                        fd,
+                        raw_path,
+                        dump_path.display(),
+                        dumped_bytes
+                    );
+                }
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
