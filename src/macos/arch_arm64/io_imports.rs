@@ -19,7 +19,8 @@ use crate::macos::arm64_runner_support::{
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
     duplicate_synthetic_fd, extract_ascii_indicators, fnv1a64_hex, fstat_guest_file,
-    lossy_data_preview, open_directory_stream, open_guest_file, read_guest_directory_entry,
+    lossy_data_preview, open_directory_stream, open_guest_file,
+    open_guest_file_with_flags, read_guest_directory_entry,
     read_guest_file, register_process_fd, resolve_directory_stream_fd, resolve_guest_path,
     resolve_process_fd_target, sanitize_capture_label, shannon_entropy, stat_guest_path,
     terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
@@ -1463,7 +1464,7 @@ pub fn install_arm64_io_imports(
                         Ok(os) => os,
                         Err(_) => return,
                     };
-                    match open_guest_file(&mut os, current_pid, &path) {
+                    match open_guest_file_with_flags(&mut os, current_pid, &path, flags) {
                         Ok((fd, resolved)) => (fd, 0u32, resolved),
                         Err(errno) => (
                             u64::MAX,

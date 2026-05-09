@@ -240,12 +240,14 @@ fn should_materialize_missing_path(raw_path: &str) -> bool {
     if name.starts_with(".inj_") {
         return false;
     }
-    // RustDoor opens /tmp/com.apple.lock as a daemon-singleton check —
-    // if it exists the new instance assumes another daemon is already
-    // running and exits before reaching the C2 command loop. Treat the
-    // file as absent so the freshly-emulated daemon "wins" the lock and
-    // proceeds into the interesting commands.
-    if raw_path == "/tmp/com.apple.lock" {
+    // RustDoor opens /tmp/com.apple.lock and per-instance variants like
+    // /tmp/com.apple.lock.<timestamp> as a daemon-singleton check — if
+    // any of them already exist the new instance assumes another daemon
+    // is already running and exits before spawning its real install /
+    // download / log-stream commands. Treat the whole family as absent
+    // so the freshly-emulated daemon "wins" the lock and proceeds into
+    // the interesting commands.
+    if raw_path == "/tmp/com.apple.lock" || raw_path.starts_with("/tmp/com.apple.lock.") {
         return false;
     }
     true
@@ -321,11 +323,28 @@ fn read_directory_entries(resolved: &Path) -> Result<Vec<GuestDirectoryEntry>, u
     Ok(entries)
 }
 
+/// Darwin `O_CREAT` is `0x200`. When set on a missing path, the guest is
+/// asking the kernel to create the file, so the materialization policy
+/// should not pretend the path is `ENOENT` — otherwise we end up with
+/// the RustDoor sequence "open RDONLY → ENOENT → open RDWR|O_CREAT →
+/// ENOENT → panic" instead of the expected "missing → freshly created".
+pub const GUEST_OPEN_CREATE: u64 = 0x200;
+
 pub fn open_guest_path(
     table: &mut GuestFileTable,
     pid: u64,
     fd: u64,
     raw_path: &str,
+) -> Result<(GuestOpenTarget, PathBuf), u32> {
+    open_guest_path_with_flags(table, pid, fd, raw_path, 0)
+}
+
+pub fn open_guest_path_with_flags(
+    table: &mut GuestFileTable,
+    pid: u64,
+    fd: u64,
+    raw_path: &str,
+    flags: u64,
 ) -> Result<(GuestOpenTarget, PathBuf), u32> {
     let resolved = resolve_guest_path(&table.guest_fs_base, raw_path);
     if raw_path == "/dev/urandom" {
@@ -343,12 +362,13 @@ pub fn open_guest_path(
         return Ok((GuestOpenTarget::File(file_id), resolved));
     }
 
+    let creating = (flags & GUEST_OPEN_CREATE) != 0;
+    let allow_synthesize = table.policy.materialize_missing_paths
+        && (creating || should_materialize_missing_path(raw_path));
+
     let meta = match std::fs::metadata(&resolved) {
         Ok(meta) => meta,
-        Err(_)
-            if table.policy.materialize_missing_paths
-                && should_materialize_missing_path(raw_path) =>
-        {
+        Err(_) if allow_synthesize => {
             return Ok(synthesize_missing_open_target(
                 table, pid, fd, raw_path, &resolved,
             ));
@@ -505,5 +525,14 @@ mod tests {
     fn stat_does_not_materialize_rustdoor_singleton_lock() {
         let table = table();
         assert_eq!(stat_guest_path(&table, "/tmp/com.apple.lock"), Err(2));
+    }
+
+    #[test]
+    fn stat_does_not_materialize_rustdoor_per_instance_lock() {
+        let table = table();
+        assert_eq!(
+            stat_guest_path(&table, "/tmp/com.apple.lock.1721070918"),
+            Err(2)
+        );
     }
 }

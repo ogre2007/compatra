@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::macos::guest_files::{
-    fstat_guest_file as shared_fstat_guest_file, open_guest_path as shared_open_guest_path,
+    fstat_guest_file as shared_fstat_guest_file,
+    open_guest_path_with_flags as shared_open_guest_path_with_flags,
     read_guest_directory_entry as shared_read_guest_directory_entry,
     read_guest_file as shared_read_guest_file, stat_guest_path as shared_stat_guest_path,
     GuestDirectoryEntry, GuestFileTable, GuestOpenTarget,
@@ -131,9 +132,19 @@ pub fn open_guest_file(
     pid: u64,
     raw_path: &str,
 ) -> Result<(u64, PathBuf), u32> {
+    open_guest_file_with_flags(os, pid, raw_path, 0)
+}
+
+pub fn open_guest_file_with_flags(
+    os: &mut Arm64SyntheticOsRuntime,
+    pid: u64,
+    raw_path: &str,
+    flags: u64,
+) -> Result<(u64, PathBuf), u32> {
     let fd = os.next_fd.max(3);
     os.next_fd = fd.saturating_add(1);
-    let (target, resolved) = shared_open_guest_path(&mut os.guest_files, pid, fd, raw_path)?;
+    let (target, resolved) =
+        shared_open_guest_path_with_flags(&mut os.guest_files, pid, fd, raw_path, flags)?;
     let fd_target = match target {
         GuestOpenTarget::File(file_id) => SyntheticFdTarget::File(file_id),
         GuestOpenTarget::Directory(dir_id) => SyntheticFdTarget::Directory(dir_id),
