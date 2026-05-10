@@ -686,10 +686,54 @@ pub fn install_arm64_io_imports(
                         Err(_) => return,
                     };
                     match cmd {
-                        0 | 67 => match duplicate_synthetic_fd(&mut os, current_pid, fd, arg) {
-                            Ok(new_fd) => (new_fd, 0u32),
-                            Err(errno) => (u64::MAX, errno),
-                        },
+                        0 | 67 => {
+                            // Tokio/mio sometimes pass garbage in x2 (the
+                            // min-fd argument): F_DUPFD_CLOEXEC is often
+                            // emitted with a stack-pointer-like value
+                            // because of register reuse from inlined
+                            // helpers. Clamp aggressively so we don't
+                            // loop forever scanning the fd table.
+                            let min_fd = if arg > 0x10_000 { 3 } else { arg };
+                            // kqueue fds live in os.kqueues, not in
+                            // process_fd_targets, so duplicate_synthetic_fd
+                            // would return EBADF for them. Detect that
+                            // case and synthesize a kqueue duplicate
+                            // inline so Tokio's runtime bootstrap doesn't
+                            // see -1 and panic at brk #0x1.
+                            if os.kqueues.contains_key(&fd) {
+                                let existing = os
+                                    .kqueues
+                                    .get(&fd)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let new_fd = os
+                                    .next_kqueue_fd
+                                    .max(0x20_000)
+                                    .max(min_fd);
+                                os.next_kqueue_fd = new_fd.saturating_add(1);
+                                os.kqueues.insert(new_fd, existing);
+                                register_process_fd(&mut os, current_pid, new_fd);
+                                if cmd == 67 {
+                                    os.fd_flags.insert(new_fd, 1);
+                                }
+                                (new_fd, 0u32)
+                            } else {
+                                match duplicate_synthetic_fd(
+                                    &mut os,
+                                    current_pid,
+                                    fd,
+                                    min_fd,
+                                ) {
+                                    Ok(new_fd) => {
+                                        if cmd == 67 {
+                                            os.fd_flags.insert(new_fd, 1);
+                                        }
+                                        (new_fd, 0u32)
+                                    }
+                                    Err(errno) => (u64::MAX, errno),
+                                }
+                            }
+                        }
                         1 => (os.fd_flags.get(&fd).copied().unwrap_or(0), 0u32),
                         2 => {
                             os.fd_flags.insert(fd, arg);
