@@ -33,3 +33,9 @@ venv/
 *.til
 *.id*
 *.dmp
+
+# IDA / Hex-Rays decompilation output sitting next to fixtures.
+# The .macho samples are tracked but their decompiled .c output is
+# multi-megabyte reverse-engineered text we treat as scratch.
+fixtures/**/*.macho.c
+fixtures/**/*.bndb
