@@ -2299,6 +2299,88 @@ pub fn install_arm64_io_imports(
         )?;
     }
 
+    if let Some(&addr) = stub_map.get("_posix_memalign") {
+        // POSIX `int posix_memalign(void **memptr, size_t alignment,
+        // size_t size)` — on success it returns 0 and stores the
+        // allocated pointer in `*memptr`. The Rust allocator
+        // (`__rust_alloc` -> `sub_100064658` in RustDoor) calls this
+        // for any allocation whose alignment exceeds `0x10`. Without
+        // a real hook the import-stub returns 0 (which the caller
+        // reads as "success") but `*memptr` stays NULL, so every
+        // over-aligned Rust allocation silently produces a NULL
+        // pointer. In RustDoor that propagates through the tokio
+        // runtime worker bootstrap and ends in the `brk #0x1` panic
+        // at `0x10000AE00` before the malware can spawn its
+        // `osascript display dialog ...` / `chflags hidden npm` /
+        // `curl ...` `posix_spawnp` calls.
+        let malloc_next_addr = shared_state.malloc_next_addr.clone();
+        let malloc_mapped_until = shared_state.malloc_mapped_until.clone();
+        let malloc_allocations = shared_state.malloc_allocations.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let memptr_ptr = emu.read_reg("x0").unwrap_or(0);
+                let alignment = emu.read_reg("x1").unwrap_or(0).max(1);
+                let size = emu.read_reg("x2").unwrap_or(0);
+                // Round size up to alignment. If size is 0 we still
+                // hand out a stable non-NULL pointer (Rust's
+                // dangling-but-valid sentinel discipline) so the
+                // caller's "if (memptr) ..." check passes.
+                let alloc_size = align_up(size.max(1), alignment.max(0x10));
+                let page_size = align_up(alloc_size, 0x1000);
+                let allocated = {
+                    let mut next = match malloc_next_addr.lock() {
+                        Ok(next) => next,
+                        Err(_) => return,
+                    };
+                    // Bump up to the requested alignment.
+                    let aligned = align_up(*next, alignment.max(0x10));
+                    *next = aligned.saturating_add(page_size);
+                    if !ensure_malloc_range_mapped(emu, &malloc_mapped_until, aligned, page_size) {
+                        return;
+                    }
+                    let _ = emu.write_memory(aligned, &vec![0u8; alloc_size as usize]);
+                    aligned
+                };
+                if let Ok(mut allocations) = malloc_allocations.lock() {
+                    allocations.insert(allocated, alloc_size);
+                }
+                let mut wrote_memptr = false;
+                if memptr_ptr != 0 {
+                    if emu
+                        .write_memory(memptr_ptr, &allocated.to_le_bytes())
+                        .is_ok()
+                    {
+                        wrote_memptr = true;
+                    }
+                }
+                let result_code: u64 = if wrote_memptr { 0 } else { 22 /* EINVAL */ };
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result_code);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_posix_memalign(memptr=0x{:X}, alignment=0x{:X}, size=0x{:X}) -> result={} *memptr=0x{:X}",
+                        memptr_ptr, alignment, size, result_code, allocated
+                    ),
+                );
+                let event = arm64_memory_event("posix_memalign")
+                    .arg("MemPtrPtr", format!("0x{:X}", memptr_ptr))
+                    .arg("Alignment", format!("0x{:X}", alignment))
+                    .arg("Size", format!("0x{:X}", size))
+                    .arg("Allocated", format!("0x{:X}", allocated))
+                    .arg("Result", result_code.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
     if let Some(&addr) = stub_map.get("_write") {
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
