@@ -186,4 +186,40 @@ fn rustdoor_fast_mode_reaches_log_stream_posix_spawnp() {
             spawn_lines.join("\n")
         );
     }
+
+    // 6. After the log-stream spawn, the daemon's Tokio worker thread
+    //    bootstraps a kqueue + EVFILT_USER waker. Until we synthesized a
+    //    kqueue duplicate for `_fcntl(kq, F_DUPFD_CLOEXEC, _)` the worker
+    //    panicked at brk #0x1 because the dup returned -1. Pin both the
+    //    successful kqueue dup AND the EVFILT_USER kevent registration so
+    //    a regression that re-introduces the brk_trap fails here instead
+    //    of silently shrinking the trace.
+    let kqueue_dup_seen = trace.lines().any(|line| {
+        line.contains("\"Call\":\"fcntl\"")
+            && line.contains("\"CmdName\":\"F_DUPFD_CLOEXEC\"")
+            && line.contains("\"Errno\":\"0\"")
+            // Source kqueue fd is allocated at 0x20_000 (131072) by
+            // `_kqueue`; the dup result must be 0x20_001 or higher.
+            && line.contains("\"Fd\":\"131072\"")
+    });
+    assert!(
+        kqueue_dup_seen,
+        "fast-mode trace did not record a successful F_DUPFD_CLOEXEC of \
+         the kqueue fd — Tokio's worker bootstrap probably panicked at \
+         brk #0x1 again because the dup returned -1"
+    );
+
+    let evfilt_user_kevent_seen = trace.lines().any(|line| {
+        line.contains("\"plugin\":\"kqueuemon\"")
+            && line.contains("\"Call\":\"kevent\"")
+            // EVFILT_USER == -10, registered with EV_ADD|EV_CLEAR|EV_RECEIPT.
+            && line.contains("filter=-10")
+            && line.contains("ident=0")
+    });
+    assert!(
+        evfilt_user_kevent_seen,
+        "fast-mode trace did not contain the worker's EVFILT_USER waker \
+         registration — Tokio's poll loop never finished bootstrapping, \
+         so the daemon will never wait on the log-stream pipe"
+    );
 }
