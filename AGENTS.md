@@ -110,15 +110,16 @@ add new ones):
 
 ## CI and local validation
 
-- CI (`.github/workflows/rust.yml`) runs on Ubuntu and uses the Python
-  checker: `python3 scripts/ci/check_amos_trace.py amos-trace.jsonl`.
-- `scripts/ci/check_amos_trace.ps1` is a local Windows convenience mirror;
-  keep both checkers in sync if you change the AMOS trace contract.
+- CI (`.github/workflows/rust.yml`) runs on Ubuntu via `cargo test`. The
+  AMOS regression contract lives in `tests/amos_private_access.rs` and
+  the RustDoor fast-mode contract lives in `tests/rustdoor_fast_mode.rs`;
+  both spawn the `machina` binary and assert milestones from the JSONL
+  trace.
 - Canonical local smoke flow:
   - `cargo build --bin machina`
   - `cargo run --bin machina -- fixtures/macos/bin/arm64_hello`
-  - AMOS regression: run the binary against the AMOS sample, redirect to
-    `amos-trace.jsonl`, then run the Python checker.
+  - `cargo test --test amos_private_access` for the AMOS regression
+  - `cargo test --test rustdoor_fast_mode` for the RustDoor milestones
 
 ## Repo hygiene
 

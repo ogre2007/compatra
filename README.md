@@ -65,17 +65,18 @@ cargo run --bin machina -- fixtures\macos\bin\arm64_hello
 
 ## Local AMOS integration check
 
-Generate a JSONL trace:
+The AMOS private-file access milestones (Binance / Firefox / Electrum
+/ Coinomi / Chrome) are pinned by `tests/amos_private_access.rs`. Run
+it with:
 
-```powershell
-.\target\debug\machina.exe fixtures\macos\bin\2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho > amos-trace.jsonl
+```
+cargo test --test amos_private_access
 ```
 
-Validate that execution reached stealer logic and private-file access:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\ci\check_amos_trace.ps1 amos-trace.jsonl
-```
+The test spawns the `machina` binary against the AMOS fixture and
+asserts the milestones from its JSONL stdout, so it works the same way
+on Windows, macOS, and Linux without a separate Python or PowerShell
+checker.
 
 ## Sample corpus
 
