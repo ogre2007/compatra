@@ -78,6 +78,57 @@ emulator behavior.
 - Recommended local invocation:
   - `MACHINA_PROFILE=long .\target\debug\machina.exe fixtures\macos\bin\rustdoor\76f96a35b6f638eed779dc127f29a5b537ffc3bb7accc2c9bfab5a2120ea6bc9.macho > rustdoor-trace-long.jsonl`
 
+## `machoman/D1yCPUyk.bin.macho`
+
+- Path: [fixtures/macos/bin/machoman/D1yCPUyk.bin.macho](D:/dev/quiling/qiling/fixtures/macos/bin/machoman/D1yCPUyk.bin.macho)
+- Family: Lazarus "Mach-O Man" kit, profiler stage (companion of the
+  `teamsSDK.bin` stager; downloaded as `D1<random>.bin` and run with
+  a `<server_url>` argument to register the host with the C2)
+- Architecture: arm64
+- Source notes: heavy control-flow obfuscation (every basic block
+  ends in an indirect `br xN` through a `movz`/`movk` chain plus
+  garbage register ops in between), obfuscated segment names like
+  `.<71` / `.hAv` / `.AR1` masking what would normally be
+  `__DATA_CONST` / extra `__TEXT` shards, and a duplicate
+  chained-fixups table in `__DATA_CONST` mirroring the registered
+  chain in the `.<71` segment.
+- Current observed status:
+  - the binary uses `LC_DYLD_CHAINED_FIXUPS` instead of the legacy
+    bind opcodes. Before chained-fixups support was added, any
+    indirect call through `__nl_symbol_ptr` fetched the raw chain
+    entry `0x8010000000000065` for `_time` (ordinal 0x65), the TBI
+    handler stripped the tag, and PC landed inside the Mach-O
+    header at `0x100000065`, exhausting the 50M instruction budget
+    with `Imports=0 / Syscalls=0` and a `tagged-pointer-alias`
+    memmon event as the smoking gun.
+  - the loader now walks the chained-fixups blob at load time and
+    patches every bind slot (150 in the real chain + 132 in the
+    `__DATA_CONST` mirror = 282 binds) and every rebase (3 — two
+    static initializers and one terminator) to the appropriate
+    synthetic stub or canonical address. The fallback walker for
+    unregistered mirror tables is conservative (only triggered for
+    segments whose first 8 bytes match the chain-bind sentinel
+    pattern).
+  - emulation now boots the C++ runtime: `_getpid` / `_srand` /
+    `_strlen` and the libc++ string constructors execute, and
+    control reaches `std::__1::basic_ostream<...>::sentry::sentry`
+    (the first thing `operator<<` does when the binary prints its
+    usage message to `std::cerr`).
+- **Current next blocker:** the synthetic `mov x0,#0; ret` stub
+  isn't a faithful replacement for the C++ sentry constructor.
+  After the sentry returns with `x0 = 0`, the surrounding
+  `operator<<` flow loads the sentry's `ok_` field with
+  `ldr w8, [sp, #76]` at `0x1002341F0` and Unicorn faults with
+  `UC_ERR_READ_UNMAPPED` — the underlying issue is that data
+  symbols like `__ZNSt3__14cerrE` are currently bound to function
+  stub addresses (no vtable, no streambuf), so any C++ ostream
+  state read through the ostream object falls off the stub region.
+  To reach the usage message we need: (a) a real fake-ostream data
+  region the `cerr` import binds to, (b) a sentry stub that writes
+  `1` into `*this` so `operator<<` continues past the ok-check.
+- Recommended local invocation:
+  - `.\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-trace.jsonl`
+
 ## Corpus hygiene
 
 - New samples should be added with a short status note here.
