@@ -118,6 +118,45 @@ pub mod thread_flavor {
     pub const ARM_THREAD_STATE: u32 = 0x0000_0003;
 }
 
+/// Chained-fixups (LC_DYLD_CHAINED_FIXUPS) layout constants.
+///
+/// Layout of the blob pointed at by LC_DYLD_CHAINED_FIXUPS's
+/// linkedit_data_command:
+///
+/// ```c
+/// struct dyld_chained_fixups_header {
+///     uint32_t fixups_version;   // 0
+///     uint32_t starts_offset;    // offset of dyld_chained_starts_in_image
+///     uint32_t imports_offset;   // offset to imports table
+///     uint32_t symbols_offset;   // offset to symbol strings
+///     uint32_t imports_count;
+///     uint32_t imports_format;   // DYLD_CHAINED_IMPORT_* values below
+///     uint32_t symbols_format;   // 0 = uncompressed
+/// };
+/// ```
+pub mod dyld_chained_fixups {
+    pub const DYLD_CHAINED_IMPORT: u32 = 1;
+    pub const DYLD_CHAINED_IMPORT_ADDEND: u32 = 2;
+    pub const DYLD_CHAINED_IMPORT_ADDEND64: u32 = 3;
+
+    pub const DYLD_CHAINED_PTR_ARM64E: u16 = 1;
+    pub const DYLD_CHAINED_PTR_64: u16 = 2;
+    pub const DYLD_CHAINED_PTR_32: u16 = 3;
+    pub const DYLD_CHAINED_PTR_32_CACHE: u16 = 4;
+    pub const DYLD_CHAINED_PTR_32_FIRMWARE: u16 = 5;
+    pub const DYLD_CHAINED_PTR_64_OFFSET: u16 = 6;
+    pub const DYLD_CHAINED_PTR_ARM64E_KERNEL: u16 = 7;
+    pub const DYLD_CHAINED_PTR_64_KERNEL_CACHE: u16 = 8;
+    pub const DYLD_CHAINED_PTR_ARM64E_USERLAND: u16 = 9;
+    pub const DYLD_CHAINED_PTR_ARM64E_FIRMWARE: u16 = 10;
+    pub const DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE: u16 = 11;
+    pub const DYLD_CHAINED_PTR_ARM64E_USERLAND24: u16 = 12;
+
+    pub const DYLD_CHAINED_PTR_START_NONE: u16 = 0xFFFF;
+    pub const DYLD_CHAINED_PTR_START_MULTI: u16 = 0x8000;
+    pub const DYLD_CHAINED_PTR_START_LAST: u16 = 0x8000;
+}
+
 /// VM protection constants
 pub mod vm_protection {
     pub const VM_PROT_READ: i32 = 0x01;

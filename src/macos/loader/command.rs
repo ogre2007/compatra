@@ -27,6 +27,7 @@ pub enum LoadCommand {
     FunctionStarts(FunctionStartsCommand),
     DataInCode(DataInCodeCommand),
     DyldInfoOnly(DyldInfoOnlyCommand),
+    DyldChainedFixups(DyldChainedFixupsCommand),
     Unknown {
         cmd_id: u32,
         cmd_size: u32,
@@ -124,6 +125,9 @@ impl LoadCommand {
             load_command::LC_DYLD_INFO_ONLY => {
                 LoadCommand::DyldInfoOnly(DyldInfoOnlyCommand::parse(cmd_data, big_endian)?)
             }
+            load_command::LC_DYLD_CHAINED_FIXUPS => LoadCommand::DyldChainedFixups(
+                DyldChainedFixupsCommand::parse(cmd_data, big_endian)?,
+            ),
             _ => LoadCommand::Unknown {
                 cmd_id: cmd,
                 cmd_size: cmdsize as u32,
@@ -155,6 +159,7 @@ impl LoadCommand {
             LoadCommand::FunctionStarts(_) => load_command::LC_FUNCTION_STARTS,
             LoadCommand::DataInCode(_) => load_command::LC_DATA_IN_CODE,
             LoadCommand::DyldInfoOnly(_) => load_command::LC_DYLD_INFO_ONLY,
+            LoadCommand::DyldChainedFixups(_) => load_command::LC_DYLD_CHAINED_FIXUPS,
             LoadCommand::Unknown { cmd_id, .. } => *cmd_id,
         }
     }
@@ -1157,6 +1162,31 @@ impl FunctionStartsCommand {
             ));
         }
 
+        let mut cursor = Cursor::new(data);
+        Ok(Self {
+            data_offset: read_u32(&mut cursor, big_endian)?,
+            data_size: read_u32(&mut cursor, big_endian)?,
+        })
+    }
+}
+
+/// LC_DYLD_CHAINED_FIXUPS uses the same linkedit_data_command layout
+/// (cmd, cmdsize, dataoff, datasize) as LC_FUNCTION_STARTS / LC_DATA_IN_CODE.
+/// The `data_offset`/`data_size` pair points into __LINKEDIT at the
+/// `dyld_chained_fixups_header` blob that drives bind/rebase resolution.
+#[derive(Debug, Clone)]
+pub struct DyldChainedFixupsCommand {
+    pub data_offset: u32,
+    pub data_size: u32,
+}
+
+impl DyldChainedFixupsCommand {
+    pub fn parse(data: &[u8], big_endian: bool) -> Result<Self, MacOsError> {
+        if data.len() < 8 {
+            return Err(MacOsError::LoaderError(
+                "DyldChainedFixups data too short".to_string(),
+            ));
+        }
         let mut cursor = Cursor::new(data);
         Ok(Self {
             data_offset: read_u32(&mut cursor, big_endian)?,

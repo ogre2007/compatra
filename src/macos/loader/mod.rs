@@ -7,7 +7,10 @@ pub mod consts;
 pub mod header;
 pub mod parser;
 
-use crate::macos::imports::{install_synthetic_macho_imports, patch_macho_import_pointer_sections};
+use crate::macos::imports::{
+    install_synthetic_macho_imports, patch_macho_import_pointer_sections,
+    process_macho_chained_fixups,
+};
 use crate::macos::Emulator;
 use crate::macos::LogLevel;
 use crate::macos::MacOsError;
@@ -332,9 +335,10 @@ impl MachOLoader {
         };
 
         if let Some(arch) = arch {
-            match install_synthetic_macho_imports(emulator, arch, synthetic_base).and_then(
-                |synthetic| {
-                    patch_macho_import_pointer_sections(
+            let install_result = install_synthetic_macho_imports(emulator, arch, synthetic_base);
+            match install_result {
+                Ok(synthetic) => {
+                    let patch_result = patch_macho_import_pointer_sections(
                         emulator,
                         self,
                         arch,
@@ -342,18 +346,51 @@ impl MachOLoader {
                         &synthetic.syscall_stubs,
                         &synthetic.symbol_stubs,
                         &synthetic.data_symbols,
-                    )
-                },
-            ) {
-                Ok((patched, mapped_to_syscall, unresolved_fallback)) => {
-                    emulator.log(
-                        LogLevel::Info,
-                        &format!(
-                            "Applied synthetic no-dyld import fallback: patched={}, syscall_stubs={}, unresolved={}",
-                            patched, mapped_to_syscall, unresolved_fallback
-                        ),
                     );
-                    return Ok(());
+                    let chain_result = process_macho_chained_fixups(
+                        emulator,
+                        self,
+                        arch,
+                        synthetic.zero_stub_addr,
+                        &synthetic.syscall_stubs,
+                        &synthetic.symbol_stubs,
+                        &synthetic.data_symbols,
+                    );
+                    match (patch_result, chain_result) {
+                        (Ok((patched, mapped_to_syscall, unresolved_fallback)), Ok(chain)) => {
+                            emulator.log(
+                                LogLevel::Info,
+                                &format!(
+                                    "Applied synthetic no-dyld import fallback: patched={}, syscall_stubs={}, unresolved={}, chained_bound={}, chained_rebased={}, chained_unresolved={}",
+                                    patched,
+                                    mapped_to_syscall,
+                                    unresolved_fallback,
+                                    chain.bound,
+                                    chain.rebased,
+                                    chain.unresolved,
+                                ),
+                            );
+                            return Ok(());
+                        }
+                        (Ok(_), Err(err)) => {
+                            emulator.log(
+                                LogLevel::Warn,
+                                &format!(
+                                    "Chained-fixups processing failed, using gadget fallback: {}",
+                                    err
+                                ),
+                            );
+                        }
+                        (Err(err), _) => {
+                            emulator.log(
+                                LogLevel::Warn,
+                                &format!(
+                                    "Synthetic no-dyld import fallback failed, using gadget fallback: {}",
+                                    err
+                                ),
+                            );
+                        }
+                    }
                 }
                 Err(err) => {
                     emulator.log(

@@ -144,6 +144,41 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         &trace_bus,
         &process_name,
     )?;
+
+    // Apply LC_DYLD_CHAINED_FIXUPS: walk every chain in the data
+    // segments and patch each pointer slot in guest memory. Without
+    // this, indirect calls through __nl_symbol_ptr / GOT fetch the
+    // raw chain value (`bit63=1 | ordinal`) and the emulator's TBI
+    // strip lands PC inside the Mach-O header at offsets like
+    // 0x100000065, never executing real imports.
+    match crate::macos::imports::process_chained_fixups_with_binary(
+        &mut emulator,
+        &binary,
+        0u64,
+        &stub_map,
+        None,
+        done_addr,
+    ) {
+        Ok(stats) if stats.bound + stats.rebased + stats.unresolved > 0 => {
+            if let Some(bus) = &trace_bus {
+                let _ = bus.send(
+                    process_event(&metadata, "chained-fixups", "process_chained_fixups")
+                        .arg("Bound", stats.bound.to_string())
+                        .arg("Rebased", stats.rebased.to_string())
+                        .arg("Unresolved", stats.unresolved.to_string()),
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            if let Some(bus) = &trace_bus {
+                let _ = bus.send(
+                    process_event(&metadata, "chained-fixups-error", "process_chained_fixups")
+                        .arg("Error", format!("{}", err)),
+                );
+            }
+        }
+    }
     let last_stub = import_tracker.last_stub.clone();
     let import_count = import_tracker.import_count.clone();
     let recent_imports = import_tracker.recent_imports.clone();

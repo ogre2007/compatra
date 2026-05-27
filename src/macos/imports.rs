@@ -2825,6 +2825,420 @@ pub fn install_synthetic_macho_imports(
     })
 }
 
+/// Result of resolving every bind in an `LC_DYLD_CHAINED_FIXUPS` blob.
+///
+/// Reported counts are the number of bind chain entries patched, the
+/// number of rebase entries rewritten, and the number of binds that
+/// fell back to the "unresolved" stub address because the named
+/// symbol had no synthetic stub.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ChainedFixupStats {
+    pub bound: usize,
+    pub rebased: usize,
+    pub unresolved: usize,
+}
+
+/// Walk every chain described by `LC_DYLD_CHAINED_FIXUPS` and patch
+/// each pointer slot in guest memory.
+///
+/// Modern macOS Mach-O binaries (and obfuscated samples like the
+/// Lazarus "Mach-O Man" profiler) use chained fixups instead of the
+/// legacy `LC_DYLD_INFO_ONLY` bind opcodes. Each pointer slot in a
+/// data segment is initialized in the file to a self-describing
+/// chain entry: bit 63 selects bind vs. rebase, bits 51-62 give the
+/// stride to the next slot (in 4-byte units, or 0 to end the chain),
+/// and the remaining bits encode either an import-table ordinal or
+/// an image-base-relative target offset. dyld walks every chain at
+/// load time and rewrites every slot to the resolved address.
+///
+/// Without this pass the slots remain as raw chain values, so any
+/// indirect call through `__nl_symbol_ptr` (or any C++ vtable / GOT
+/// load) jumps to the chain encoding itself — which strips through
+/// the TBI tag handler and lands inside the Mach-O header at offsets
+/// like `0x100000065`, exhausting the instruction budget without ever
+/// executing real import code.
+pub fn process_macho_chained_fixups(
+    emulator: &mut dyn Emulator,
+    loader: &MachOLoader,
+    _arch: ArchType,
+    zero_stub_addr: u64,
+    syscall_stubs: &HashMap<u64, u64>,
+    symbol_stubs: &HashMap<String, u64>,
+    data_symbols: &HashMap<String, u64>,
+) -> Result<ChainedFixupStats, MacOsError> {
+    let unresolved_mode = std::env::var("QILING_IMPORT_FALLBACK")
+        .unwrap_or_else(|_| "getpid".to_string())
+        .to_ascii_lowercase();
+    let fallback_addr = if unresolved_mode == "zero" {
+        zero_stub_addr
+    } else {
+        *syscall_stubs.get(&0x20).unwrap_or(&zero_stub_addr)
+    };
+    process_chained_fixups_with_binary(
+        emulator,
+        &loader.binary,
+        loader.slide,
+        symbol_stubs,
+        Some(data_symbols),
+        fallback_addr,
+    )
+}
+
+/// Loader-independent chained-fixups walker.
+///
+/// Decouples chain processing from `MachOLoader` so the arm64 runner
+/// (which loads the binary through its own segment-mapping path,
+/// then resolves imports via `install_return_stubs`) can patch
+/// chained-fixup binds against the runner's `stub_map`.
+pub fn process_chained_fixups_with_binary(
+    emulator: &mut dyn Emulator,
+    binary: &crate::macos::loader::parser::MachoBinary,
+    slide: u64,
+    symbol_stubs: &HashMap<String, u64>,
+    data_symbols: Option<&HashMap<String, u64>>,
+    fallback_addr: u64,
+) -> Result<ChainedFixupStats, MacOsError> {
+    use crate::macos::loader::consts::dyld_chained_fixups::*;
+
+    let mut stats = ChainedFixupStats::default();
+
+    // Locate the LC_DYLD_CHAINED_FIXUPS payload. If the binary uses
+    // the legacy bind opcodes there is nothing to do here.
+    let (blob_off, blob_size) = match binary.commands.iter().find_map(|c| match c {
+        LoadCommand::DyldChainedFixups(cf) => {
+            Some((cf.data_offset as usize, cf.data_size as usize))
+        }
+        _ => None,
+    }) {
+        Some(pair) => pair,
+        None => return Ok(stats),
+    };
+    let raw = &binary.data;
+    if blob_off
+        .checked_add(blob_size)
+        .map(|end| end > raw.len())
+        .unwrap_or(true)
+    {
+        return Err(MacOsError::LoaderError(
+            "chained-fixups blob extends past binary EOF".to_string(),
+        ));
+    }
+    let blob = &raw[blob_off..blob_off + blob_size];
+    if blob.len() < 28 {
+        return Err(MacOsError::LoaderError(
+            "chained-fixups header truncated".to_string(),
+        ));
+    }
+
+    let starts_offset = u32::from_le_bytes(blob[4..8].try_into().unwrap()) as usize;
+    let imports_offset = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
+    let symbols_offset = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
+    let imports_count = u32::from_le_bytes(blob[16..20].try_into().unwrap()) as usize;
+    let imports_format = u32::from_le_bytes(blob[20..24].try_into().unwrap());
+    let symbols_format = u32::from_le_bytes(blob[24..28].try_into().unwrap());
+    if symbols_format != 0 {
+        return Err(MacOsError::LoaderError(format!(
+            "chained-fixups symbols_format={} (only uncompressed=0 is supported)",
+            symbols_format
+        )));
+    }
+
+    let imports = parse_chained_fixup_imports(blob, imports_offset, symbols_offset, imports_count, imports_format)?;
+
+    // Resolve each import once up front so the chain walk is a
+    // straight lookup. Look up by the literal symbol name first
+    // (matching how install_return_stubs registers them — with the
+    // leading underscore preserved) and fall back to the normalized
+    // form for the synthetic-imports path.
+    let resolved: Vec<u64> = imports
+        .iter()
+        .map(|(_, _, name)| {
+            if let Some(&addr) = symbol_stubs.get(name) {
+                return addr;
+            }
+            let normalized = normalize_import_symbol(name.clone());
+            if let Some(&addr) = symbol_stubs.get(&normalized) {
+                return addr;
+            }
+            if let Some(d) = data_symbols {
+                if let Some(&addr) = d.get(&normalized) {
+                    return addr;
+                }
+                if let Some(&addr) = d.get(name) {
+                    return addr;
+                }
+            }
+            stats.unresolved += 1;
+            fallback_addr
+        })
+        .collect();
+
+    // Parse starts_in_image and walk each segment's chains.
+    let starts = &blob[starts_offset..];
+    if starts.len() < 4 {
+        return Err(MacOsError::LoaderError(
+            "chained-fixups starts_in_image truncated".to_string(),
+        ));
+    }
+    let seg_count = u32::from_le_bytes(starts[0..4].try_into().unwrap()) as usize;
+    if starts.len() < 4 + seg_count * 4 {
+        return Err(MacOsError::LoaderError(
+            "chained-fixups seg_info_offset table truncated".to_string(),
+        ));
+    }
+    let image_base = binary.header_address();
+
+    // Collect which segments the chain table actually covers so we
+    // can detect duplicate chain tables that other segments hold
+    // (some obfuscated samples mirror the chain bytes in
+    // __DATA_CONST without registering a starts entry; calls that
+    // resolve through that mirror would otherwise still see raw
+    // chain values).
+    let mut chain_format: Option<u16> = None;
+    let mut covered_segments: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for seg_idx in 0..seg_count {
+        let v = u32::from_le_bytes(
+            starts[4 + seg_idx * 4..4 + seg_idx * 4 + 4].try_into().unwrap(),
+        );
+        if v != 0 {
+            covered_segments.insert(seg_idx);
+            if chain_format.is_none() {
+                let sio = &blob[starts_offset + v as usize..];
+                if sio.len() >= 8 {
+                    chain_format =
+                        Some(u16::from_le_bytes(sio[6..8].try_into().unwrap()));
+                }
+            }
+        }
+    }
+
+    for seg_idx in 0..seg_count {
+        let seg_info_off = u32::from_le_bytes(
+            starts[4 + seg_idx * 4..4 + seg_idx * 4 + 4].try_into().unwrap(),
+        ) as usize;
+        if seg_info_off == 0 {
+            continue;
+        }
+        let sio = &blob[starts_offset + seg_info_off..];
+        if sio.len() < 22 {
+            continue;
+        }
+        let page_size = u16::from_le_bytes(sio[4..6].try_into().unwrap()) as u64;
+        let pointer_format = u16::from_le_bytes(sio[6..8].try_into().unwrap());
+        let segment_offset = u64::from_le_bytes(sio[8..16].try_into().unwrap());
+        let page_count = u16::from_le_bytes(sio[20..22].try_into().unwrap()) as usize;
+        if sio.len() < 22 + page_count * 2 {
+            continue;
+        }
+
+        for page_idx in 0..page_count {
+            let ps = u16::from_le_bytes(
+                sio[22 + page_idx * 2..22 + page_idx * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+            if ps == DYLD_CHAINED_PTR_START_NONE {
+                continue;
+            }
+            // DYLD_CHAINED_PTR_START_MULTI introduces a second header
+            // word giving multiple chain starts within one page; the
+            // obfuscated profiler does not use it, but unfamiliar
+            // pointer formats reach the same branch — skip cleanly
+            // rather than misinterpret.
+            if ps & DYLD_CHAINED_PTR_START_MULTI != 0 {
+                continue;
+            }
+            let chain_start_va = image_base
+                + segment_offset
+                + page_idx as u64 * page_size
+                + ps as u64
+                + slide;
+            walk_chain_64(
+                emulator,
+                chain_start_va,
+                pointer_format,
+                image_base + slide,
+                &resolved,
+                fallback_addr,
+                &mut stats,
+            )?;
+        }
+    }
+
+    // Fallback: detect duplicate chain tables in segments that
+    // weren't registered as having a chain start. Treat any
+    // r/w-writable segment whose first slot looks like a chain bind
+    // entry (top byte 0x80 — the sentinel that marks bit 63 set in
+    // chain-encoded binds) as a synthetic chain starting at offset
+    // 0, using the same pointer format the real chain used.
+    if let Some(fmt) = chain_format {
+        let segments_clone: Vec<crate::macos::loader::command::SegmentCommand64> = binary
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                LoadCommand::Segment64(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for (idx, seg) in segments_clone.iter().enumerate() {
+            if covered_segments.contains(&idx) {
+                continue;
+            }
+            if seg.filesize == 0 || seg.vmsize == 0 {
+                continue;
+            }
+            // PAGEZERO / TEXT / LINKEDIT are not GOT-like.
+            let segname = seg.segname_str();
+            if segname == "__PAGEZERO" || segname == "__TEXT" || segname == "__LINKEDIT" {
+                continue;
+            }
+            let probe_va = seg.vmaddr + slide;
+            let probe = match emulator.read_memory(probe_va, 8) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let probe_arr: [u8; 8] = match probe.try_into() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let raw = u64::from_le_bytes(probe_arr);
+            // Bind sentinel: bit 63 set AND ordinal in range AND
+            // next field non-zero. Without all three this is just
+            // ordinary data and we leave it alone.
+            let bind = (raw >> 63) & 1 == 1;
+            let nxt = (raw >> 51) & 0xFFF;
+            let ord = (raw & 0x00FF_FFFF) as usize;
+            if !(bind && nxt != 0 && ord < resolved.len()) {
+                continue;
+            }
+            walk_chain_64(
+                emulator,
+                probe_va,
+                fmt,
+                image_base + slide,
+                &resolved,
+                fallback_addr,
+                &mut stats,
+            )?;
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Decode the chained-fixup imports table into `(lib_ordinal, weak, name)` triples.
+fn parse_chained_fixup_imports(
+    blob: &[u8],
+    imports_offset: usize,
+    symbols_offset: usize,
+    imports_count: usize,
+    imports_format: u32,
+) -> Result<Vec<(u8, bool, String)>, MacOsError> {
+    use crate::macos::loader::consts::dyld_chained_fixups::*;
+    let entry_size = match imports_format {
+        DYLD_CHAINED_IMPORT => 4,
+        DYLD_CHAINED_IMPORT_ADDEND => 8,
+        DYLD_CHAINED_IMPORT_ADDEND64 => 16,
+        other => {
+            return Err(MacOsError::LoaderError(format!(
+                "chained-fixups imports_format={} not supported",
+                other
+            )));
+        }
+    };
+    if imports_offset + imports_count * entry_size > blob.len() {
+        return Err(MacOsError::LoaderError(
+            "chained-fixups imports table truncated".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(imports_count);
+    for i in 0..imports_count {
+        let off = imports_offset + i * entry_size;
+        // All three formats share the same first u32 layout for
+        // lib_ordinal / weak_import / name_offset.
+        let raw = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap());
+        let lib_ord = (raw & 0xFF) as u8;
+        let weak = ((raw >> 8) & 0x1) != 0;
+        let name_off = ((raw >> 9) & 0x007F_FFFF) as usize;
+        let nm_start = symbols_offset + name_off;
+        if nm_start >= blob.len() {
+            return Err(MacOsError::LoaderError(format!(
+                "chained-fixups import #{} name_offset 0x{:x} out of range",
+                i, name_off
+            )));
+        }
+        let nm_end = blob[nm_start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| nm_start + p)
+            .unwrap_or(blob.len());
+        let name = String::from_utf8_lossy(&blob[nm_start..nm_end]).into_owned();
+        out.push((lib_ord, weak, name));
+    }
+    Ok(out)
+}
+
+/// Walk a single chain starting at `chain_start_va` for one of the
+/// 64-bit `DYLD_CHAINED_PTR_*` formats and patch each slot in place.
+fn walk_chain_64(
+    emulator: &mut dyn Emulator,
+    chain_start_va: u64,
+    pointer_format: u16,
+    image_base_with_slide: u64,
+    resolved_imports: &[u64],
+    fallback_addr: u64,
+    stats: &mut ChainedFixupStats,
+) -> Result<(), MacOsError> {
+    use crate::macos::loader::consts::dyld_chained_fixups::*;
+    if !matches!(
+        pointer_format,
+        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET
+    ) {
+        return Ok(());
+    }
+    let mut va = chain_start_va;
+    // Sanity bound to avoid runaway chains in malformed blobs.
+    for _ in 0..0x10_0000 {
+        let bytes_vec = emulator.read_memory(va, 8)?;
+        let bytes: [u8; 8] = bytes_vec
+            .try_into()
+            .map_err(|_| MacOsError::LoaderError(format!("short read at chain slot 0x{:x}", va)))?;
+        let raw = u64::from_le_bytes(bytes);
+        let bind = (raw >> 63) & 1 == 1;
+        let next = ((raw >> 51) & 0xFFF) as u64;
+        let new_value: u64 = if bind {
+            let ordinal = (raw & 0x00FF_FFFF) as usize;
+            if ordinal < resolved_imports.len() {
+                stats.bound += 1;
+                resolved_imports[ordinal]
+            } else {
+                stats.unresolved += 1;
+                fallback_addr
+            }
+        } else {
+            // Rebase: bits 0-35 are the target offset. For format
+            // DYLD_CHAINED_PTR_64 bits 56-63 give the top byte of
+            // the final VA; for DYLD_CHAINED_PTR_64_OFFSET that
+            // field is reserved and must be zero.
+            let target_off = raw & 0x0000_000F_FFFF_FFFF;
+            let high8 = if pointer_format == DYLD_CHAINED_PTR_64 {
+                (raw >> 56) & 0xFF
+            } else {
+                0
+            };
+            stats.rebased += 1;
+            (high8 << 56) | (image_base_with_slide.wrapping_add(target_off))
+        };
+        emulator.write_memory(va, &new_value.to_le_bytes())?;
+        if next == 0 {
+            break;
+        }
+        va = va.wrapping_add(next * 4);
+    }
+    Ok(())
+}
+
 pub fn patch_macho_import_pointer_sections(
     emulator: &mut dyn Emulator,
     loader: &MachOLoader,
