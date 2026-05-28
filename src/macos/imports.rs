@@ -2953,20 +2953,28 @@ pub fn process_chained_fixups_with_binary(
     let resolved: Vec<u64> = imports
         .iter()
         .map(|(_, _, name)| {
+            // Prefer data-symbol bindings whenever both maps have an
+            // entry: install_return_stubs builds a function stub for
+            // every undefined symbol regardless of type, including
+            // C++ globals like `__ZNSt3__14cerrE`. Without checking
+            // data_symbols first, a load through cerr fetches stub
+            // code bytes as if they were the ostream object's
+            // vtable, and the next `ldur xN, [xN, #-N]` faults.
+            if let Some(d) = data_symbols {
+                if let Some(&addr) = d.get(name) {
+                    return addr;
+                }
+                let normalized = normalize_import_symbol(name.clone());
+                if let Some(&addr) = d.get(&normalized) {
+                    return addr;
+                }
+            }
             if let Some(&addr) = symbol_stubs.get(name) {
                 return addr;
             }
             let normalized = normalize_import_symbol(name.clone());
             if let Some(&addr) = symbol_stubs.get(&normalized) {
                 return addr;
-            }
-            if let Some(d) = data_symbols {
-                if let Some(&addr) = d.get(&normalized) {
-                    return addr;
-                }
-                if let Some(&addr) = d.get(name) {
-                    return addr;
-                }
             }
             stats.unresolved += 1;
             fallback_addr

@@ -9,6 +9,8 @@ pub mod arm64_binary_setup;
 pub mod arm64_bootstrap;
 #[path = "arch_arm64/diagnostics.rs"]
 pub mod arm64_diagnostics;
+#[path = "arch_arm64/cpp_imports.rs"]
+pub mod arm64_cpp_imports;
 #[path = "arch_arm64/io_imports.rs"]
 pub mod arm64_io_imports;
 #[path = "arch_arm64/process_imports.rs"]

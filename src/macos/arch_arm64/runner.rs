@@ -1,6 +1,7 @@
 //! Legacy arm64 Mach-O runner used by the no-dyld binary entrypoint.
 
 use crate::macos::apple_imports::install_apple_imports;
+use crate::macos::arm64_cpp_imports::install_arm64_cpp_imports;
 use crate::macos::binary_bootstrap::{map_binary_segments, setup_bootstrap_state};
 use crate::macos::binary_setup::{
     find_runtime_symbols, install_arm64_indirect_branch_hooks, install_arm64_lse_atomic_hooks,
@@ -21,7 +22,137 @@ use crate::macos::{
 };
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
+use crate::macos::{memory_event, SharedTraceBus};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 const INDIRECT_BRANCH_MODE_ENV: &str = "MACHINA_INDIRECT_BRANCH_MODE";
+
+/// Size of the fake C++ data region carved out of the mmap arena.
+/// Large enough to host a generic ostream object, a small vtable
+/// table, and a few extra fake-data symbols (ctype::id, etc.)
+/// without bumping into surrounding allocations.
+const ARM64_CPP_DATA_REGION_SIZE: u64 = 0x2000;
+
+/// Offsets inside the C++ data region for each kind of fake symbol.
+/// Layout is intentionally simple: a single vtable shared by every
+/// C++ class import, followed by per-instance objects whose
+/// vtable-pointer slot (offset 0) targets that shared vtable. The
+/// shared vtable holds far more entries than any individual class
+/// would ever index into, so virtual calls fall through to the
+/// done_addr return-zero gadget rather than tripping off the end.
+const ARM64_CPP_VTABLE_OFFSET: u64 = 0x100; // 32 fake vfn entries
+const ARM64_CPP_CERR_OBJECT_OFFSET: u64 = 0x400;
+const ARM64_CPP_CIN_OBJECT_OFFSET: u64 = 0x500;
+const ARM64_CPP_CTYPE_ID_OFFSET: u64 = 0x600;
+const ARM64_CPP_GENERIC_OBJECT_OFFSET: u64 = 0x700;
+
+/// Allocate and initialize a fake C++ data-symbol region.
+///
+/// Returns a map of known C++ data-symbol names → resolved
+/// addresses. Pass it to `process_chained_fixups_with_binary` as
+/// `data_symbols` so the chain walker patches data binds (like
+/// `__ZNSt3__14cerrE`) into this region instead of a function
+/// stub. The fake region survives for the lifetime of the
+/// emulator process and is never read by anything else, so the
+/// initial layout is locked in here and not rebuilt.
+fn setup_arm64_cpp_data_region(
+    emulator: &mut UnicornEmulator,
+    mmap_next: &Arc<AtomicU64>,
+    mmap_end: u64,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
+    let region_size = ARM64_CPP_DATA_REGION_SIZE;
+    let base = mmap_next.fetch_add(region_size, Ordering::Relaxed);
+    if base.saturating_add(region_size) > mmap_end {
+        // The mmap arena is exhausted — extremely unlikely in
+        // practice (it's 16 GB), but bail rather than wrap.
+        return Err("mmap arena exhausted while allocating C++ data region".into());
+    }
+    // The mmap arena overlaps the already-mapped heap region in
+    // arm64 bootstrap layout (see memory_arena::arm64) so we
+    // don't need to (and can't) re-map here. Just zero the slice.
+    let zeros = vec![0u8; region_size as usize];
+    emulator.write_memory(base, &zeros)?;
+
+    // Populate the shared vtable with done_addr entries. C++ code
+    // that reaches a virtual call ends up at done_addr's `ret`
+    // (returning 0 in x0), which is the same convention every
+    // unhandled libc++ stub already uses.
+    let vtable_addr = base + ARM64_CPP_VTABLE_OFFSET;
+    for i in 0..32 {
+        emulator.write_memory(vtable_addr + i * 8, &done_addr.to_le_bytes())?;
+    }
+
+    // Each fake object stores the shared vtable pointer at offset
+    // 0. The C++ ABI says `[this]` is the vtable for the most
+    // derived class. With every entry pointing at done_addr,
+    // any virtual call through this object harmlessly returns 0.
+    let cerr_addr = base + ARM64_CPP_CERR_OBJECT_OFFSET;
+    emulator.write_memory(cerr_addr, &vtable_addr.to_le_bytes())?;
+    let cin_addr = base + ARM64_CPP_CIN_OBJECT_OFFSET;
+    emulator.write_memory(cin_addr, &vtable_addr.to_le_bytes())?;
+    let ctype_id_addr = base + ARM64_CPP_CTYPE_ID_OFFSET;
+    // ctype::id is a small std::locale::id object; a single zeroed
+    // page is enough — the C++ runtime only uses it for identity
+    // comparisons.
+
+    let mut data_symbols: HashMap<String, u64> = HashMap::new();
+
+    // C++ globals (std::cerr / std::cin) — instances.
+    data_symbols.insert("__ZNSt3__14cerrE".to_string(), cerr_addr);
+    data_symbols.insert("__ZNSt3__14cinE".to_string(), cin_addr);
+    data_symbols.insert("__ZNSt3__15wcerrE".to_string(), cerr_addr);
+    data_symbols.insert("__ZNSt3__15wcinE".to_string(), cin_addr);
+    data_symbols.insert("__ZNSt3__15ctypeIcE2idE".to_string(), ctype_id_addr);
+
+    // C++ vtable / VTT symbols. The C++ ABI stores typeinfo at
+    // [vtable-8] and offset-to-top at [vtable-16]. Our shared
+    // vtable starts at vtable_addr, but a bind to `__ZTV*` should
+    // resolve to vtable_addr + 16 (i.e., past the metadata slots)
+    // so subsequent `ldr xN, [vtable, #0]` reads the first virtual
+    // function, not the typeinfo. We currently bind to vtable_addr
+    // directly because the metadata slots are already zeros from
+    // the initial map and the obfuscated code we observe reads
+    // `ldur xN, [xN, #-24]` — i.e., it expects valid memory at
+    // (vtable-24) too, which the surrounding zeros provide as long
+    // as the vtable lives well inside the region.
+    let vtable_names = [
+        "__ZTVNSt3__18ios_baseE",
+        "__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__113basic_ostreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__113basic_istreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__115basic_streambufIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTVNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTVNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
+        "__ZTTNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
+        "__ZTTNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTTNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+    ];
+    for name in vtable_names {
+        data_symbols.insert(name.to_string(), vtable_addr);
+    }
+
+    let _ = ARM64_CPP_GENERIC_OBJECT_OFFSET; // reserved for future symbols
+
+    if let Some(bus) = trace_bus {
+        let _ = bus.send(
+            memory_event(metadata, "cpp-data-region")
+                .arg("Base", format!("0x{:X}", base))
+                .arg("Size", format!("0x{:X}", region_size))
+                .arg("VTable", format!("0x{:X}", vtable_addr))
+                .arg("Cerr", format!("0x{:X}", cerr_addr)),
+        );
+    }
+    Ok(data_symbols)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndirectBranchMode {
@@ -145,6 +276,30 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         &process_name,
     )?;
 
+    // Build a fake C++ data-symbol region so chained-fixups can
+    // bind C++ globals (std::cerr, vtables) to a region that won't
+    // crash when the binary dereferences them as ostream/vtable
+    // pointers. Without this, the chained-fixups walker binds
+    // every C++ data symbol to a function stub address, and the
+    // first time the C++ code does `ldr xN, [cerr_slot]` followed
+    // by `ldr xN, [xN]` (vtable load) it fetches 8 bytes of stub
+    // code (`mov x0,0; ret` = 0xd65f03c0d2800000) as data and the
+    // next vtable-relative LDUR faults on the bogus address.
+    let cpp_data_symbols = match setup_arm64_cpp_data_region(
+        &mut emulator,
+        &mmap_next,
+        mmap_end,
+        done_addr,
+        &trace_bus,
+        &metadata,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[CPP-DATA-REGION] setup failed: {}", e);
+            HashMap::new()
+        }
+    };
+
     // Apply LC_DYLD_CHAINED_FIXUPS: walk every chain in the data
     // segments and patch each pointer slot in guest memory. Without
     // this, indirect calls through __nl_symbol_ptr / GOT fetch the
@@ -156,7 +311,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         &binary,
         0u64,
         &stub_map,
-        None,
+        Some(&cpp_data_symbols),
         done_addr,
     ) {
         Ok(stats) if stats.bound + stats.rebased + stats.unresolved > 0 => {
@@ -179,6 +334,21 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
             }
         }
     }
+
+    // Install C++ ostream stub overrides. Without these, every
+    // operator<< call construct/destructs a sentry but never
+    // writes — and `basic_ostream::write` silently returns 0
+    // instead of producing the actual message bytes. Wire these
+    // up after install_return_stubs so the stub addresses are
+    // already populated.
+    install_arm64_cpp_imports(
+        &mut emulator,
+        &stub_map,
+        &trace_bus,
+        &import_tracker,
+        &process_name,
+    )?;
+
     let last_stub = import_tracker.last_stub.clone();
     let import_count = import_tracker.import_count.clone();
     let recent_imports = import_tracker.recent_imports.clone();

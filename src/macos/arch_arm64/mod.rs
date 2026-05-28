@@ -2,6 +2,7 @@
 
 pub use crate::macos::arm64_binary_setup as binary_setup;
 pub use crate::macos::arm64_bootstrap as bootstrap;
+pub use crate::macos::arm64_cpp_imports as cpp_imports;
 pub use crate::macos::arm64_diagnostics as diagnostics;
 pub use crate::macos::arm64_io_imports as io_imports;
 pub use crate::macos::arm64_process_imports as process_imports;
