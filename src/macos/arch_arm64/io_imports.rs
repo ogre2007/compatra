@@ -1472,9 +1472,33 @@ pub fn install_arm64_io_imports(
                     &import_tracker,
                     format!("_strlen(str=0x{:X}) -> {}", str_ptr, len),
                 );
+                // Include the actual string content (up to 256
+                // chars, control chars replaced) so callers can
+                // see what the binary is measuring. C++ obfuscated
+                // ostream paths inline the streambuf write, so
+                // _strlen on a literal is often the only evidence
+                // of which message the binary was about to emit.
+                let preview_len = len.min(256) as usize;
+                let bytes = if str_ptr != 0 && preview_len > 0 {
+                    emu.read_memory(str_ptr, preview_len)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let text: String = bytes
+                    .iter()
+                    .map(|&b| match b {
+                        0x20..=0x7e => b as char,
+                        b'\n' => '\u{240A}',
+                        b'\r' => '\u{240D}',
+                        b'\t' => '\u{2409}',
+                        _ => '.',
+                    })
+                    .collect();
                 let event = arm64_process_event(current_pid, current_tid, "strlen", "strlen")
                     .arg("Ptr", format!("0x{:X}", str_ptr))
-                    .arg("Result", len.to_string());
+                    .arg("Result", len.to_string())
+                    .arg("Text", text);
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
