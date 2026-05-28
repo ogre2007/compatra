@@ -18,7 +18,8 @@ use crate::macos::runtime_hooks::install_runtime_hooks;
 use crate::macos::time_imports::install_time_imports;
 use crate::macos::{
     default_guest_fs_base, ensure_macho_cpu, install_runtime_plugins, process_event,
-    shared_trace_bus_from_env, MacosCpu, RuntimeContext, SyscallRuntimePlugin, TraceMetadata,
+    runtime_process_metadata, shared_trace_bus_from_env, MacosCpu, RuntimeContext,
+    SyscallRuntimePlugin, TraceMetadata,
 };
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
@@ -348,6 +349,52 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         &import_tracker,
         &process_name,
     )?;
+
+    // Optional: bypass the obfuscated argc/usage decision so the
+    // profile collection path runs even when the binary's argc
+    // check is broken or expects an environment we don't
+    // synthesize. Set `MACHINA_BYPASS_USAGE_CHECK=<comma-list of
+    // hex addresses>` to override the bool functions at those
+    // PCs to return 0 (skip-usage path). Specific to the Mach-O
+    // Man profiler — the obfuscator wraps the real
+    // `should_print_usage` check in
+    // `sub_10022AE68 → sub_10022AE90 → sub_10022AEB4 →
+    // sub_10022AED4: return sub_100232C28() == 0`, where
+    // `sub_100232C28 → sub_100232C58` is an obfuscated argc
+    // probe IDA gave up on.
+    if let Ok(pcs) = std::env::var("MACHINA_BYPASS_USAGE_CHECK") {
+        for token in pcs.split(',') {
+            let token = token.trim();
+            let stripped = token.trim_start_matches("0x").trim_start_matches("0X");
+            let addr = match u64::from_str_radix(stripped, 16) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let trace_bus_for_hook = trace_bus.clone();
+            let proc_name = process_name.to_string();
+            emulator.add_code_hook(
+                addr,
+                addr + 4,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    let _ = emu.write_reg("x0", 0u64);
+                    let lr = emu.read_reg("lr").unwrap_or(0);
+                    if lr != 0 {
+                        let _ = emu.write_reg("pc", lr);
+                    }
+                    if let Some(bus) = &trace_bus_for_hook {
+                        let _ = bus.send(
+                            process_event(
+                                &runtime_process_metadata(proc_name.clone()),
+                                "bypass-usage-check",
+                                "bypass_usage_check",
+                            )
+                            .arg("Pc", format!("0x{:X}", addr)),
+                        );
+                    }
+                },
+            )?;
+        }
+    }
 
     let last_stub = import_tracker.last_stub.clone();
     let import_count = import_tracker.import_count.clone();
