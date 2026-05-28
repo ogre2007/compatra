@@ -114,18 +114,51 @@ emulator behavior.
     control reaches `std::__1::basic_ostream<...>::sentry::sentry`
     (the first thing `operator<<` does when the binary prints its
     usage message to `std::cerr`).
-- **Current next blocker:** the synthetic `mov x0,#0; ret` stub
-  isn't a faithful replacement for the C++ sentry constructor.
-  After the sentry returns with `x0 = 0`, the surrounding
-  `operator<<` flow loads the sentry's `ok_` field with
-  `ldr w8, [sp, #76]` at `0x1002341F0` and Unicorn faults with
-  `UC_ERR_READ_UNMAPPED` — the underlying issue is that data
-  symbols like `__ZNSt3__14cerrE` are currently bound to function
-  stub addresses (no vtable, no streambuf), so any C++ ostream
-  state read through the ostream object falls off the stub region.
-  To reach the usage message we need: (a) a real fake-ostream data
-  region the `cerr` import binds to, (b) a sentry stub that writes
-  `1` into `*this` so `operator<<` continues past the ok-check.
+  - the arm64 runner now carves a fake C++ data region out of the
+    mmap arena (a shared zeroed vtable + per-object slots for
+    `__ZNSt3__14cerrE`, `__ZNSt3__14cinE`, the `ios_base`/
+    `basic_ios`/`basic_ostream`/`basic_istream` vtables, the
+    `ostringstream`/`istringstream` VTT tables, and
+    `__ZNSt3__15ctypeIcE2idE`). The chained-fixups walker now
+    prefers data-symbol bindings over function-stub bindings, so
+    `cerr` resolves to a real ostream-shaped object and any
+    `ldr xN, [cerr]` followed by a vtable-relative `ldur` walks
+    through valid memory instead of stub bytes.
+  - the new `src/macos/arch_arm64/cpp_imports.rs` installs custom
+    code hooks at the sentry/write stubs: `basic_ostream::sentry::
+    sentry(ostream&)` writes `1` to `*x0` so the sentry is marked
+    good, and `basic_ostream::write(const char*, streamsize)` reads
+    x1/x2 from guest memory and emits an `ostream-write` JSONL
+    event with both the printable text and the raw hex.
+  - emulation exits cleanly at `done_addr` with `Imports=36` (up
+    from 0 pre-chained-fixups, 14 pre-data-region) and `Status=ok`.
+    Three full sentry construct/destruct cycles fire, matching the
+    three `<<` chunks (`"Usage: "`, argv[0], `" <server_url>\n"`).
+- **Current next blocker:** the obfuscated `operator<<` body does
+  *not* go through the `basic_ostream::write` import; it inlines
+  the `__pad_and_output` / streambuf write path, which reaches the
+  byte sink through virtual `sputn`/`sputc` calls on the fake
+  vtable. With every vtable slot pointing at the return-zero
+  done_addr, the writes silently no-op so no `ostream-write`
+  event fires and the message bytes never surface in the trace.
+  A more faithful implementation would either (a) install a real
+  fake streambuf at `cerr.__rdbuf_` whose virtual `xsputn` writes
+  to host stderr, or (b) intercept the binary's outermost
+  `operator<<(ostream&, const char*)` template instantiation
+  directly. The "usage path" itself runs to completion either way
+  — the missing piece is just routing the bytes out.
+- **Independent observation:** the binary's `main` calls the usage
+  print unconditionally regardless of argc. The IDA decompilation
+  shows no `argc != 2` check anywhere in the obfuscated call chain
+  (`main_0 → sub_100227F14 → sub_100227F3C → sub_100227FA0 → 4
+  function calls ending in `sub_1002280F4` / usage print). Even
+  with `MACHINA_ARGV_APPEND="http://1.2.3.4:8888"` the trace
+  shows the same 36 imports, no `_sysctl` / `_popen` / `_stat` /
+  `_open` calls, and `X0=1` (exit code 1) at done_addr. So
+  reaching the profile-collection code path will require manually
+  reversing the obfuscation to find where argv[1] actually gets
+  consumed (likely behind one of the `JUMPOUT(0x8010...)` chain
+  bind thunks that IDA gave up on).
 - Recommended local invocation:
   - `.\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-trace.jsonl`
 
