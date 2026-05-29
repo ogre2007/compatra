@@ -165,17 +165,6 @@ emulator behavior.
   tail-jumping to `_main`. The two C++ initializers register
   `___cxa_atexit` handlers via `_dladdr`, then control
   reaches `_main` with `argc/argv/envp` preserved.
-- The first static initializer (at `0x100372CCC`) writes
-  done_addr into ~6 GOT slots in `__DATA_CONST` (confirmed via
-  GOT[117] = `_kill` slot flipping from `0x200007D00` to
-  `0x200000800` between init0 entry and init1 entry). The
-  arm64 runner now snapshots the GOT regions after
-  chained-fixups resolves them and restores the snapshot in a
-  one-shot code hook at `_main` entry, mimicking the
-  `__DATA_CONST` read-only flip that real dyld performs after
-  bind processing. After the fix, the `_kill` import resolves
-  correctly through its install_return_stubs trampoline
-  instead of silently terminating at done_addr.
 - `MACHINA_TRACE_FN_ENTRY=<label>:<hex addr>,...` installs
   no-op code hooks at the given addresses and emits a
   `function-entry` JSONL event whenever execution reaches
