@@ -503,6 +503,123 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         }
     }
 
+    // Only run the snapshot/restore dance for binaries that
+    // actually use LC_DYLD_CHAINED_FIXUPS. Legacy bind-opcode
+    // binaries (AMOS, RustDoor) have their __nl_symbol_ptr /
+    // __got writes happen at runtime through legitimate code,
+    // and snapshotting + restoring those regions on _main
+    // entry overwrites that valid runtime state.
+    let uses_chained_fixups = binary.commands.iter().any(|c| {
+        matches!(
+            c,
+            crate::macos::loader::command::LoadCommand::DyldChainedFixups(_)
+        )
+    });
+
+    if uses_chained_fixups {
+    // Snapshot the GOT regions (__DATA_CONST mirror and the
+    // .<71-style __nl_symbol_ptr segment) right after
+    // chained-fixups resolves them, then install a code hook
+    // at _main that restores those bytes before the binary
+    // runs. Modern Mach-O dyld flips __DATA_CONST to read-only
+    // after bind processing so C++ static initializers can't
+    // clobber the resolved GOT, but Unicorn's `protect_memory`
+    // doesn't enforce that on every backend. The Mach-O Man
+    // profiler's first static initializer actively overwrites
+    // GOT slots (confirmed: GOT[117] = `_kill` flips from
+    // 0x200007D00 to 0x200000800 between init0 entry and init1
+    // entry). Without the snapshot/restore step every kill /
+    // open / mmap call through the corrupted GOT silently
+    // terminates emulation by jumping to done_addr.
+    //
+    // After the hook fires once it self-disables via an
+    // `AtomicBool` guard so legitimate runtime writes (e.g.
+    // C++ atexit storage) aren't reverted.
+    {
+        use std::sync::Arc;
+        // Collect snapshot ranges: data-segments with chain-like
+        // first bytes plus the registered chain segment.
+        let mut snapshots: Vec<(u64, Vec<u8>)> = Vec::new();
+        for seg in &binary.segments {
+            let segname = seg.segname_str();
+            // __DATA_CONST is the main chained-fixups GOT in
+            // standard binaries; obfuscators rename it to
+            // arbitrary 4-char tags but keep `__nl_symbol_ptr`
+            // sections inside, so we also snapshot any
+            // r/w-writable segment whose sections include one.
+            let interesting = segname == "__DATA_CONST"
+                || seg
+                    .sections
+                    .iter()
+                    .any(|sec| {
+                        let name = String::from_utf8_lossy(
+                            &sec.sectname[..sec
+                                .sectname
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(sec.sectname.len())],
+                        );
+                        name == "__nl_symbol_ptr"
+                            || name == "__la_symbol_ptr"
+                            || name == "__got"
+                    });
+            if interesting && seg.vmsize > 0 {
+                let aligned = ((seg.vmsize + 0xFFF) & !0xFFF) as usize;
+                if let Ok(bytes) = emulator.read_memory(seg.vmaddr, aligned) {
+                    snapshots.push((seg.vmaddr, bytes));
+                }
+            }
+        }
+        if !snapshots.is_empty() {
+            if let Some(bus) = &trace_bus {
+                let summary = snapshots
+                    .iter()
+                    .map(|(a, b)| format!("0x{:X}:{:#x}", a, b.len()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = bus.send(
+                    memory_event(&metadata, "got-snapshot")
+                        .arg("Regions", summary),
+                );
+            }
+
+            let snapshots = Arc::new(snapshots);
+            let already_restored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let trace_bus_for_hook = trace_bus.clone();
+            let metadata_for_hook = metadata.clone();
+            let actual_main_addr = resolve_entry(&binary);
+            emulator.add_code_hook(
+                actual_main_addr,
+                actual_main_addr + 4,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    if already_restored
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    let mut restored = 0usize;
+                    for (vmaddr, bytes) in snapshots.iter() {
+                        if emu.write_memory(*vmaddr, bytes).is_ok() {
+                            restored += bytes.len();
+                        }
+                    }
+                    if let Some(bus) = &trace_bus_for_hook {
+                        let _ = bus.send(
+                            process_event(
+                                &metadata_for_hook,
+                                "got-snapshot-restore",
+                                "got_snapshot_restore",
+                            )
+                            .arg("BytesRestored", restored.to_string())
+                            .arg("Regions", snapshots.len().to_string()),
+                        );
+                    }
+                },
+            )?;
+        }
+    }
+    }  // uses_chained_fixups
+
     // Install C++ ostream stub overrides. Without these, every
     // operator<< call construct/destructs a sentry but never
     // writes — and `basic_ostream::write` silently returns 0
@@ -558,6 +675,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
                     let x0 = emu.read_reg("x0").unwrap_or(0);
                     let x1 = emu.read_reg("x1").unwrap_or(0);
                     let lr = emu.read_reg("lr").unwrap_or(0);
+                    let x16 = emu.read_reg("x16").unwrap_or(0);
                     if let Some(bus) = &trace_bus_for_hook {
                         let _ = bus.send(
                             process_event(
@@ -569,6 +687,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
                             .arg("Pc", format!("0x{:X}", addr))
                             .arg("X0", format!("0x{:X}", x0))
                             .arg("X1", format!("0x{:X}", x1))
+                            .arg("X16", format!("0x{:X}", x16))
                             .arg("Lr", format!("0x{:X}", lr)),
                         );
                     }
