@@ -180,16 +180,39 @@ fn build_mod_init_trampoline(
     code.extend_from_slice(&0xD61F0200u32.to_le_bytes()); // br x16
     code.extend_from_slice(&0xD65F03C0u32.to_le_bytes()); // ret (safety net)
 
-    // Allocate guest memory for the trampoline. Match the alloc
-    // pattern setup_arm64_cpp_data_region uses — the arm64 layout
-    // already pre-maps the mmap arena as part of the heap, so we
-    // only need to write the code bytes.
+    // Allocate guest memory for the trampoline. The arm64 layout
+    // pre-maps the mmap arena as data-only (R+W) heap; if we
+    // wrote into that region the trampoline bytes would be
+    // unfetchable. Carve out a fresh R+W+X page above the
+    // existing arena instead.
     let aligned_size = ((code.len() as u64 + 0xFFF) & !0xFFF).max(0x1000);
     let base = mmap_next.fetch_add(aligned_size, Ordering::Relaxed);
     if base.saturating_add(aligned_size) > mmap_end {
         return Err("mmap arena exhausted while allocating __mod_init trampoline".into());
     }
+    // Re-protect the trampoline page to R+W+X so the fetch path
+    // can read instructions from it. The page is already mapped
+    // as part of the heap arena; just upgrade the protection.
+    emulator.protect_memory(
+        base & !0xFFF,
+        aligned_size,
+        unicorn_engine::Prot::READ | unicorn_engine::Prot::WRITE | unicorn_engine::Prot::EXEC,
+    )?;
     emulator.write_memory(base, &code)?;
+    // Read back the first few instructions to confirm the write
+    // landed and is visible to the fetch path.
+    let readback = emulator.read_memory(base, code.len().min(0x80)).unwrap_or_default();
+    if let Some(bus) = trace_bus {
+        let hex: String = readback
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let _ = bus.send(
+            memory_event(metadata, "mod-init-readback")
+                .arg("Base", format!("0x{:X}", base))
+                .arg("Hex", hex),
+        );
+    }
 
     if let Some(bus) = trace_bus {
         let _ = bus.send(
@@ -780,7 +803,12 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     let result = run_with_diagnostics(
         &mut emulator,
         RunReport {
-            actual_entry,
+            // Start emulation at the trampoline (or _main if the
+            // trampoline wasn't built) — the diagnostic runner
+            // passes this PC to `uc_emu_start` instead of reading
+            // PC from the cpu state, so updating PC via
+            // `write_reg` earlier is not enough on its own.
+            actual_entry: entry,
             done_addr,
             stack_base,
             stack_size,
