@@ -49,6 +49,163 @@ const ARM64_CPP_CIN_OBJECT_OFFSET: u64 = 0x500;
 const ARM64_CPP_CTYPE_ID_OFFSET: u64 = 0x600;
 const ARM64_CPP_GENERIC_OBJECT_OFFSET: u64 = 0x700;
 
+/// Build a synthetic trampoline that invokes each
+/// `__mod_init_func` entry in order, then tail-jumps to the real
+/// `_main`. Modern Mach-O loaders execute these C++ static
+/// initializers as part of dyld startup, and obfuscated samples
+/// like the Mach-O Man profiler put meaningful state-setup logic
+/// inside them — without it, runtime globals stay zero and
+/// `_main` runs against an uninitialized world.
+///
+/// Returns the trampoline entry point on success, or `Ok(None)`
+/// when the binary has no `__mod_init_func` section (so the
+/// caller can keep using the original entry).
+fn build_mod_init_trampoline(
+    emulator: &mut UnicornEmulator,
+    binary: &MachoBinary,
+    mmap_next: &Arc<AtomicU64>,
+    mmap_end: u64,
+    main_addr: u64,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    // Locate the __mod_init_func section regardless of which
+    // segment claims it — obfuscators rename the parent segment
+    // (e.g. ".<71" instead of "__DATA_CONST") so we can't rely
+    // on `get_section(seg, "__mod_init_func")`.
+    let init_section = binary
+        .segments
+        .iter()
+        .flat_map(|s| s.sections.iter())
+        .find(|sec| {
+            let name = String::from_utf8_lossy(
+                &sec.sectname[..sec
+                    .sectname
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(sec.sectname.len())],
+            );
+            name == "__mod_init_func"
+        });
+    let Some(sec) = init_section else {
+        return Ok(None);
+    };
+    if sec.size == 0 || sec.size % 8 != 0 {
+        return Ok(None);
+    }
+    let entry_count = (sec.size / 8) as usize;
+    if entry_count == 0 {
+        return Ok(None);
+    }
+
+    // Read every initializer address out of guest memory — the
+    // chained-fixups pass has already replaced the on-disk chain
+    // entries with resolved absolute addresses.
+    let mut init_addrs: Vec<u64> = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        let slot_addr = sec.addr + (i as u64) * 8;
+        let bytes = emulator.read_memory(slot_addr, 8)?;
+        let arr: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| "short read on __mod_init_func slot")?;
+        let addr = u64::from_le_bytes(arr);
+        if addr == 0 {
+            continue;
+        }
+        init_addrs.push(addr);
+    }
+    if init_addrs.is_empty() {
+        return Ok(None);
+    }
+
+    // ARM64 trampoline layout:
+    //   sub sp, sp, #32                ; reserve scratch frame
+    //   stp x0, x1, [sp]               ; save argc, argv
+    //   str x2, [sp, #16]              ; save envp
+    //   ; per initializer:
+    //   movz x16, #imm0
+    //   movk x16, #imm1, lsl #16
+    //   movk x16, #imm2, lsl #32
+    //   movk x16, #imm3, lsl #48
+    //   blr  x16
+    //   ; after the last initializer:
+    //   ldp x0, x1, [sp]
+    //   ldr x2, [sp, #16]
+    //   add sp, sp, #32
+    //   movz x16, #imm0    ; <main>
+    //   movk x16, #imm1, lsl #16
+    //   movk x16, #imm2, lsl #32
+    //   movk x16, #imm3, lsl #48
+    //   br   x16
+    //
+    // Each init = 6 instructions (24 bytes); prelude/epilogue =
+    // 8 instructions (32 bytes); main jump = 5 instructions (20
+    // bytes). Add a 4-byte ret guard at the tail for safety.
+    let mut code: Vec<u8> = Vec::new();
+
+    // Prelude.
+    code.extend_from_slice(&0xD10083FFu32.to_le_bytes()); // sub sp, sp, #32
+    code.extend_from_slice(&0xA90007E0u32.to_le_bytes()); // stp x0, x1, [sp]
+    code.extend_from_slice(&0xF90008E2u32.to_le_bytes()); // str x2, [sp, #16]
+
+    let emit_load_x16 = |code: &mut Vec<u8>, target: u64| {
+        let imm0 = (target & 0xFFFF) as u32;
+        let imm1 = ((target >> 16) & 0xFFFF) as u32;
+        let imm2 = ((target >> 32) & 0xFFFF) as u32;
+        let imm3 = ((target >> 48) & 0xFFFF) as u32;
+        // movz x16, #imm0, lsl #0
+        code.extend_from_slice(&(0xD2800010u32 | (imm0 << 5)).to_le_bytes());
+        // movk x16, #imm1, lsl #16
+        code.extend_from_slice(&(0xF2A00010u32 | (imm1 << 5)).to_le_bytes());
+        // movk x16, #imm2, lsl #32
+        code.extend_from_slice(&(0xF2C00010u32 | (imm2 << 5)).to_le_bytes());
+        // movk x16, #imm3, lsl #48
+        code.extend_from_slice(&(0xF2E00010u32 | (imm3 << 5)).to_le_bytes());
+    };
+
+    for &init_addr in &init_addrs {
+        emit_load_x16(&mut code, init_addr);
+        // blr x16
+        code.extend_from_slice(&0xD63F0200u32.to_le_bytes());
+    }
+
+    // Epilogue: restore argc/argv/envp.
+    code.extend_from_slice(&0xA94007E0u32.to_le_bytes()); // ldp x0, x1, [sp]
+    code.extend_from_slice(&0xF94008E2u32.to_le_bytes()); // ldr x2, [sp, #16]
+    code.extend_from_slice(&0x910083FFu32.to_le_bytes()); // add sp, sp, #32
+
+    // Tail-call main via br x16 (LR already points at done_addr).
+    emit_load_x16(&mut code, main_addr);
+    code.extend_from_slice(&0xD61F0200u32.to_le_bytes()); // br x16
+    code.extend_from_slice(&0xD65F03C0u32.to_le_bytes()); // ret (safety net)
+
+    // Allocate guest memory for the trampoline. Match the alloc
+    // pattern setup_arm64_cpp_data_region uses — the arm64 layout
+    // already pre-maps the mmap arena as part of the heap, so we
+    // only need to write the code bytes.
+    let aligned_size = ((code.len() as u64 + 0xFFF) & !0xFFF).max(0x1000);
+    let base = mmap_next.fetch_add(aligned_size, Ordering::Relaxed);
+    if base.saturating_add(aligned_size) > mmap_end {
+        return Err("mmap arena exhausted while allocating __mod_init trampoline".into());
+    }
+    emulator.write_memory(base, &code)?;
+
+    if let Some(bus) = trace_bus {
+        let _ = bus.send(
+            memory_event(metadata, "mod-init-trampoline")
+                .arg("Base", format!("0x{:X}", base))
+                .arg("Size", format!("0x{:X}", code.len()))
+                .arg("InitCount", init_addrs.len().to_string())
+                .arg("FirstInit", format!("0x{:X}", init_addrs[0]))
+                .arg("MainAddr", format!("0x{:X}", main_addr))
+                .arg("DoneAddr", format!("0x{:X}", done_addr)),
+        );
+    }
+
+    Ok(Some(base))
+}
+
 /// Allocate and initialize a fake C++ data-symbol region.
 ///
 /// Returns a map of known C++ data-symbol names → resolved
@@ -362,6 +519,54 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     // sub_10022AED4: return sub_100232C28() == 0`, where
     // `sub_100232C28 → sub_100232C58` is an obfuscated argc
     // probe IDA gave up on.
+    // Optional: install probe hooks at known function entry
+    // points to surface which paths the binary actually runs.
+    // Pass `MACHINA_TRACE_FN_ENTRY=<name>:<hex addr>,...` (no
+    // colons in the name; use any human-readable label). Each
+    // address gets a code hook that emits a `function-entry`
+    // JSONL event when execution reaches it. The probe is
+    // non-modifying: it logs and falls through.
+    if let Ok(spec) = std::env::var("MACHINA_TRACE_FN_ENTRY") {
+        for entry in spec.split(',') {
+            let Some((label, addr_str)) = entry.trim().split_once(':') else {
+                continue;
+            };
+            let stripped = addr_str
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
+            let addr = match u64::from_str_radix(stripped, 16) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let label_owned = label.to_string();
+            let trace_bus_for_hook = trace_bus.clone();
+            let proc_name = process_name.to_string();
+            emulator.add_code_hook(
+                addr,
+                addr + 4,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    let x0 = emu.read_reg("x0").unwrap_or(0);
+                    let x1 = emu.read_reg("x1").unwrap_or(0);
+                    let lr = emu.read_reg("lr").unwrap_or(0);
+                    if let Some(bus) = &trace_bus_for_hook {
+                        let _ = bus.send(
+                            process_event(
+                                &runtime_process_metadata(proc_name.clone()),
+                                "function-entry",
+                                "function_entry",
+                            )
+                            .arg("Label", label_owned.clone())
+                            .arg("Pc", format!("0x{:X}", addr))
+                            .arg("X0", format!("0x{:X}", x0))
+                            .arg("X1", format!("0x{:X}", x1))
+                            .arg("Lr", format!("0x{:X}", lr)),
+                        );
+                    }
+                },
+            )?;
+        }
+    }
+
     if let Ok(pcs) = std::env::var("MACHINA_BYPASS_USAGE_CHECK") {
         for token in pcs.split(',') {
             let token = token.trim();
@@ -521,14 +726,45 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     install_runtime_plugins(&mut emulator, &runtime_context, &[&SyscallRuntimePlugin])?;
 
     let actual_entry = resolve_entry(&binary);
+
+    // Optional: build a synthetic trampoline that calls every
+    // __mod_init_func entry before transferring control to _main.
+    // Modern Mach-O loaders execute these C++ static
+    // initializers as part of dyld startup, and obfuscated
+    // samples (notably the Mach-O Man profiler) place
+    // meaningful initialization in them — without this, runtime
+    // globals stay zero and the binary's argc dispatch always
+    // takes the usage-and-exit branch.
+    let entry = match build_mod_init_trampoline(
+        &mut emulator,
+        &binary,
+        &mmap_next,
+        mmap_end,
+        actual_entry,
+        done_addr,
+        &trace_bus,
+        &metadata,
+    ) {
+        Ok(Some(trampoline_addr)) => trampoline_addr,
+        Ok(None) => actual_entry,
+        Err(err) => {
+            eprintln!(
+                "[MOD-INIT] trampoline setup failed, running _main directly: {}",
+                err
+            );
+            actual_entry
+        }
+    };
+
     if let Some(bus) = &trace_bus {
         let _ = bus.send(
             process_event(&metadata, "entry", "entry")
-                .arg("Pc", format!("0x{:X}", actual_entry))
-                .arg("DoneAddr", format!("0x{:X}", done_addr)),
+                .arg("Pc", format!("0x{:X}", entry))
+                .arg("DoneAddr", format!("0x{:X}", done_addr))
+                .arg("ActualEntry", format!("0x{:X}", actual_entry)),
         );
     }
-    emulator.write_reg("pc", actual_entry)?;
+    emulator.write_reg("pc", entry)?;
     emulator.write_reg("lr", done_addr)?;
 
     install_diagnostic_hooks(
