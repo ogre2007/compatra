@@ -201,19 +201,6 @@ fn build_mod_init_trampoline(
     emulator.write_memory(base, &code)?;
     // Read back the first few instructions to confirm the write
     // landed and is visible to the fetch path.
-    let readback = emulator.read_memory(base, code.len().min(0x80)).unwrap_or_default();
-    if let Some(bus) = trace_bus {
-        let hex: String = readback
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect();
-        let _ = bus.send(
-            memory_event(metadata, "mod-init-readback")
-                .arg("Base", format!("0x{:X}", base))
-                .arg("Hex", hex),
-        );
-    }
-
     if let Some(bus) = trace_bus {
         let _ = bus.send(
             memory_event(metadata, "mod-init-trampoline")

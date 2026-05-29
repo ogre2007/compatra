@@ -147,20 +147,52 @@ emulator behavior.
   `operator<<(ostream&, const char*)` template instantiation
   directly. The "usage path" itself runs to completion either way
   — the missing piece is just routing the bytes out.
-- **Independent observation:** the binary's `main` calls the usage
-  print unconditionally regardless of argc. The IDA decompilation
-  shows no `argc != 2` check anywhere in the obfuscated call chain
-  (`main_0 → sub_100227F14 → sub_100227F3C → sub_100227FA0 → 4
-  function calls ending in `sub_1002280F4` / usage print). Even
-  with `MACHINA_ARGV_APPEND="http://1.2.3.4:8888"` the trace
-  shows the same 36 imports, no `_sysctl` / `_popen` / `_stat` /
-  `_open` calls, and `X0=1` (exit code 1) at done_addr. So
-  reaching the profile-collection code path will require manually
-  reversing the obfuscation to find where argv[1] actually gets
-  consumed (likely behind one of the `JUMPOUT(0x8010...)` chain
-  bind thunks that IDA gave up on).
+- **The obfuscated usage check** sits at
+  `sub_1002280F4 + 0x34 (= 0x10022812C)`: a `tbz w0, #0,
+  0x100228378` that consumes the return value of
+  `sub_10022AE68 → sub_10022AE90 → sub_10022AEB4 →
+  sub_10022AED4: return sub_100232C28() == 0`. The inner
+  `sub_100232C58` is the argc probe IDA gave up on
+  (`call analysis failed funcsize=14`). When run with
+  `MACHINA_BYPASS_USAGE_CHECK=0x10022AE68` the binary now reads
+  argv[1] (`_strlen "http://127.0.0.1:8888"`), passes it to
+  `basic_string::compare(0, 7, "http://")`, and proceeds past
+  the URL check.
+- The arm64 runner now installs a synthetic
+  `__mod_init_func` trampoline (mapped R+W+X, passed as
+  `RunReport::actual_entry` so `uc_emu_start` actually begins
+  there) that calls every static initializer in order before
+  tail-jumping to `_main`. The two C++ initializers register
+  `___cxa_atexit` handlers via `_dladdr`, then control
+  reaches `_main` with `argc/argv/envp` preserved.
+- `MACHINA_TRACE_FN_ENTRY=<label>:<hex addr>,...` installs
+  no-op code hooks at the given addresses and emits a
+  `function-entry` JSONL event whenever execution reaches
+  one. Used to pin down which paths the binary actually visits.
+- A `basic_string::compare(pos, n, const char* s)` hook in
+  `src/macos/arch_arm64/cpp_imports.rs` performs the real
+  byte comparison, decoding both the libc++ long-form layout
+  (data ptr at offset 16) and a custom layout the binary
+  appears to use (the "size" slot holds a code address, so
+  the hook ignores it and reads from the data pointer via
+  the `n`-byte window plus a null terminator).
+- **Current next blocker:** even with bypass + mod-init the
+  binary still does not reach `getHostname` / `getTmpDir` /
+  `get_browser_extensions` / `buildPostBody`. None of those
+  symbols has a direct `bl` caller anywhere in `__TEXT` /
+  `.hAv` / `.AR1` — every call to them goes through indirect
+  `br xN` chains whose target is computed from a
+  `movz`/`movk` sequence. Without bypass the binary enters
+  an obfuscation loop that exhausts the 50M instruction
+  budget calling `_time` / `_getpid` / `_srand` and the C++
+  sentry imports ~1786 times each. Reaching the profile
+  pipeline (sysctl / popen / curl) needs either deeper
+  obfuscation work to resolve the indirect call targets, or
+  a direct hook that jumps straight into `buildPostBody` /
+  `getHostname` with a synthesized std::string `argv[1]`.
 - Recommended local invocation:
   - `.\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-trace.jsonl`
+  - `MACHINA_BYPASS_USAGE_CHECK="0x10022AE68" MACHINA_ARGV_APPEND="http://127.0.0.1:8888" .\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-bypass.jsonl` to skip the obfuscated usage check and see the URL-validation path execute
 
 ## Corpus hygiene
 
