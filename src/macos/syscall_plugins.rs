@@ -78,9 +78,15 @@ const SYSCALL_SYSCTL: u64 = 0x20000CA;
 const SYSCALL_STAT64: u64 = 0x2000152;
 const SYSCALL_FSTAT64: u64 = 0x2000153;
 const SYSCALL_LSTAT64: u64 = 0x2000154;
+const SYSCALL_READ_NOCANCEL: u64 = 0x200018C;
+const SYSCALL_WRITE_NOCANCEL: u64 = 0x200018D;
+const SYSCALL_OPEN_NOCANCEL: u64 = 0x200018E;
+const SYSCALL_CLOSE_NOCANCEL: u64 = 0x200018F;
 const SYSCALL_RECVMSG_NOCANCEL: u64 = 0x2000191;
 const SYSCALL_SENDMSG_NOCANCEL: u64 = 0x2000192;
 const SYSCALL_RECVFROM_NOCANCEL: u64 = 0x2000193;
+const SYSCALL_ACCEPT_NOCANCEL: u64 = 0x2000194;
+const SYSCALL_FCNTL_NOCANCEL: u64 = 0x2000196;
 const SYSCALL_SELECT_NOCANCEL: u64 = 0x2000197;
 const SYSCALL_CONNECT_NOCANCEL: u64 = 0x2000199;
 const SYSCALL_READV_NOCANCEL: u64 = 0x200019B;
@@ -210,9 +216,15 @@ pub fn default_syscall_name(num: u64) -> &'static str {
         SYSCALL_FSTAT64 => "fstat64",
         SYSCALL_LSTAT64 => "lstat64",
         SYSCALL_RECVFROM => "recvfrom",
+        SYSCALL_READ_NOCANCEL => "read_nocancel",
+        SYSCALL_WRITE_NOCANCEL => "write_nocancel",
+        SYSCALL_OPEN_NOCANCEL => "open_nocancel",
+        SYSCALL_CLOSE_NOCANCEL => "close_nocancel",
         SYSCALL_RECVMSG_NOCANCEL => "recvmsg_nocancel",
         SYSCALL_SENDMSG_NOCANCEL => "sendmsg_nocancel",
         SYSCALL_RECVFROM_NOCANCEL => "recvfrom_nocancel",
+        SYSCALL_ACCEPT_NOCANCEL => "accept_nocancel",
+        SYSCALL_FCNTL_NOCANCEL => "fcntl_nocancel",
         SYSCALL_SELECT_NOCANCEL => "select_nocancel",
         SYSCALL_CONNECT_NOCANCEL => "connect_nocancel",
         SYSCALL_READV_NOCANCEL => "readv_nocancel",
@@ -353,7 +365,7 @@ pub fn handle_basic_macos_syscall(
                     .arg("Result", "0");
             }
         }
-        SYSCALL_WRITE => {
+        SYSCALL_WRITE | SYSCALL_WRITE_NOCANCEL => {
             let fd = invocation.args[0] as i32;
             let buf = invocation.args[1];
             let count = invocation.args[2] as usize;
@@ -386,7 +398,7 @@ pub fn handle_basic_macos_syscall(
                 .arg("Count", count.to_string())
                 .arg("Result", count.to_string());
         }
-        SYSCALL_READ => {
+        SYSCALL_READ | SYSCALL_READ_NOCANCEL => {
             let fd = invocation.args[0];
             let buf = invocation.args[1];
             let count = invocation.args[2] as usize;
@@ -653,7 +665,7 @@ pub fn handle_basic_macos_syscall(
         SYSCALL_MPROTECT | SYSCALL_MUNMAP => {
             event = event.arg("Result", "0");
         }
-        SYSCALL_OPEN => {
+        SYSCALL_OPEN | SYSCALL_OPEN_NOCANCEL => {
             let path_ptr = invocation.args[0];
             let flags = invocation.args[1];
             let mode = invocation.args[2];
@@ -987,7 +999,7 @@ pub fn handle_basic_macos_syscall(
                     .arg("Result", "0");
             }
         }
-        SYSCALL_CLOSE => {
+        SYSCALL_CLOSE | SYSCALL_CLOSE_NOCANCEL => {
             let fd = invocation.args[0];
             let mut removed_synthetic = false;
             if let Ok(mut table) = runtime.fd_table.lock() {
@@ -1031,7 +1043,7 @@ pub fn handle_basic_macos_syscall(
                 event = event.arg("Result", "0");
             }
         }
-        SYSCALL_ACCEPT => {
+        SYSCALL_ACCEPT | SYSCALL_ACCEPT_NOCANCEL => {
             let fd = invocation.args[0];
             let sockaddr_ptr = invocation.args[1];
             let sockaddr_len_ptr = invocation.args[2];
@@ -1074,7 +1086,7 @@ pub fn handle_basic_macos_syscall(
                 event = event.arg("Fd", fd.to_string()).arg("Result", "0");
             }
         }
-        SYSCALL_FCNTL => {
+        SYSCALL_FCNTL | SYSCALL_FCNTL_NOCANCEL => {
             let fd = invocation.args[0];
             let cmd = invocation.args[1];
             let arg = invocation.args[2];
@@ -1432,8 +1444,14 @@ mod tests {
         assert_eq!(default_syscall_name(0x2000152), "stat64");
         assert_eq!(default_syscall_name(0x2000153), "fstat64");
         assert_eq!(default_syscall_name(0x2000154), "lstat64");
+        assert_eq!(default_syscall_name(0x200018C), "read_nocancel");
+        assert_eq!(default_syscall_name(0x200018D), "write_nocancel");
+        assert_eq!(default_syscall_name(0x200018E), "open_nocancel");
+        assert_eq!(default_syscall_name(0x200018F), "close_nocancel");
         assert_eq!(default_syscall_name(0x2000191), "recvmsg_nocancel");
         assert_eq!(default_syscall_name(0x2000192), "sendmsg_nocancel");
+        assert_eq!(default_syscall_name(0x2000194), "accept_nocancel");
+        assert_eq!(default_syscall_name(0x2000196), "fcntl_nocancel");
         assert_eq!(default_syscall_name(0x200019B), "readv_nocancel");
         assert_eq!(default_syscall_name(0x20001A1), "poll_nocancel");
         assert_eq!(default_syscall_name(0x20001F4), "getentropy");

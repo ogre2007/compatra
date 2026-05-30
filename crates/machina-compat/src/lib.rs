@@ -2559,7 +2559,31 @@ const HOST_PATH_BUFFER_SIZE: usize = 4096;
 #[cfg(target_os = "macos")]
 const MAX_GUEST_SYSCTL_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
+const MAX_GUEST_STDIO_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const HOST_FILE_HANDLE_SIZE: usize = 8;
+#[cfg(target_os = "macos")]
 const HOST_DIRENT_SIZE: usize = mem::size_of::<libc::dirent>();
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct HostFileHandle {
+    file_ptr: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn host_file_handles() -> &'static Mutex<std::collections::HashMap<u64, HostFileHandle>> {
+    static HANDLES: OnceLock<Mutex<std::collections::HashMap<u64, HostFileHandle>>> =
+        OnceLock::new();
+    HANDLES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn host_file_ptr(stream: u64) -> Option<*mut libc::FILE> {
+    let handles = host_file_handles().lock().ok()?;
+    let handle = handles.get(&stream)?;
+    Some(handle.file_ptr as *mut libc::FILE)
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
@@ -5220,6 +5244,332 @@ fn proxy_host_sysctl_common<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn allocate_guest_file_handle<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    file_ptr: *mut libc::FILE,
+) -> Option<u64> {
+    let guest_handle = memory.allocate_memory(HOST_FILE_HANDLE_SIZE, 8).ok()?;
+    memory
+        .write_memory(guest_handle, &0u64.to_le_bytes())
+        .ok()?;
+    host_file_handles().lock().ok()?.insert(
+        guest_handle,
+        HostFileHandle {
+            file_ptr: file_ptr as usize,
+        },
+    );
+    Some(guest_handle)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fopen<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    mode_ptr: u64,
+) -> Option<HostCallResult> {
+    let path = read_cstring(memory, path_ptr, HOST_PATH_BUFFER_SIZE).ok()?;
+    let mode = read_cstring(memory, mode_ptr, 64).ok()?;
+    let host_path = CString::new(path).ok()?;
+    let host_mode = CString::new(mode).ok()?;
+    clear_errno();
+    let file = unsafe { libc::fopen(host_path.as_ptr(), host_mode.as_ptr()) };
+    if file.is_null() {
+        return Some(host_null_error(host_errno()));
+    }
+    let Some(guest_handle) = allocate_guest_file_handle(memory, file) else {
+        unsafe {
+            libc::fclose(file);
+        }
+        return Some(host_null_error(libc::ENOMEM as u32));
+    };
+    Some(host_call_value(guest_handle))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fdopen<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    fd: u64,
+    mode_ptr: u64,
+) -> Option<HostCallResult> {
+    let mode = read_cstring(memory, mode_ptr, 64).ok()?;
+    let host_mode = CString::new(mode).ok()?;
+    clear_errno();
+    let file = unsafe { libc::fdopen(fd as libc::c_int, host_mode.as_ptr()) };
+    if file.is_null() {
+        return Some(host_null_error(host_errno()));
+    }
+    let Some(guest_handle) = allocate_guest_file_handle(memory, file) else {
+        unsafe {
+            libc::fclose(file);
+        }
+        return Some(host_null_error(libc::ENOMEM as u32));
+    };
+    Some(host_call_value(guest_handle))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fclose<M: GuestMemory + ?Sized>(memory: &mut M, stream: u64) -> Option<HostIoResult> {
+    let handle = match host_file_handles().lock().ok()?.remove(&stream) {
+        Some(handle) => handle,
+        None => return Some(host_io_error(libc::EBADF as u32)),
+    };
+    clear_errno();
+    let ret = unsafe { libc::fclose(handle.file_ptr as *mut libc::FILE) };
+    let _ = memory.free_memory(stream);
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn guest_stdio_size(size: u64, nmemb: u64) -> Option<(usize, usize, usize)> {
+    let item_size = usize::try_from(size).ok()?;
+    let item_count = usize::try_from(nmemb).ok()?;
+    let byte_count = item_size.checked_mul(item_count)?;
+    (byte_count <= MAX_GUEST_STDIO_BYTES).then_some((item_size, item_count, byte_count))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fread<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    buf_ptr: u64,
+    size: u64,
+    nmemb: u64,
+    stream: u64,
+) -> Option<HostIoResult> {
+    let (item_size, item_count, byte_count) = match guest_stdio_size(size, nmemb) {
+        Some(sizes) => sizes,
+        None => return Some(host_io_error(libc::EINVAL as u32)),
+    };
+    if byte_count > 0 && buf_ptr == 0 {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_io_error(libc::EBADF as u32));
+    };
+    if byte_count == 0 {
+        return Some(HostIoResult {
+            return_value: 0,
+            errno: 0,
+            transferred: 0,
+            preview: Vec::new(),
+        });
+    }
+    let mut data = vec![0u8; byte_count];
+    clear_errno();
+    let items = unsafe {
+        libc::fread(
+            data.as_mut_ptr().cast::<libc::c_void>(),
+            item_size,
+            item_count,
+            file,
+        )
+    };
+    let transferred = items.saturating_mul(item_size).min(data.len());
+    if transferred > 0 && memory.write_memory(buf_ptr, &data[..transferred]).is_err() {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
+    let errno = if items < item_count && unsafe { libc::ferror(file) } != 0 {
+        host_errno()
+    } else {
+        0
+    };
+    Some(HostIoResult {
+        return_value: items as u64,
+        errno,
+        transferred,
+        preview: data[..transferred.min(128)].to_vec(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fwrite<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    buf_ptr: u64,
+    size: u64,
+    nmemb: u64,
+    stream: u64,
+) -> Option<HostIoResult> {
+    let (item_size, item_count, byte_count) = match guest_stdio_size(size, nmemb) {
+        Some(sizes) => sizes,
+        None => return Some(host_io_error(libc::EINVAL as u32)),
+    };
+    if byte_count > 0 && buf_ptr == 0 {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_io_error(libc::EBADF as u32));
+    };
+    let data = if byte_count == 0 {
+        Vec::new()
+    } else {
+        match memory.read_memory(buf_ptr, byte_count) {
+            Ok(data) => data,
+            Err(_) => return Some(host_io_error(libc::EFAULT as u32)),
+        }
+    };
+    clear_errno();
+    let items = unsafe {
+        libc::fwrite(
+            data.as_ptr().cast::<libc::c_void>(),
+            item_size,
+            item_count,
+            file,
+        )
+    };
+    let transferred = items.saturating_mul(item_size).min(data.len());
+    let errno = if items < item_count && unsafe { libc::ferror(file) } != 0 {
+        host_errno()
+    } else {
+        0
+    };
+    Some(HostIoResult {
+        return_value: items as u64,
+        errno,
+        transferred,
+        preview: data[..transferred.min(128)].to_vec(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fflush(stream: u64) -> Option<HostIoResult> {
+    let file = if stream == 0 {
+        ptr::null_mut()
+    } else {
+        let Some(file) = host_file_ptr(stream) else {
+            return Some(host_io_error(libc::EBADF as u32));
+        };
+        file
+    };
+    clear_errno();
+    let ret = unsafe { libc::fflush(file) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fseek(stream: u64, offset: u64, whence: u64) -> Option<HostIoResult> {
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_io_error(libc::EBADF as u32));
+    };
+    clear_errno();
+    let ret = unsafe { libc::fseek(file, offset as i64 as libc::c_long, whence as libc::c_int) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_ftell(stream: u64) -> Option<HostCallResult> {
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_call_error(libc::EBADF as u32));
+    };
+    clear_errno();
+    let ret = unsafe { libc::ftell(file) };
+    Some(host_call_result(ret as isize))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fgets<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    buf_ptr: u64,
+    size: u64,
+    stream: u64,
+) -> Option<HostCallResult> {
+    if buf_ptr == 0 || size == 0 || size > libc::c_int::MAX as u64 {
+        return Some(host_null_error(libc::EINVAL as u32));
+    }
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_null_error(libc::EBADF as u32));
+    };
+    let mut data = vec![0u8; size as usize];
+    clear_errno();
+    let ret = unsafe {
+        libc::fgets(
+            data.as_mut_ptr().cast::<libc::c_char>(),
+            size as libc::c_int,
+            file,
+        )
+    };
+    if ret.is_null() {
+        let errno = if unsafe { libc::ferror(file) } != 0 {
+            Some(host_errno())
+        } else {
+            None
+        };
+        return Some(HostCallResult {
+            return_value: 0,
+            errno,
+        });
+    }
+    let write_len = data
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|idx| idx + 1)
+        .unwrap_or(data.len());
+    if memory.write_memory(buf_ptr, &data[..write_len]).is_err() {
+        return Some(host_null_error(libc::EFAULT as u32));
+    }
+    Some(host_call_value(buf_ptr))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fputs<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    text_ptr: u64,
+    stream: u64,
+) -> Option<HostIoResult> {
+    let text = read_cstring(memory, text_ptr, MAX_GUEST_STDIO_BYTES).ok()?;
+    let bytes = text.as_bytes().to_vec();
+    let host_text = CString::new(text).ok()?;
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_io_error(libc::EBADF as u32));
+    };
+    clear_errno();
+    let ret = unsafe { libc::fputs(host_text.as_ptr(), file) };
+    Some(HostIoResult {
+        return_value: signed_return_value(ret as isize),
+        errno: if ret < 0 { host_errno() } else { 0 },
+        transferred: if ret < 0 { 0 } else { bytes.len() },
+        preview: bytes[..bytes.len().min(128)].to_vec(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_feof(stream: u64) -> Option<HostCallResult> {
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_call_error(libc::EBADF as u32));
+    };
+    let ret = unsafe { libc::feof(file) };
+    Some(host_call_value(ret as u64))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_ferror(stream: u64) -> Option<HostCallResult> {
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_call_error(libc::EBADF as u32));
+    };
+    let ret = unsafe { libc::ferror(file) };
+    Some(host_call_value(ret as u64))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_clearerr(stream: u64) -> Option<HostCallResult> {
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_call_error(libc::EBADF as u32));
+    };
+    unsafe {
+        libc::clearerr(file);
+    }
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fileno(stream: u64) -> Option<HostIoResult> {
+    let Some(file) = host_file_ptr(stream) else {
+        return Some(host_io_error(libc::EBADF as u32));
+    };
+    clear_errno();
+    let ret = unsafe { libc::fileno(file) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
 fn allocate_guest_dir_handle<M: GuestMemory + ?Sized>(
     memory: &mut M,
     dir_ptr: *mut libc::DIR,
@@ -5517,6 +5867,20 @@ mod tests {
             assert!(compat.should_proxy_import("_sysctl"));
             assert!(compat.should_proxy_import("_sysctlbyname"));
             assert!(compat.should_proxy_import("_umask"));
+            assert!(compat.should_proxy_import("_fopen"));
+            assert!(compat.should_proxy_import("_fdopen"));
+            assert!(compat.should_proxy_import("_fclose"));
+            assert!(compat.should_proxy_import("_fread"));
+            assert!(compat.should_proxy_import("_fwrite"));
+            assert!(compat.should_proxy_import("_fflush"));
+            assert!(compat.should_proxy_import("_fseek"));
+            assert!(compat.should_proxy_import("_ftell"));
+            assert!(compat.should_proxy_import("_fgets"));
+            assert!(compat.should_proxy_import("_fputs"));
+            assert!(compat.should_proxy_import("_feof"));
+            assert!(compat.should_proxy_import("_ferror"));
+            assert!(compat.should_proxy_import("_clearerr"));
+            assert!(compat.should_proxy_import("_fileno"));
             assert!(compat.should_proxy_import("_opendir"));
             assert!(compat.should_proxy_import("_fdopendir"));
             assert!(compat.should_proxy_import("_readdir"));

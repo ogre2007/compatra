@@ -286,6 +286,11 @@ fn compile_arm64_fd_fixture() -> (PathBuf, PathBuf) {
 #include <unistd.h>
 
 #define DATA_FILE "{data_file_literal}"
+#define SYS_READ_NOCANCEL 0x200018C
+#define SYS_WRITE_NOCANCEL 0x200018D
+#define SYS_OPEN_NOCANCEL 0x200018E
+#define SYS_CLOSE_NOCANCEL 0x200018F
+#define SYS_FCNTL_NOCANCEL 0x2000196
 
 typedef int (*pipe_fn)(int *);
 typedef ssize_t (*readv_fn)(int, const struct iovec *, int);
@@ -311,6 +316,18 @@ static int text_is(const char *text, const char *expected, unsigned long len) {{
         }}
     }}
     return 1;
+}}
+
+static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
+    register long x0 asm("x0") = a0;
+    register long x1 asm("x1") = a1;
+    register long x2 asm("x2") = a2;
+    register long x3 asm("x3") = a3;
+    register long x4 asm("x4") = a4;
+    register long x5 asm("x5") = a5;
+    register long x16 asm("x16") = num;
+    asm volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16) : "memory", "cc");
+    return x0;
 }}
 
 static int pipe_vec_roundtrip(const char *label, pipe_fn pipe_impl, writev_fn writev_impl, readv_fn readv_impl) {{
@@ -402,6 +419,19 @@ int main(void) {{
         failures += 40;
     }}
 
+    long raw_fd = machina_syscall6(SYS_OPEN_NOCANCEL, (long)DATA_FILE, O_RDWR, 0600, 0, 0, 0);
+    const char raw_text[] = "nc-ok";
+    long raw_write = raw_fd >= 0 ? machina_syscall6(SYS_WRITE_NOCANCEL, raw_fd, (long)raw_text, 5, 0, 0, 0) : -1;
+    long raw_seek = raw_fd >= 0 ? (long)lseek((int)raw_fd, 0, SEEK_SET) : -1;
+    char raw_buf[8] = {{0}};
+    long raw_read = raw_fd >= 0 ? machina_syscall6(SYS_READ_NOCANCEL, raw_fd, (long)raw_buf, 5, 0, 0, 0) : -1;
+    long raw_fcntl = raw_fd >= 0 ? machina_syscall6(SYS_FCNTL_NOCANCEL, raw_fd, F_GETFD, 0, 0, 0, 0) : -1;
+    long raw_close = raw_fd >= 0 ? machina_syscall6(SYS_CLOSE_NOCANCEL, raw_fd, 0, 0, 0, 0, 0) : -1;
+    printf("compat fd nocancel open=%ld write=%ld seek=%ld read=%ld text=%s fcntl=%ld close=%ld errno=%d\n", raw_fd, raw_write, raw_seek, raw_read, raw_buf, raw_fcntl, raw_close, errno);
+    if (raw_fd < 0 || raw_write != 5 || raw_seek != 0 || raw_read != 5 || !text_is(raw_buf, "nc-ok", 5) || raw_fcntl < 0 || raw_close != 0) {{
+        failures += 45;
+    }}
+
     void *self = dlopen(NULL, RTLD_NOW);
     pipe_fn dyn_pipe = (pipe_fn)dlsym(self, "pipe");
     readv_fn dyn_readv = (readv_fn)dlsym(self, "readv");
@@ -454,6 +484,224 @@ int main(void) {{
     assert!(
         output.status.success(),
         "failed to compile generated arm64 fd fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (binary, data_file)
+}
+
+#[cfg(target_os = "macos")]
+fn compile_arm64_stdio_fixture() -> (PathBuf, PathBuf) {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_stdio_compat.c");
+    let binary = out_dir.join("arm64_stdio_compat");
+    let data_file = out_dir.join("arm64_stdio_compat.tmp");
+    let data_file_literal = c_string_literal(&data_file.display().to_string());
+    fs::write(
+        &source,
+        format!(
+            r#"#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#define DATA_FILE "{data_file_literal}"
+
+typedef FILE *(*fopen_fn)(const char *, const char *);
+typedef FILE *(*fdopen_fn)(int, const char *);
+typedef int (*fclose_fn)(FILE *);
+typedef size_t (*fread_fn)(void *, size_t, size_t, FILE *);
+typedef size_t (*fwrite_fn)(const void *, size_t, size_t, FILE *);
+typedef int (*fflush_fn)(FILE *);
+typedef int (*fseek_fn)(FILE *, long, int);
+typedef long (*ftell_fn)(FILE *);
+typedef char *(*fgets_fn)(char *, int, FILE *);
+typedef int (*fputs_fn)(const char *, FILE *);
+typedef int (*feof_fn)(FILE *);
+typedef int (*ferror_fn)(FILE *);
+typedef void (*clearerr_fn)(FILE *);
+typedef int (*fileno_fn)(FILE *);
+
+static int text_is(const char *text, const char *expected) {{
+    while (*text && *expected && *text == *expected) {{
+        text++;
+        expected++;
+    }}
+    return *text == 0 && *expected == 0;
+}}
+
+static void strip_newline(char *text) {{
+    for (unsigned long i = 0; text[i] != 0; i++) {{
+        if (text[i] == '\n') {{
+            text[i] = 0;
+            return;
+        }}
+    }}
+}}
+
+static int stdio_roundtrip(
+    const char *label,
+    fopen_fn fopen_impl,
+    fdopen_fn fdopen_impl,
+    fclose_fn fclose_impl,
+    fread_fn fread_impl,
+    fwrite_fn fwrite_impl,
+    fflush_fn fflush_impl,
+    fseek_fn fseek_impl,
+    ftell_fn ftell_impl,
+    fgets_fn fgets_impl,
+    fputs_fn fputs_impl,
+    feof_fn feof_impl,
+    ferror_fn ferror_impl,
+    clearerr_fn clearerr_impl,
+    fileno_fn fileno_impl
+) {{
+    FILE *stream = fopen_impl(DATA_FILE, "w+");
+    const char payload[] = "stdio-one\nstdio-two\n";
+    size_t wrote = stream ? fwrite_impl(payload, 1, sizeof(payload) - 1, stream) : 0;
+    int puts_ret = stream ? fputs_impl("tail\n", stream) : -1;
+    int flush_ret = stream ? fflush_impl(stream) : -1;
+    long pos_after_write = stream ? ftell_impl(stream) : -1;
+    int fd = stream ? fileno_impl(stream) : -1;
+    int seek_ret = stream ? fseek_impl(stream, 0, SEEK_SET) : -1;
+
+    char line[32] = {{0}};
+    char second[32] = {{0}};
+    char tail[16] = {{0}};
+    char eof_byte = 0;
+    char *line_ret = stream ? fgets_impl(line, sizeof(line), stream) : 0;
+    if (line_ret) {{
+        strip_newline(line);
+    }}
+    size_t second_read = stream ? fread_impl(second, 1, 10, stream) : 0;
+    if (second_read < sizeof(second)) {{
+        second[second_read] = 0;
+    }}
+    strip_newline(second);
+    int tail_seek = stream ? fseek_impl(stream, -5, SEEK_END) : -1;
+    size_t tail_read = stream ? fread_impl(tail, 1, 5, stream) : 0;
+    if (tail_read < sizeof(tail)) {{
+        tail[tail_read] = 0;
+    }}
+    strip_newline(tail);
+    size_t eof_read = stream ? fread_impl(&eof_byte, 1, 1, stream) : 0;
+    int eof_state = stream ? feof_impl(stream) : 0;
+    int error_state = stream ? ferror_impl(stream) : -1;
+    if (stream) {{
+        clearerr_impl(stream);
+    }}
+    int eof_after_clear = stream ? feof_impl(stream) : -1;
+    int close_ret = stream ? fclose_impl(stream) : -1;
+    printf(
+        "compat stdio %s open=%p fwrite=%lu fputs=%d flush=%d pos=%ld fd=%d seek=%d line=%s read=%lu text=%s tail_seek=%d tail=%s eof_read=%lu eof=%d err=%d eof_after=%d close=%d errno=%d\n",
+        label,
+        (void *)stream,
+        (unsigned long)wrote,
+        puts_ret,
+        flush_ret,
+        pos_after_write,
+        fd,
+        seek_ret,
+        line,
+        (unsigned long)second_read,
+        second,
+        tail_seek,
+        tail,
+        (unsigned long)eof_read,
+        eof_state,
+        error_state,
+        eof_after_clear,
+        close_ret,
+        errno
+    );
+
+    int raw_fd = open(DATA_FILE, O_RDONLY);
+    FILE *fd_stream = raw_fd >= 0 ? fdopen_impl(raw_fd, "r") : 0;
+    char fd_buf[16] = {{0}};
+    size_t fd_read = fd_stream ? fread_impl(fd_buf, 1, 5, fd_stream) : 0;
+    if (fd_read < sizeof(fd_buf)) {{
+        fd_buf[fd_read] = 0;
+    }}
+    int fd_close = fd_stream ? fclose_impl(fd_stream) : -1;
+    if (!fd_stream && raw_fd >= 0) {{
+        close(raw_fd);
+    }}
+    printf("compat stdio %s fdopen fd=%d stream=%p read=%lu text=%s close=%d errno=%d\n", label, raw_fd, (void *)fd_stream, (unsigned long)fd_read, fd_buf, fd_close, errno);
+
+    if (!stream || wrote != sizeof(payload) - 1 || puts_ret < 0 || flush_ret != 0 || pos_after_write < 25 || fd < 0 || seek_ret != 0 || !line_ret || !text_is(line, "stdio-one") || second_read != 10 || !text_is(second, "stdio-two") || tail_seek != 0 || tail_read != 5 || !text_is(tail, "tail") || eof_read != 0 || eof_state == 0 || error_state != 0 || eof_after_clear != 0 || close_ret != 0) {{
+        return 1;
+    }}
+    if (!fd_stream || fd_read != 5 || !text_is(fd_buf, "stdio") || fd_close != 0) {{
+        return 2;
+    }}
+    return 0;
+}}
+
+int main(void) {{
+    int failures = 0;
+    failures += stdio_roundtrip("static", fopen, fdopen, fclose, fread, fwrite, fflush, fseek, ftell, fgets, fputs, feof, ferror, clearerr, fileno);
+
+    void *self = dlopen(NULL, RTLD_NOW);
+    fopen_fn dyn_fopen = (fopen_fn)dlsym(self, "fopen");
+    fdopen_fn dyn_fdopen = (fdopen_fn)dlsym(self, "fdopen");
+    fclose_fn dyn_fclose = (fclose_fn)dlsym(self, "fclose");
+    fread_fn dyn_fread = (fread_fn)dlsym(self, "fread");
+    fwrite_fn dyn_fwrite = (fwrite_fn)dlsym(self, "fwrite");
+    fflush_fn dyn_fflush = (fflush_fn)dlsym(self, "fflush");
+    fseek_fn dyn_fseek = (fseek_fn)dlsym(self, "fseek");
+    ftell_fn dyn_ftell = (ftell_fn)dlsym(self, "ftell");
+    fgets_fn dyn_fgets = (fgets_fn)dlsym(self, "fgets");
+    fputs_fn dyn_fputs = (fputs_fn)dlsym(self, "fputs");
+    feof_fn dyn_feof = (feof_fn)dlsym(self, "feof");
+    ferror_fn dyn_ferror = (ferror_fn)dlsym(self, "ferror");
+    clearerr_fn dyn_clearerr = (clearerr_fn)dlsym(self, "clearerr");
+    fileno_fn dyn_fileno = (fileno_fn)dlsym(self, "fileno");
+    printf(
+        "compat stdio dlsym ptrs fopen=%p fdopen=%p fread=%p fwrite=%p fseek=%p fgets=%p clearerr=%p fileno=%p\n",
+        (void *)dyn_fopen,
+        (void *)dyn_fdopen,
+        (void *)dyn_fread,
+        (void *)dyn_fwrite,
+        (void *)dyn_fseek,
+        (void *)dyn_fgets,
+        (void *)dyn_clearerr,
+        (void *)dyn_fileno
+    );
+    if (!dyn_fopen || !dyn_fdopen || !dyn_fclose || !dyn_fread || !dyn_fwrite || !dyn_fflush || !dyn_fseek || !dyn_ftell || !dyn_fgets || !dyn_fputs || !dyn_feof || !dyn_ferror || !dyn_clearerr || !dyn_fileno) {{
+        return 3;
+    }}
+    failures += stdio_roundtrip("dlsym", dyn_fopen, dyn_fdopen, dyn_fclose, dyn_fread, dyn_fwrite, dyn_fflush, dyn_fseek, dyn_ftell, dyn_fgets, dyn_fputs, dyn_feof, dyn_ferror, dyn_clearerr, dyn_fileno);
+    dlclose(self);
+    unlink(DATA_FILE);
+    return failures == 0 ? 0 : 1;
+}}
+"#
+        ),
+    )
+    .expect("failed to write generated arm64 stdio fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 stdio fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 stdio fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -1548,6 +1796,12 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         "fd fixture did not complete positioned file I/O probe; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("compat fd nocancel open=")
+            && stdout.contains("write=5 seek=0 read=5 text=nc-ok")
+            && stdout.contains("close=0"),
+        "fd fixture did not complete raw *_nocancel syscall I/O probe; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("compat fd dlsym ptrs 0x"),
         "fd fixture did not receive dlsym trampolines; stdout:\n{stdout}"
     );
@@ -1558,6 +1812,98 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
     assert!(
         stdout.contains("compat fd dlsym positioned pwrite=6 lseek=16 pread=6 text=dyn-ok"),
         "fd fixture did not complete dynamic positioned file I/O probe; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_proxies_stdio_file_imports() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode stdio test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let (fixture, data_file) = compile_arm64_stdio_fixture();
+    let _ = fs::remove_file(&data_file);
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(stdio): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(stdio): status={status}");
+    eprintln!("compat proof(stdio): data file={}", data_file.display());
+    eprintln!("compat proof(stdio): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(stdio): stderr:\n{stderr}");
+    }
+
+    let _ = fs::remove_file(&data_file);
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("compat stdio static open=0x")
+            && stdout.contains("fwrite=20")
+            && stdout.contains("line=stdio-one read=10 text=stdio-two")
+            && stdout.contains("tail=tail eof_read=0 eof=1 err=0 eof_after=0 close=0"),
+        "stdio fixture did not complete static FILE* roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat stdio static fdopen fd=")
+            && stdout.contains("read=5 text=stdio close=0"),
+        "stdio fixture did not complete static fdopen/fread/fclose; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat stdio dlsym ptrs fopen=0x")
+            && stdout.contains(" fread=0x")
+            && stdout.contains(" clearerr=0x")
+            && stdout.contains(" fileno=0x"),
+        "stdio fixture did not receive dlsym stdio trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat stdio dlsym open=0x")
+            && stdout.contains("line=stdio-one read=10 text=stdio-two")
+            && stdout.contains("tail=tail eof_read=0 eof=1 err=0 eof_after=0 close=0"),
+        "stdio fixture did not complete dynamic FILE* roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat stdio dlsym fdopen fd=")
+            && stdout.contains("read=5 text=stdio close=0"),
+        "stdio fixture did not complete dynamic fdopen/fread/fclose; stdout:\n{stdout}"
     );
 }
 
