@@ -8,7 +8,7 @@ use crate::macos::plugin_events::{
     capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
     syscall_event, thread_event, TraceMetadata,
 };
-use crate::macos::plugins::register_plugins;
+use crate::macos::plugins::register_analysis_plugins;
 use crate::macos::trace::{
     PluginRegistry, StdoutTraceSink, TraceConfig, TraceEvent, TraceSink, Tracer,
 };
@@ -277,7 +277,7 @@ impl<S: TraceSink> MacosEmulator<S> {
     pub fn new(options: EmulationOptions, tracer: Tracer<S>) -> Self {
         let mut plugins = PluginRegistry::new();
         if options.mode.is_analysis() {
-            register_plugins(&mut plugins);
+            register_analysis_plugins(&mut plugins);
         }
         Self {
             options,

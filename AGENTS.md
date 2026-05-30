@@ -118,16 +118,18 @@ add new ones):
 
 ## CI and local validation
 
-- CI (`.github/workflows/rust.yml`) runs on Ubuntu via `cargo test`. The
-  AMOS regression contract lives in `tests/amos_private_access.rs` and
-  the RustDoor fast-mode contract lives in `tests/rustdoor_fast_mode.rs`;
-  both spawn the `machina` binary and assert milestones from the JSONL
-  trace.
+- CI (`.github/workflows/rust.yml`) runs the full `cargo test` suite on
+  Ubuntu and a focused compatibility-mode smoke test on Intel macOS
+  (`macos-15-intel`). The AMOS regression contract lives in
+  `tests/amos_private_access.rs`, the RustDoor fast-mode contract lives in
+  `tests/rustdoor_fast_mode.rs`, and the Intel macOS compatibility smoke
+  lives in `tests/compat_mode_macos.rs`.
 - Canonical local smoke flow:
   - `cargo build --bin machina`
   - `cargo run --bin machina -- fixtures/macos/bin/arm64_hello`
   - `cargo test --test amos_private_access` for the AMOS regression
   - `cargo test --test rustdoor_fast_mode` for the RustDoor milestones
+  - `cargo test --test compat_mode_macos` on Intel macOS for compat mode
 
 ## Repo hygiene
 

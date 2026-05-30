@@ -41,6 +41,8 @@ pub mod diagnostics;
 #[path = "core/emulation.rs"]
 pub mod emulation;
 pub mod events;
+#[path = "guest_model/analysis_artifacts.rs"]
+pub mod guest_analysis_artifacts;
 #[path = "guest_model/files.rs"]
 pub mod guest_files;
 #[path = "guest_model/memory.rs"]
@@ -114,9 +116,9 @@ pub use emulation::{
     run_target_batch_with_mode, targets_from_args, BatchSummary, EmulationOptions, EmulationReport,
     EmulationStatus, MacosCpu, MacosEmulator, CPU_TYPE_ARM64, DEFAULT_SAMPLE_PATH,
 };
+pub use guest_analysis_artifacts::materialize_synthetic_file_bytes;
 pub use guest_files::{
-    fstat_guest_file as generic_fstat_guest_file, materialize_synthetic_file_bytes,
-    open_guest_path as generic_open_guest_path,
+    fstat_guest_file as generic_fstat_guest_file, open_guest_path as generic_open_guest_path,
     read_guest_directory_entry as generic_read_guest_directory_entry,
     read_guest_file as generic_read_guest_file, resolve_guest_path,
     stat_guest_path as generic_stat_guest_path, GuestDirectoryEntry, GuestFileTable,
@@ -139,7 +141,7 @@ pub use plugin_events::{
     capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
     syscall_event, thread_event, TraceMetadata,
 };
-pub use plugins::register_plugins;
+pub use plugins::{register_analysis_plugins, register_plugins};
 pub use runner::{
     emulate_macos_arm64_binary, emulate_macos_arm64_binary_with_mode, emulate_macos_binary,
     emulate_macos_binary_with_mode,

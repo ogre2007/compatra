@@ -17,68 +17,17 @@ use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
     Arm64SharedState,
 };
+use crate::macos::capture::write_posix_spawn_argv_capture;
 use crate::macos::{
     close_synthetic_fd, dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id,
     read_arm64_argv, read_cstring, resolve_process_fd_target, restore_arm64_context,
-    sanitize_capture_label, save_arm64_context, terminate_synthetic_process, ActiveArm64Thread,
-    Emulator, ForkParentResume, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
-    SyntheticProcess, MAX_SYNTHETIC_THREADS,
+    save_arm64_context, terminate_synthetic_process, ActiveArm64Thread, Emulator, ForkParentResume,
+    PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticProcess, MAX_SYNTHETIC_THREADS,
 };
 use crate::UnicornEmulator;
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
-}
-
-/// Dump the resolved `posix_spawnp` invocation (path + argv + envp
-/// pointer) to `target/machina-captures/spawn_pid<parent>_child<child>_<seq>.cmd`.
-///
-/// `_write` only captures bytes the malware sends through `_write(2)`.
-/// The remote-command surface — `osascript display dialog ...`,
-/// `chflags hidden npm`, `chmod +x npm`, `zsh -c zip -r ...`,
-/// `zsh -c curl ...`, `zsh -c mdfind -name .pem`, etc. — never goes
-/// through `_write`; the malware composes the argv and hands it to
-/// `posix_spawnp`. A per-spawn artifact file makes those argvs
-/// inspectable end-to-end alongside the file-write dumps.
-///
-/// Returns the path written on success.
-fn append_posix_spawn_argv_to_capture(
-    parent_pid: u64,
-    child_pid: u64,
-    sequence: usize,
-    path: &str,
-    argv: &[String],
-    envp_ptr: u64,
-) -> Option<std::path::PathBuf> {
-    let capture_dir = std::env::var_os("MACHINA_PAYLOAD_DUMP_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new("target").join("machina-captures"));
-    if std::fs::create_dir_all(&capture_dir).is_err() {
-        return None;
-    }
-    let safe_label = sanitize_capture_label(path);
-    let label = if safe_label.is_empty() {
-        "unknown".to_string()
-    } else {
-        safe_label
-    };
-    let file_path = capture_dir.join(format!(
-        "spawn_pid{}_child{}_seq{}_{}.cmd",
-        parent_pid, child_pid, sequence, label
-    ));
-    let mut body = String::new();
-    body.push_str(&format!("# parent_pid={}\n", parent_pid));
-    body.push_str(&format!("# child_pid={}\n", child_pid));
-    body.push_str(&format!("# sequence={}\n", sequence));
-    body.push_str(&format!("# envp=0x{:X}\n", envp_ptr));
-    body.push_str(&format!("path={}\n", path));
-    for (i, arg) in argv.iter().enumerate() {
-        body.push_str(&format!("argv[{}]={}\n", i, arg));
-    }
-    if std::fs::write(&file_path, body).is_err() {
-        return None;
-    }
-    Some(file_path)
 }
 
 fn extract_log_stream_event_messages(predicate: &str) -> Vec<String> {
@@ -143,6 +92,7 @@ fn install_posix_spawn_hook(
     let thread_runtime = shared_state.thread_runtime.clone();
     let import_tracker = import_tracker.clone();
     let trace_bus_for_hook = trace_bus.clone();
+    let runtime_mode = shared_state.runtime_mode;
     // Per-installation sequence counter so multiple `posix_spawnp`
     // calls from the same parent get distinct dump files.
     let spawn_sequence = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -168,7 +118,8 @@ fn install_posix_spawn_hook(
                 .and_then(|actions| actions.get(&file_actions_ptr).cloned())
                 .unwrap_or_default();
             let log_stream_messages = synthetic_log_stream_messages(&path, &argv);
-            let synthesize_log_stream = !log_stream_messages.is_empty();
+            let synthesize_log_stream =
+                runtime_mode.is_analysis() && !log_stream_messages.is_empty();
             let current_tid = thread_runtime
                 .lock()
                 .ok()
@@ -233,14 +184,19 @@ fn install_posix_spawn_hook(
             );
             let sequence = spawn_sequence
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dump_path = append_posix_spawn_argv_to_capture(
-                current_pid,
-                child_pid,
-                sequence,
-                &path,
-                &argv,
-                envp_ptr,
-            );
+            let dump_path = runtime_mode
+                .is_analysis()
+                .then(|| {
+                    write_posix_spawn_argv_capture(
+                        current_pid,
+                        child_pid,
+                        sequence,
+                        &path,
+                        &argv,
+                        envp_ptr,
+                    )
+                })
+                .flatten();
             if let Some(dump_path) = &dump_path {
                 println!(
                     "[CAPTURE][arm64] posix-spawn argv pid={} tid={} child_pid={} seq={} path={} dump={}",
@@ -377,6 +333,7 @@ pub fn install_arm64_process_imports(
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_mode = shared_state.runtime_mode;
     install_posix_spawn_file_action_hooks(emulator, stub_map, shared_state, import_tracker)?;
 
     if let Some(&addr) = stub_map.get("_popen") {
@@ -853,13 +810,16 @@ pub fn install_arm64_process_imports(
                     if let Some(proc_state) = os.processes.get_mut(&current_pid) {
                         proc_state.exec_path = Some(path.clone());
                     }
-                    if let Some(SyntheticFdTarget::PipeRead(pipe_id)) =
-                        resolve_process_fd_target(&os, current_pid, 0)
-                    {
-                        if let Some(pipe) = os.pipes.get_mut(&pipe_id) {
-                            pipe.capture_label = Some(format!("pid={} {} {:?}", current_pid, path, argv));
-                            pipe.capture_consumer_pid = Some(current_pid);
-                            stdin_capture_info = Some((pipe_id, pipe.read_fd, pipe.write_fd));
+                    if runtime_mode.is_analysis() {
+                        if let Some(SyntheticFdTarget::PipeRead(pipe_id)) =
+                            resolve_process_fd_target(&os, current_pid, 0)
+                        {
+                            if let Some(pipe) = os.pipes.get_mut(&pipe_id) {
+                                pipe.capture_label =
+                                    Some(format!("pid={} {} {:?}", current_pid, path, argv));
+                                pipe.capture_consumer_pid = Some(current_pid);
+                                stdin_capture_info = Some((pipe_id, pipe.read_fd, pipe.write_fd));
+                            }
                         }
                     }
                     let close_on_exec_fds = os

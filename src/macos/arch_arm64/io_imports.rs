@@ -16,14 +16,15 @@ use crate::macos::arm64_runner_support::{
     arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
     record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
+use crate::macos::capture::{append_file_write_payload_to_capture, write_pipe_stdin_capture};
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
     duplicate_synthetic_fd, extract_ascii_indicators, fnv1a64_hex, fstat_guest_file,
     lossy_data_preview, open_directory_stream, open_guest_file, open_guest_file_with_flags,
     read_guest_directory_entry, read_guest_file, register_process_fd, resolve_directory_stream_fd,
-    resolve_guest_path, resolve_process_fd_target, sanitize_capture_label, shannon_entropy,
-    stat_guest_path, terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus,
-    SyntheticFdTarget, SyntheticKeventRegistration, SyntheticPipe,
+    resolve_guest_path, resolve_process_fd_target, shannon_entropy, stat_guest_path,
+    terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
+    SyntheticKeventRegistration, SyntheticPipe,
 };
 use crate::UnicornEmulator;
 
@@ -32,57 +33,6 @@ const ARM64_PIPE_IDLE_EOF_READ_LIMIT: u64 = 256;
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
-}
-
-/// Append bytes from a guest `_write(fd, ...)` to a host file under
-/// `target/machina-captures/`. The file is named after the (pid, fd, raw
-/// path) triple so multiple guest fds — including the typical
-/// re-open-as-RW-then-write pattern RustDoor uses on `~/.zshrc` — get
-/// independent dumps. Returns the path where data was appended on
-/// success.
-///
-/// This is best-effort: failures to create the directory or open/append
-/// the file are silently swallowed so the emulator keeps running.
-fn append_file_write_payload_to_capture(
-    pid: u64,
-    fd: u64,
-    raw_path: &str,
-    data: &[u8],
-) -> Option<std::path::PathBuf> {
-    if data.is_empty() {
-        return None;
-    }
-    let capture_dir = std::env::var_os("MACHINA_PAYLOAD_DUMP_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new("target").join("machina-captures"));
-    if std::fs::create_dir_all(&capture_dir).is_err() {
-        return None;
-    }
-    let safe_label = sanitize_capture_label(raw_path);
-    let file_path = capture_dir.join(format!(
-        "file_pid{}_fd{}_{}.bin",
-        pid,
-        fd,
-        if safe_label.is_empty() {
-            "unknown"
-        } else {
-            safe_label.as_str()
-        }
-    ));
-    use std::io::Write as _;
-    match std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&file_path)
-    {
-        Ok(mut handle) => {
-            if handle.write_all(data).is_err() {
-                return None;
-            }
-        }
-        Err(_) => return None,
-    }
-    Some(file_path)
 }
 
 fn read_cstring(emu: &mut dyn Emulator, addr: u64, max_len: usize) -> String {
@@ -1769,29 +1719,26 @@ pub fn install_arm64_io_imports(
                     &import_tracker,
                     format!("_close(fd={}, pid={}, tid={}, lr=0x{:X}) -> 0", fd, current_pid, thread_id, lr),
                 );
-                if let Some((pipe_id, label, consumer_pid, data)) = capture_closed {
+                if runtime_mode.is_analysis() {
+                    if let Some((pipe_id, label, consumer_pid, data)) = capture_closed {
                     let preview = lossy_data_preview(&data, 256);
                     let raw_hash = fnv1a64_hex(&data);
                     let raw_entropy = shannon_entropy(&data);
                     let capture_kind = "process-stdin";
-                    let capture_dir = std::path::Path::new("target").join("machina-captures");
                     let mut artifact_summary = String::new();
                     let mut analysis_summary = String::new();
                     let raw_indicators = extract_ascii_indicators(&data, 8, 8);
                     if !raw_indicators.is_empty() {
                         analysis_summary.push_str(&format!(" indicators={:?}", raw_indicators));
                     }
-                    if std::fs::create_dir_all(&capture_dir).is_ok() {
-                        let safe_label = sanitize_capture_label(&label);
-                        let raw_path = capture_dir.join(format!("pipe_{}_{}_stdin.stdin", pipe_id, safe_label));
-                        if std::fs::write(&raw_path, &data).is_ok() {
-                            artifact_summary.push_str(&format!(" raw={}", raw_path.display()));
-                        }
+                    if let Some(raw_path) = write_pipe_stdin_capture(pipe_id, &label, &data) {
+                        artifact_summary.push_str(&format!(" raw={}", raw_path.display()));
                     }
                     println!(
                         "[CAPTURE][arm64] {} complete pipe_id={} closed_by_pid={} consumer_pid={:?} target={} total_bytes={} raw_fnv1a64={} raw_entropy={:.3} preview={}{}{}",
                         capture_kind, pipe_id, current_pid, consumer_pid, label, data.len(), raw_hash, raw_entropy, preview, artifact_summary, analysis_summary
                     );
+                    }
                 }
             },
         )?;

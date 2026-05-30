@@ -40,7 +40,7 @@ pub use macos::plugin_events::{
     capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
     syscall_event, thread_event, TraceMetadata,
 };
-pub use macos::plugins::register_plugins;
+pub use macos::plugins::{register_analysis_plugins, register_plugins};
 pub use macos::policy::MacOsPolicyManager;
 pub use macos::runner::{
     emulate_macos_arm64_binary, emulate_macos_arm64_binary_with_mode, emulate_macos_binary,

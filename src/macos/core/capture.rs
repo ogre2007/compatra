@@ -1,5 +1,7 @@
 //! Helpers for captured guest data.
 
+use std::path::{Path, PathBuf};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureSummary {
     pub bytes: usize,
@@ -36,6 +38,100 @@ pub fn sanitize_capture_label(label: &str) -> String {
         .chars()
         .take(80)
         .collect()
+}
+
+pub fn capture_dir_from_env() -> PathBuf {
+    std::env::var_os("MACHINA_PAYLOAD_DUMP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new("target").join("machina-captures"))
+}
+
+pub fn append_file_write_payload_to_capture(
+    pid: u64,
+    fd: u64,
+    raw_path: &str,
+    data: &[u8],
+) -> Option<PathBuf> {
+    if data.is_empty() {
+        return None;
+    }
+    let capture_dir = capture_dir_from_env();
+    if std::fs::create_dir_all(&capture_dir).is_err() {
+        return None;
+    }
+    let safe_label = sanitize_capture_label(raw_path);
+    let file_path = capture_dir.join(format!(
+        "file_pid{}_fd{}_{}.bin",
+        pid,
+        fd,
+        if safe_label.is_empty() {
+            "unknown"
+        } else {
+            safe_label.as_str()
+        }
+    ));
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&file_path)
+    {
+        Ok(mut handle) => {
+            if handle.write_all(data).is_err() {
+                return None;
+            }
+        }
+        Err(_) => return None,
+    }
+    Some(file_path)
+}
+
+pub fn write_posix_spawn_argv_capture(
+    parent_pid: u64,
+    child_pid: u64,
+    sequence: usize,
+    path: &str,
+    argv: &[String],
+    envp_ptr: u64,
+) -> Option<PathBuf> {
+    let capture_dir = capture_dir_from_env();
+    if std::fs::create_dir_all(&capture_dir).is_err() {
+        return None;
+    }
+    let safe_label = sanitize_capture_label(path);
+    let label = if safe_label.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe_label
+    };
+    let file_path = capture_dir.join(format!(
+        "spawn_pid{}_child{}_seq{}_{}.cmd",
+        parent_pid, child_pid, sequence, label
+    ));
+    let mut body = String::new();
+    body.push_str(&format!("# parent_pid={}\n", parent_pid));
+    body.push_str(&format!("# child_pid={}\n", child_pid));
+    body.push_str(&format!("# sequence={}\n", sequence));
+    body.push_str(&format!("# envp=0x{:X}\n", envp_ptr));
+    body.push_str(&format!("path={}\n", path));
+    for (i, arg) in argv.iter().enumerate() {
+        body.push_str(&format!("argv[{}]={}\n", i, arg));
+    }
+    if std::fs::write(&file_path, body).is_err() {
+        return None;
+    }
+    Some(file_path)
+}
+
+pub fn write_pipe_stdin_capture(pipe_id: u64, label: &str, data: &[u8]) -> Option<PathBuf> {
+    let capture_dir = capture_dir_from_env();
+    if std::fs::create_dir_all(&capture_dir).is_err() {
+        return None;
+    }
+    let safe_label = sanitize_capture_label(label);
+    let raw_path = capture_dir.join(format!("pipe_{}_{}_stdin.stdin", pipe_id, safe_label));
+    std::fs::write(&raw_path, data).ok()?;
+    Some(raw_path)
 }
 
 pub fn fnv1a64_hex(data: &[u8]) -> String {

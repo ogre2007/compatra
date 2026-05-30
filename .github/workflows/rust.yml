@@ -21,3 +21,17 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  macos-intel-compat:
+    runs-on: macos-15-intel
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Verify Intel macOS runner
+      run: |
+        test "$(uname -s)" = "Darwin"
+        test "$(uname -m)" = "x86_64"
+        sw_vers
+    - name: Build machina
+      run: cargo build --bin machina --verbose
+    - name: Run compat-mode smoke test
+      run: cargo test --test compat_mode_macos --verbose

@@ -74,6 +74,16 @@ non-analysis defaults:
 cargo run --bin machina -- --mode compat fixtures\macos\bin\arm64_hello
 ```
 
+## Local compat smoke check
+
+Compatibility mode is pinned by `tests/compat_mode_macos.rs`. The test is
+intended for Intel macOS, where host-library compatibility work can be
+validated:
+
+```
+cargo test --test compat_mode_macos
+```
+
 ## Local AMOS integration check
 
 The AMOS private-file access milestones (Binance / Firefox / Electrum

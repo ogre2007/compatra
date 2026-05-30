@@ -6,7 +6,7 @@
 
 use crate::macos::trace::{CallTracePlugin, PluginRegistry, TraceCategory};
 
-pub fn register_plugins(registry: &mut PluginRegistry) {
+pub fn register_analysis_plugins(registry: &mut PluginRegistry) {
     registry.register(
         CallTracePlugin::new("procmon")
             .category(TraceCategory::Process)
@@ -72,6 +72,10 @@ pub fn register_plugins(registry: &mut PluginRegistry) {
             .call("kqueue")
             .call("import-hit"),
     );
+}
+
+pub fn register_plugins(registry: &mut PluginRegistry) {
+    register_analysis_plugins(registry);
 }
 
 #[cfg(test)]
