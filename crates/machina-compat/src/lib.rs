@@ -140,6 +140,8 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     Select,
     #[cfg(target_os = "macos")]
+    DarwinCheckFdSetOverflow,
+    #[cfg(target_os = "macos")]
     Access,
     #[cfg(target_os = "macos")]
     Chdir,
@@ -528,6 +530,11 @@ impl CompatibilityServices {
                 self.select_fds(memory, args[0], args[1], args[2], args[3], args[4])?
                     .into(),
             ),
+            #[cfg(target_os = "macos")]
+            HostImportKind::DarwinCheckFdSetOverflow => Some(HostCallResult {
+                return_value: 1,
+                errno: Some(0),
+            }),
             #[cfg(target_os = "macos")]
             HostImportKind::Access => Some(self.access_path(memory, args[0], args[1])?.into()),
             #[cfg(target_os = "macos")]
@@ -2836,6 +2843,7 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "dup2" => Some(HostImportKind::Dup2),
             "pipe" => Some(HostImportKind::Pipe),
             "select" | "select$NOCANCEL" => Some(HostImportKind::Select),
+            "__darwin_check_fd_set_overflow" => Some(HostImportKind::DarwinCheckFdSetOverflow),
             "access" => Some(HostImportKind::Access),
             "chdir" => Some(HostImportKind::Chdir),
             "fchdir" => Some(HostImportKind::Fchdir),
@@ -7073,6 +7081,7 @@ mod tests {
             assert!(compat.should_proxy_import("_pipe"));
             assert!(compat.should_proxy_import("_select$NOCANCEL"));
             assert!(compat.should_proxy_import("_select$1050"));
+            assert!(compat.should_proxy_import("___darwin_check_fd_set_overflow"));
             assert!(compat.should_proxy_import("_access"));
             assert!(compat.should_proxy_import("_access$UNIX2003"));
             assert!(compat.should_proxy_import("_chdir"));
