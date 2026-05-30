@@ -37,6 +37,7 @@ pub fn install_return_stubs(
     tracker: &ImportTracker,
     trace_bus: &Option<crate::macos::SharedTraceBus>,
     process_name: &str,
+    runtime_mode: crate::macos::RuntimeMode,
 ) -> Result<
     (
         std::collections::HashMap<String, u64>,
@@ -51,5 +52,6 @@ pub fn install_return_stubs(
         tracker,
         trace_bus,
         process_name,
+        runtime_mode,
     )
 }

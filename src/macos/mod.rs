@@ -1,3 +1,5 @@
+#[path = "core/analysis.rs"]
+pub mod analysis;
 #[path = "platform_apple/imports.rs"]
 pub mod apple_imports;
 #[path = "platform_apple/runtime.rs"]

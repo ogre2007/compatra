@@ -12,12 +12,12 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use crate::macos::analysis::AnalysisServices;
 use crate::macos::arm64_io_imports::allocate_arm64_heap;
 use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
     Arm64SharedState,
 };
-use crate::macos::capture::write_posix_spawn_argv_capture;
 use crate::macos::{
     close_synthetic_fd, dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id,
     read_arm64_argv, read_cstring, resolve_process_fd_target, restore_arm64_context,
@@ -28,54 +28,6 @@ use crate::UnicornEmulator;
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
-}
-
-fn extract_log_stream_event_messages(predicate: &str) -> Vec<String> {
-    let mut messages = Vec::new();
-    let mut rest = predicate;
-    while let Some(idx) = rest.find("eventMessage contains") {
-        rest = &rest[idx + "eventMessage contains".len()..];
-        let Some(start) = rest.find('"') else {
-            break;
-        };
-        let after_start = &rest[start + 1..];
-        let Some(end) = after_start.find('"') else {
-            break;
-        };
-        messages.push(after_start[..end].to_string());
-        rest = &after_start[end + 1..];
-    }
-    messages
-}
-
-fn synthetic_log_stream_messages(path: &str, argv: &[String]) -> Vec<String> {
-    if path != "log" || !argv.iter().any(|arg| arg == "stream") {
-        return Vec::new();
-    }
-    let mut messages = argv
-        .iter()
-        .flat_map(|arg| extract_log_stream_event_messages(arg))
-        .collect::<Vec<_>>();
-    messages.sort();
-    messages.dedup();
-    messages
-}
-
-fn synthetic_log_stream_output(messages: &[String]) -> Vec<u8> {
-    let mut output =
-        "Timestamp                       Thread     Type        Activity             PID    TTL  \n"
-            .as_bytes()
-            .to_vec();
-    for message in messages {
-        output.extend_from_slice(
-            format!(
-                "2026-05-08 20:00:00.000000+0300 0x000000   Info        0x0                  0      0    {}\n",
-                message
-            )
-            .as_bytes(),
-        );
-    }
-    output
 }
 
 fn install_posix_spawn_hook(
@@ -92,7 +44,7 @@ fn install_posix_spawn_hook(
     let thread_runtime = shared_state.thread_runtime.clone();
     let import_tracker = import_tracker.clone();
     let trace_bus_for_hook = trace_bus.clone();
-    let runtime_mode = shared_state.runtime_mode;
+    let analysis = AnalysisServices::for_mode(shared_state.runtime_mode);
     // Per-installation sequence counter so multiple `posix_spawnp`
     // calls from the same parent get distinct dump files.
     let spawn_sequence = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -117,9 +69,12 @@ fn install_posix_spawn_hook(
                 .ok()
                 .and_then(|actions| actions.get(&file_actions_ptr).cloned())
                 .unwrap_or_default();
-            let log_stream_messages = synthetic_log_stream_messages(&path, &argv);
-            let synthesize_log_stream =
-                runtime_mode.is_analysis() && !log_stream_messages.is_empty();
+            let log_stream = analysis.and_then(|analysis| analysis.synthetic_log_stream(&path, &argv));
+            let log_stream_messages = log_stream
+                .as_ref()
+                .map(|stream| stream.messages.clone())
+                .unwrap_or_default();
+            let synthesize_log_stream = log_stream.is_some();
             let current_tid = thread_runtime
                 .lock()
                 .ok()
@@ -148,8 +103,7 @@ fn install_posix_spawn_hook(
                         exec_path: Some(path.clone()),
                     },
                 );
-                if synthesize_log_stream {
-                    let output = synthetic_log_stream_output(&log_stream_messages);
+                if let Some(log_stream) = &log_stream {
                     for (fd, newfd) in &file_actions {
                         if *newfd != 1 && *newfd != 2 {
                             continue;
@@ -158,7 +112,7 @@ fn install_posix_spawn_hook(
                             resolve_process_fd_target(&os, current_pid, *fd)
                         {
                             if let Some(pipe) = os.pipes.get_mut(&pipe_id) {
-                                pipe.buffer.extend(output.iter().copied());
+                                pipe.buffer.extend(log_stream.output.iter().copied());
                                 pipe.write_open = false;
                             }
                         }
@@ -184,10 +138,9 @@ fn install_posix_spawn_hook(
             );
             let sequence = spawn_sequence
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dump_path = runtime_mode
-                .is_analysis()
-                .then(|| {
-                    write_posix_spawn_argv_capture(
+            let dump_path = analysis
+                .and_then(|analysis| {
+                    analysis.write_posix_spawn_argv_capture(
                         current_pid,
                         child_pid,
                         sequence,
@@ -195,8 +148,7 @@ fn install_posix_spawn_hook(
                         &argv,
                         envp_ptr,
                     )
-                })
-                .flatten();
+                });
             if let Some(dump_path) = &dump_path {
                 println!(
                     "[CAPTURE][arm64] posix-spawn argv pid={} tid={} child_pid={} seq={} path={} dump={}",
@@ -333,7 +285,7 @@ pub fn install_arm64_process_imports(
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime_mode = shared_state.runtime_mode;
+    let analysis = AnalysisServices::for_mode(shared_state.runtime_mode);
     install_posix_spawn_file_action_hooks(emulator, stub_map, shared_state, import_tracker)?;
 
     if let Some(&addr) = stub_map.get("_popen") {
@@ -810,13 +762,17 @@ pub fn install_arm64_process_imports(
                     if let Some(proc_state) = os.processes.get_mut(&current_pid) {
                         proc_state.exec_path = Some(path.clone());
                     }
-                    if runtime_mode.is_analysis() {
+                    if let Some(analysis) = analysis {
                         if let Some(SyntheticFdTarget::PipeRead(pipe_id)) =
                             resolve_process_fd_target(&os, current_pid, 0)
                         {
                             if let Some(pipe) = os.pipes.get_mut(&pipe_id) {
                                 pipe.capture_label =
-                                    Some(format!("pid={} {} {:?}", current_pid, path, argv));
+                                    Some(analysis.process_stdin_capture_label(
+                                        current_pid,
+                                        &path,
+                                        &argv,
+                                    ));
                                 pipe.capture_consumer_pid = Some(current_pid);
                                 stdin_capture_info = Some((pipe_id, pipe.read_fd, pipe.write_fd));
                             }

@@ -12,19 +12,19 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
+use crate::macos::analysis::{AnalysisServices, FilePayloadDump};
 use crate::macos::arm64_runner_support::{
     arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
     record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
-use crate::macos::capture::{append_file_write_payload_to_capture, write_pipe_stdin_capture};
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
-    duplicate_synthetic_fd, extract_ascii_indicators, fnv1a64_hex, fstat_guest_file,
-    lossy_data_preview, open_directory_stream, open_guest_file, open_guest_file_with_flags,
-    read_guest_directory_entry, read_guest_file, register_process_fd, resolve_directory_stream_fd,
-    resolve_guest_path, resolve_process_fd_target, shannon_entropy, stat_guest_path,
-    terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
-    SyntheticKeventRegistration, SyntheticPipe,
+    duplicate_synthetic_fd, fstat_guest_file, lossy_data_preview, open_directory_stream,
+    open_guest_file, open_guest_file_with_flags, read_guest_directory_entry, read_guest_file,
+    register_process_fd, resolve_directory_stream_fd, resolve_guest_path,
+    resolve_process_fd_target, stat_guest_path, terminate_synthetic_process, Emulator,
+    PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticKeventRegistration,
+    SyntheticPipe,
 };
 use crate::UnicornEmulator;
 
@@ -260,7 +260,7 @@ pub fn install_arm64_io_imports(
     let malloc_next_addr = shared_state.malloc_next_addr.clone();
     let synthetic_stop_reason = shared_state.synthetic_stop_reason.clone();
     let process_bootstrap = shared_state.process_bootstrap;
-    let runtime_mode = shared_state.runtime_mode;
+    let analysis = AnalysisServices::for_mode(shared_state.runtime_mode);
 
     if let Some(&addr) = stub_map.get("_kqueue") {
         let os_runtime = shared_state.os_runtime.clone();
@@ -1719,26 +1719,24 @@ pub fn install_arm64_io_imports(
                     &import_tracker,
                     format!("_close(fd={}, pid={}, tid={}, lr=0x{:X}) -> 0", fd, current_pid, thread_id, lr),
                 );
-                if runtime_mode.is_analysis() {
-                    if let Some((pipe_id, label, consumer_pid, data)) = capture_closed {
-                    let preview = lossy_data_preview(&data, 256);
-                    let raw_hash = fnv1a64_hex(&data);
-                    let raw_entropy = shannon_entropy(&data);
-                    let capture_kind = "process-stdin";
-                    let mut artifact_summary = String::new();
-                    let mut analysis_summary = String::new();
-                    let raw_indicators = extract_ascii_indicators(&data, 8, 8);
-                    if !raw_indicators.is_empty() {
-                        analysis_summary.push_str(&format!(" indicators={:?}", raw_indicators));
-                    }
-                    if let Some(raw_path) = write_pipe_stdin_capture(pipe_id, &label, &data) {
-                        artifact_summary.push_str(&format!(" raw={}", raw_path.display()));
-                    }
+                if let (Some(analysis), Some((pipe_id, label, consumer_pid, data))) =
+                    (analysis, capture_closed)
+                {
+                    let report =
+                        analysis.complete_pipe_stdin_capture(pipe_id, label, consumer_pid, &data);
                     println!(
-                        "[CAPTURE][arm64] {} complete pipe_id={} closed_by_pid={} consumer_pid={:?} target={} total_bytes={} raw_fnv1a64={} raw_entropy={:.3} preview={}{}{}",
-                        capture_kind, pipe_id, current_pid, consumer_pid, label, data.len(), raw_hash, raw_entropy, preview, artifact_summary, analysis_summary
+                        "[CAPTURE][arm64] process-stdin complete pipe_id={} closed_by_pid={} consumer_pid={:?} target={} total_bytes={} raw_fnv1a64={} raw_entropy={:.3} preview={}{}{}",
+                        report.pipe_id,
+                        current_pid,
+                        report.consumer_pid,
+                        report.label,
+                        report.bytes,
+                        report.raw_hash,
+                        report.raw_entropy,
+                        report.preview,
+                        report.artifact_summary,
+                        report.analysis_summary
                     );
-                    }
                 }
             },
         )?;
@@ -2601,9 +2599,9 @@ pub fn install_arm64_io_imports(
                 }
                 let mut pipe_capture = None;
                 let mut substituted_recent_read = false;
-                let mut file_payload_dump: Option<(String, std::path::PathBuf, usize)> = None;
+                let mut file_payload_dump: Option<FilePayloadDump> = None;
                 if !data.is_empty() {
-                    if runtime_mode.is_analysis() {
+                    if let Some(analysis) = analysis {
                         if let Ok(os_guard) = os_runtime.lock() {
                         if let Some(SyntheticFdTarget::File(file_id)) =
                             resolve_process_fd_target(&os_guard, current_pid, fd)
@@ -2611,14 +2609,13 @@ pub fn install_arm64_io_imports(
                             if let Some(file) = os_guard.guest_files.files.get(&file_id) {
                                 let raw_path = file.raw_path.clone();
                                 drop(os_guard);
-                                if let Some(dump_path) = append_file_write_payload_to_capture(
+                                if let Some(dump) = analysis.capture_file_write_payload(
                                     current_pid,
                                     fd,
-                                    &raw_path,
+                                    raw_path,
                                     &data,
                                 ) {
-                                    file_payload_dump =
-                                        Some((raw_path, dump_path, data.len()));
+                                    file_payload_dump = Some(dump);
                                 }
                             }
                         }
@@ -2719,19 +2716,19 @@ pub fn install_arm64_io_imports(
                     .arg("Captured", data.len().to_string())
                     .arg("Buf", format!("0x{:X}", buf))
                     .arg("Preview", preview);
-                if let Some((raw_path, dump_path, dumped_bytes)) = &file_payload_dump {
+                if let Some(dump) = &file_payload_dump {
                     event = event
-                        .arg("PayloadPath", raw_path.clone())
-                        .arg("PayloadDumpFile", dump_path.display().to_string())
-                        .arg("PayloadDumpedBytes", dumped_bytes.to_string());
+                        .arg("PayloadPath", dump.raw_path.clone())
+                        .arg("PayloadDumpFile", dump.dump_path.display().to_string())
+                        .arg("PayloadDumpedBytes", dump.dumped_bytes.to_string());
                     println!(
                         "[CAPTURE][arm64] file-write payload pid={} tid={} fd={} path={} dump={} bytes={}",
                         current_pid,
                         current_tid,
                         fd,
-                        raw_path,
-                        dump_path.display(),
-                        dumped_bytes
+                        dump.raw_path,
+                        dump.dump_path.display(),
+                        dump.dumped_bytes
                     );
                 }
                 emit_arm64_event(&trace_bus_for_hook, event);

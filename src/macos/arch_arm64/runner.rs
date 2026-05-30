@@ -448,6 +448,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &import_tracker,
         &trace_bus,
         &process_name,
+        runtime_mode,
     )?;
     for (name, addr) in stub_map.clone() {
         let normalized = crate::macos::imports::normalize_import_symbol(name);

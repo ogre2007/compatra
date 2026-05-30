@@ -38,7 +38,7 @@ fn compat_mode_smoke_is_macos_only() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn compat_mode_runs_arm64_hello_without_analysis_trace_plugins() {
+fn compat_mode_executes_arm64_hello_without_analysis_trace_plugins() {
     if std::env::consts::ARCH != "x86_64" {
         eprintln!(
             "skipping Intel macOS compat-mode integration test on {}",
@@ -63,6 +63,11 @@ fn compat_mode_runs_arm64_hello_without_analysis_trace_plugins() {
         .env("MACHINA_PLUGIN_TRACE", "1")
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
+        // The compat trace bus intentionally has no analysis plugin preset,
+        // so enable legacy startup diagnostics only for this smoke test. These
+        // markers prove Unicorn entered guest arm64 code and returned through
+        // the synthetic done address instead of merely accepting the CLI input.
+        .env("MACHINA_DEBUG_STDOUT", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -76,6 +81,19 @@ fn compat_mode_runs_arm64_hello_without_analysis_trace_plugins() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    assert!(
+        stdout.contains("Hello World"),
+        "compat smoke did not proxy guest stdout from the arm64 fixture; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[STARTUP][arm64 #00] pc="),
+        "compat smoke did not show the first guest instruction; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[THREAD][arm64] reached done_addr")
+            || stdout.contains("[STARTUP][arm64] reached done_addr"),
+        "compat smoke did not prove guest execution reached the synthetic done address; stdout:\n{stdout}"
+    );
     for forbidden in [
         "\"plugin\":\"procmon\"",
         "\"plugin\":\"syscalls\"",

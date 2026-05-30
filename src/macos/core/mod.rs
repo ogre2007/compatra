@@ -1,3 +1,4 @@
+pub use crate::macos::analysis;
 pub mod binary_bootstrap;
 pub mod binary_setup;
 pub mod bootstrap;

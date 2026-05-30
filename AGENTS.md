@@ -29,9 +29,10 @@ re-export the same modules under shorter names. When you add a new file:
 
 Group ownership:
 
-- `src/macos/core` — architecture-neutral orchestration, tracing, plugin and
-  runtime façades, batch emulation driver (`emulation.rs`), JSONL trace
-  pipeline (`trace.rs`, `plugin_events.rs`, `runner_plugins.rs`).
+- `src/macos/core` — architecture-neutral orchestration, analysis-service
+  boundary (`analysis.rs`), tracing, plugin and runtime façades, batch
+  emulation driver (`emulation.rs`), JSONL trace pipeline (`trace.rs`,
+  `plugin_events.rs`, `runner_plugins.rs`).
 - `src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics, LSE
   atomic / indirect-branch hooks, and arm64 `*_imports.rs` thunk groups.
 - `src/macos/platform_apple` — CoreFoundation, Security, XPC, libobjc and
