@@ -1562,6 +1562,7 @@ pub fn install_arm64_io_imports(
                 let path_ptr = emu.read_reg("x0").unwrap_or(0);
                 let flags = emu.read_reg("x1").unwrap_or(0);
                 let mode = emu.read_reg("x2").unwrap_or(0);
+                let stack_ptr = emu.read_reg("sp").ok();
                 let path = read_cstring(emu, path_ptr, 4096);
                 let current_tid = thread_runtime
                     .lock()
@@ -1574,7 +1575,9 @@ pub fn install_arm64_io_imports(
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
                 if let Some(compat) = compat_for_hook {
-                    if let Some(result) = compat.open_path_arg0(emu, path_ptr, flags, mode) {
+                    if let Some(result) =
+                        compat.open_path_arm64(emu, path_ptr, flags, mode, stack_ptr)
+                    {
                         let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
                         let lr = emu.read_reg("lr").unwrap_or(0);
                         let _ = emu.write_reg("x0", result.return_value);

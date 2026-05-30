@@ -97,6 +97,24 @@ impl CompatibilityServices {
         machina_compat::CompatibilityServices.open_path_arg0(&mut memory, path_ptr, flags, mode)
     }
 
+    pub fn open_path_arm64(
+        &self,
+        emu: &mut dyn Emulator,
+        path_ptr: u64,
+        flags: u64,
+        register_mode: u64,
+        stack_ptr: Option<u64>,
+    ) -> Option<HostOpenResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.open_path_arm64(
+            &mut memory,
+            path_ptr,
+            flags,
+            register_mode,
+            stack_ptr,
+        )
+    }
+
     pub fn read_fd(
         &self,
         emu: &mut dyn Emulator,

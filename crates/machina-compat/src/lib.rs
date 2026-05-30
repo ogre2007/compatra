@@ -386,7 +386,7 @@ impl CompatibilityServices {
             HostImportKind::Putchar => proxy_host_putchar(args[0]),
             #[cfg(target_os = "macos")]
             HostImportKind::Open => {
-                let result = self.open_path_arg0(memory, args[0], args[1], args[2])?;
+                let result = self.open_path_arm64(memory, args[0], args[1], args[2], stack_ptr)?;
                 Some(HostCallResult {
                     return_value: result.return_value,
                     errno: Some(result.errno),
@@ -772,6 +772,26 @@ impl CompatibilityServices {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, path_ptr, flags, mode);
+            None
+        }
+    }
+
+    pub fn open_path_arm64<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        flags: u64,
+        register_mode: u64,
+        stack_ptr: Option<u64>,
+    ) -> Option<HostOpenResult> {
+        #[cfg(target_os = "macos")]
+        {
+            let mode = arm64_variadic_open_mode(memory, flags, register_mode, stack_ptr);
+            return proxy_host_open_arg0(memory, path_ptr, flags, mode);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, path_ptr, flags, register_mode, stack_ptr);
             None
         }
     }
@@ -2978,6 +2998,22 @@ fn read_stack_u64_args<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn arm64_variadic_open_mode<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    flags: u64,
+    register_mode: u64,
+    stack_ptr: Option<u64>,
+) -> u64 {
+    if (flags & libc::O_CREAT as u64) == 0 {
+        return register_mode;
+    }
+
+    stack_ptr
+        .and_then(|sp| read_stack_u64_args(memory, sp, 1).first().copied())
+        .unwrap_or(register_mode)
+}
+
+#[cfg(target_os = "macos")]
 const DARWIN_ADDRINFO_SIZE: usize = 48;
 #[cfg(target_os = "macos")]
 const DARWIN_ADDRINFO_AI_FLAGS: usize = 0;
@@ -3006,9 +3042,9 @@ const DARWIN_IOVEC_BASE: usize = 0;
 #[cfg(target_os = "macos")]
 const DARWIN_IOVEC_LEN: usize = 8;
 #[cfg(target_os = "macos")]
-const DARWIN_STAT_SIZE: usize = 128;
+const DARWIN_STAT_SIZE: usize = 144;
 #[cfg(target_os = "macos")]
-const DARWIN_STAT_SIZE_OFFSET: usize = 48;
+const DARWIN_STAT_SIZE_OFFSET: usize = 96;
 #[cfg(target_os = "macos")]
 const MAX_GUEST_IOV: usize = 1024;
 #[cfg(target_os = "macos")]
@@ -3132,6 +3168,15 @@ fn write_guest_u64<M: GuestMemory + ?Sized>(
     memory: &mut M,
     addr: u64,
     value: u64,
+) -> Result<(), GuestMemoryError> {
+    memory.write_memory(addr, &value.to_le_bytes())
+}
+
+#[cfg(target_os = "macos")]
+fn write_guest_u32<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    value: u32,
 ) -> Result<(), GuestMemoryError> {
     memory.write_memory(addr, &value.to_le_bytes())
 }
@@ -3538,19 +3583,31 @@ fn proxy_host_getcwd<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_stat_from_metadata(metadata: &fs::Metadata) -> MaybeUninit<[u8; DARWIN_STAT_SIZE]> {
-    darwin_minimal_stat(metadata.size())
+fn write_darwin_stat_from_metadata<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    stat_ptr: u64,
+    metadata: &fs::Metadata,
+) -> Result<(), u32> {
+    write_darwin_minimal_stat(memory, stat_ptr, metadata.size())
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_minimal_stat(size: u64) -> MaybeUninit<[u8; DARWIN_STAT_SIZE]> {
-    let mut stat = MaybeUninit::<[u8; DARWIN_STAT_SIZE]>::zeroed();
-    unsafe {
-        let stat = &mut *stat.as_mut_ptr();
-        stat[DARWIN_STAT_SIZE_OFFSET..DARWIN_STAT_SIZE_OFFSET + 8]
-            .copy_from_slice(&size.to_le_bytes());
+fn write_darwin_minimal_stat<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    stat_ptr: u64,
+    size: u64,
+) -> Result<(), u32> {
+    let mut stat = [0u8; DARWIN_STAT_SIZE];
+    stat[DARWIN_STAT_SIZE_OFFSET..DARWIN_STAT_SIZE_OFFSET + 8].copy_from_slice(&size.to_le_bytes());
+    if memory.write_memory(stat_ptr, &stat).is_ok() {
+        return Ok(());
     }
-    stat
+    memory
+        .write_memory(
+            stat_ptr + DARWIN_STAT_SIZE_OFFSET as u64,
+            &size.to_le_bytes(),
+        )
+        .map_err(|_| libc::EFAULT as u32)
 }
 
 #[cfg(target_os = "macos")]
@@ -3576,8 +3633,7 @@ fn proxy_host_stat<M: GuestMemory + ?Sized>(
         Ok(metadata) => metadata,
         Err(error) => return Some(host_io_error(io_error_errno(&error))),
     };
-    let stat = darwin_stat_from_metadata(&metadata);
-    if write_guest_host_struct(memory, stat_ptr, &stat).is_err() {
+    if write_darwin_stat_from_metadata(memory, stat_ptr, &metadata).is_err() {
         return Some(host_io_error(libc::EFAULT as u32));
     }
     Some(host_io_result(0, Vec::new()))
@@ -3597,8 +3653,7 @@ fn proxy_host_fstat<M: GuestMemory + ?Sized>(
     let ret = unsafe { libc::fstat(fd as libc::c_int, stat.as_mut_ptr()) };
     if ret == 0 {
         let size = unsafe { (*stat.as_ptr()).st_size }.max(0) as u64;
-        let guest_stat = darwin_minimal_stat(size);
-        if write_guest_host_struct(memory, stat_ptr, &guest_stat).is_err() {
+        if write_darwin_minimal_stat(memory, stat_ptr, size).is_err() {
             return Some(host_io_error(libc::EFAULT as u32));
         }
     }
@@ -4952,8 +5007,11 @@ fn proxy_host_select<M: GuestMemory + ?Sized>(
     let ready_except = collect_ready_host_fd_set(exceptfds.as_ref(), except_host.as_ref());
     if ready_read.is_empty() {
         ready_read = collect_fionread_ready(readfds.as_ref());
-        if !ready_read.is_empty() && ret == 0 {
-            ret = ready_read.len() as libc::c_int;
+        if ready_read.is_empty() && readfds_ptr != 0 {
+            ready_read = collect_fionread_ready_range(nfds);
+        }
+        if !ready_read.is_empty() {
+            ret = ret.max(ready_read.len() as libc::c_int);
         }
     }
 
@@ -5089,6 +5147,21 @@ fn collect_fionread_ready(original: Option<&HashSet<libc::c_int>>) -> HashSet<li
         let ret = unsafe { libc::ioctl(*fd, libc::FIONREAD, &mut available as *mut libc::c_int) };
         if ret == 0 && available > 0 {
             ready.insert(*fd);
+        }
+    }
+    ready
+}
+
+#[cfg(target_os = "macos")]
+fn collect_fionread_ready_range(nfds: u64) -> HashSet<libc::c_int> {
+    let mut ready = HashSet::new();
+    let max_fd = nfds.min(libc::FD_SETSIZE as u64);
+    for fd in 0..max_fd {
+        let fd = fd as libc::c_int;
+        let mut available: libc::c_int = 0;
+        let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available as *mut libc::c_int) };
+        if ret == 0 && available > 0 {
+            ready.insert(fd);
         }
     }
     ready
@@ -5664,6 +5737,17 @@ fn proxy_host_mach_timebase_info<M: GuestMemory + ?Sized>(
     let ret = unsafe { libc::mach_timebase_info(info.as_mut_ptr()) };
     if ret == 0 && write_guest_host_struct(memory, info_ptr, &info).is_err() {
         return Some(host_call_error(libc::EFAULT as u32));
+    }
+    if ret != 0 {
+        if write_guest_u32(memory, info_ptr, 1).is_err()
+            || write_guest_u32(memory, info_ptr + 4, 1).is_err()
+        {
+            return Some(host_call_error(libc::EFAULT as u32));
+        }
+        return Some(HostCallResult {
+            return_value: 0,
+            errno: None,
+        });
     }
     Some(HostCallResult {
         return_value: ret as u64,
