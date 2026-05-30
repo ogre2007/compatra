@@ -601,15 +601,21 @@ static int text_is(const char *text, const char *expected, unsigned long len) {{
 }}
 
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
-    register long x0 asm("x0") = a0;
-    register long x1 asm("x1") = a1;
-    register long x2 asm("x2") = a2;
-    register long x3 asm("x3") = a3;
-    register long x4 asm("x4") = a4;
-    register long x5 asm("x5") = a5;
-    register long x16 asm("x16") = num;
-    asm volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16) : "memory", "cc");
-    return x0;
+    long ret;
+    asm volatile(
+        "mov x0, %[a0]\n"
+        "mov x1, %[a1]\n"
+        "mov x2, %[a2]\n"
+        "mov x3, %[a3]\n"
+        "mov x4, %[a4]\n"
+        "mov x5, %[a5]\n"
+        "mov x16, %[num]\n"
+        "svc #0x80\n"
+        "mov %[ret], x0\n"
+        : [ret] "=r"(ret)
+        : [num] "r"(num), [a0] "r"(a0), [a1] "r"(a1), [a2] "r"(a2), [a3] "r"(a3), [a4] "r"(a4), [a5] "r"(a5)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "memory", "cc");
+    return ret;
 }}
 
 static int pipe_vec_roundtrip(const char *label, pipe_fn pipe_impl, writev_fn writev_impl, readv_fn readv_impl) {{
@@ -734,7 +740,7 @@ int main(void) {{
     }}
     failures += pipe_vec_roundtrip("dlsym", dyn_pipe, dyn_writev, dyn_readv);
 
-    int dyn_rw_fd = dyn_open(DATA_FILE, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    int dyn_rw_fd = dyn_open(DATA_FILE, O_RDWR);
     long dyn_write_count = dyn_rw_fd >= 0 ? (long)dyn_write(dyn_rw_fd, "rw-ok", 5) : -1;
     long dyn_rw_seek = dyn_rw_fd >= 0 ? (long)dyn_lseek(dyn_rw_fd, 0, SEEK_SET) : -1;
     char dyn_rw_buf[8] = {{0}};
@@ -1041,6 +1047,8 @@ typedef ssize_t (*readlink_fn)(const char *, char *, size_t);
 typedef int (*symlink_fn)(const char *, const char *);
 typedef char *(*realpath_fn)(const char *, char *);
 
+extern char *realpath(const char *, char *);
+
 static int text_is(const char *text, const char *expected) {{
     return strcmp(text, expected) == 0;
 }}
@@ -1278,15 +1286,21 @@ typedef long (*sysconf_fn)(int);
 typedef int (*sysctlbyname_fn)(const char *, void *, size_t *, void *, size_t);
 
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
-    register long x0 asm("x0") = a0;
-    register long x1 asm("x1") = a1;
-    register long x2 asm("x2") = a2;
-    register long x3 asm("x3") = a3;
-    register long x4 asm("x4") = a4;
-    register long x5 asm("x5") = a5;
-    register long x16 asm("x16") = num;
-    asm volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16) : "memory", "cc");
-    return x0;
+    long ret;
+    asm volatile(
+        "mov x0, %[a0]\n"
+        "mov x1, %[a1]\n"
+        "mov x2, %[a2]\n"
+        "mov x3, %[a3]\n"
+        "mov x4, %[a4]\n"
+        "mov x5, %[a5]\n"
+        "mov x16, %[num]\n"
+        "svc #0x80\n"
+        "mov %[ret], x0\n"
+        : [ret] "=r"(ret)
+        : [num] "r"(num), [a0] "r"(a0), [a1] "r"(a1), [a2] "r"(a2), [a3] "r"(a3), [a4] "r"(a4), [a5] "r"(a5)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "memory", "cc");
+    return ret;
 }
 
 int main(void) {
@@ -1515,15 +1529,21 @@ typedef int (*getentropy_fn)(void *, size_t);
 extern int getentropy(void *, size_t);
 
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
-    register long x0 asm("x0") = a0;
-    register long x1 asm("x1") = a1;
-    register long x2 asm("x2") = a2;
-    register long x3 asm("x3") = a3;
-    register long x4 asm("x4") = a4;
-    register long x5 asm("x5") = a5;
-    register long x16 asm("x16") = num;
-    asm volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16) : "memory", "cc");
-    return x0;
+    long ret;
+    asm volatile(
+        "mov x0, %[a0]\n"
+        "mov x1, %[a1]\n"
+        "mov x2, %[a2]\n"
+        "mov x3, %[a3]\n"
+        "mov x4, %[a4]\n"
+        "mov x5, %[a5]\n"
+        "mov x16, %[num]\n"
+        "svc #0x80\n"
+        "mov %[ret], x0\n"
+        : [ret] "=r"(ret)
+        : [num] "r"(num), [a0] "r"(a0), [a1] "r"(a1), [a2] "r"(a2), [a3] "r"(a3), [a4] "r"(a4), [a5] "r"(a5)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "memory", "cc");
+    return ret;
 }}
 
 static int streq(const char *a, const char *b) {{

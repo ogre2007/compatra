@@ -373,7 +373,7 @@ impl CompatibilityServices {
             HostImportKind::Puts => proxy_host_puts(memory, args[0]),
             #[cfg(target_os = "macos")]
             HostImportKind::Printf => {
-                let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 16));
+                let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 64));
                 proxy_host_printf(memory, args, stack_args.as_deref())
             }
             #[cfg(target_os = "macos")]
@@ -4837,30 +4837,6 @@ fn write_guest_host_struct<M: GuestMemory + ?Sized, T>(
 }
 
 #[cfg(target_os = "macos")]
-fn read_optional_guest_host_struct<M: GuestMemory + ?Sized, T>(
-    memory: &mut M,
-    addr: u64,
-) -> Result<Option<MaybeUninit<T>>, u32> {
-    if addr == 0 {
-        Ok(None)
-    } else {
-        read_guest_host_struct(memory, addr).map(Some)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn write_optional_guest_host_struct<M: GuestMemory + ?Sized, T>(
-    memory: &mut M,
-    addr: u64,
-    value: &Option<MaybeUninit<T>>,
-) -> Result<(), u32> {
-    if let Some(value) = value {
-        write_guest_host_struct(memory, addr, value)?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 fn proxy_host_select<M: GuestMemory + ?Sized>(
     memory: &mut M,
     nfds: u64,
@@ -4872,60 +4848,194 @@ fn proxy_host_select<M: GuestMemory + ?Sized>(
     if nfds > libc::c_int::MAX as u64 {
         return Some(host_io_error(libc::EINVAL as u32));
     }
-    let mut readfds = match read_optional_guest_host_struct::<_, libc::fd_set>(memory, readfds_ptr)
-    {
+    let readfds = match read_darwin_fd_set(memory, readfds_ptr, nfds) {
         Ok(value) => value,
         Err(errno) => return Some(host_io_error(errno)),
     };
-    let mut writefds =
-        match read_optional_guest_host_struct::<_, libc::fd_set>(memory, writefds_ptr) {
-            Ok(value) => value,
-            Err(errno) => return Some(host_io_error(errno)),
-        };
-    let mut exceptfds =
-        match read_optional_guest_host_struct::<_, libc::fd_set>(memory, exceptfds_ptr) {
-            Ok(value) => value,
-            Err(errno) => return Some(host_io_error(errno)),
-        };
-    let mut timeout = match read_optional_guest_host_struct::<_, libc::timeval>(memory, timeout_ptr)
-    {
+    let writefds = match read_darwin_fd_set(memory, writefds_ptr, nfds) {
+        Ok(value) => value,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let exceptfds = match read_darwin_fd_set(memory, exceptfds_ptr, nfds) {
+        Ok(value) => value,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let timeout_ms = match read_darwin_timeval_timeout_ms(memory, timeout_ptr) {
         Ok(value) => value,
         Err(errno) => return Some(host_io_error(errno)),
     };
 
-    let readfds_host = readfds
-        .as_mut()
-        .map_or(ptr::null_mut(), MaybeUninit::as_mut_ptr);
-    let writefds_host = writefds
-        .as_mut()
-        .map_or(ptr::null_mut(), MaybeUninit::as_mut_ptr);
-    let exceptfds_host = exceptfds
-        .as_mut()
-        .map_or(ptr::null_mut(), MaybeUninit::as_mut_ptr);
-    let timeout_host = timeout
-        .as_mut()
-        .map_or(ptr::null_mut(), MaybeUninit::as_mut_ptr);
-
-    clear_errno();
-    let ret = unsafe {
-        libc::select(
-            nfds as libc::c_int,
-            readfds_host,
-            writefds_host,
-            exceptfds_host,
-            timeout_host,
-        )
-    };
-    if ret >= 0 {
-        if let Err(errno) = write_optional_guest_host_struct(memory, readfds_ptr, &readfds)
-            .and_then(|_| write_optional_guest_host_struct(memory, writefds_ptr, &writefds))
-            .and_then(|_| write_optional_guest_host_struct(memory, exceptfds_ptr, &exceptfds))
-            .and_then(|_| write_optional_guest_host_struct(memory, timeout_ptr, &timeout))
-        {
-            return Some(host_io_error(errno));
+    let mut pollfds = Vec::<libc::pollfd>::new();
+    if let Some(fds) = readfds.as_ref() {
+        for fd in fds {
+            add_poll_event(&mut pollfds, *fd, libc::POLLIN);
         }
     }
-    Some(host_io_result(ret as isize, Vec::new()))
+    if let Some(fds) = writefds.as_ref() {
+        for fd in fds {
+            add_poll_event(&mut pollfds, *fd, libc::POLLOUT);
+        }
+    }
+    if let Some(fds) = exceptfds.as_ref() {
+        for fd in fds {
+            add_poll_event(&mut pollfds, *fd, libc::POLLPRI);
+        }
+    }
+
+    clear_errno();
+    let ret = if pollfds.is_empty() {
+        0
+    } else {
+        unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        }
+    };
+    if ret < 0 {
+        return Some(host_io_result(ret as isize, Vec::new()));
+    }
+
+    let mut ready_read = HashSet::new();
+    let mut ready_write = HashSet::new();
+    let mut ready_except = HashSet::new();
+    for pollfd in &pollfds {
+        let fd = pollfd.fd;
+        let revents = pollfd.revents;
+        if readfds.as_ref().is_some_and(|fds| fds.contains(&fd))
+            && (revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
+        {
+            ready_read.insert(fd);
+        }
+        if writefds.as_ref().is_some_and(|fds| fds.contains(&fd))
+            && (revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR)) != 0
+        {
+            ready_write.insert(fd);
+        }
+        if exceptfds.as_ref().is_some_and(|fds| fds.contains(&fd))
+            && (revents & (libc::POLLPRI | libc::POLLERR)) != 0
+        {
+            ready_except.insert(fd);
+        }
+    }
+
+    if let Err(errno) = write_darwin_fd_set(memory, readfds_ptr, readfds.as_ref(), &ready_read)
+        .and_then(|_| write_darwin_fd_set(memory, writefds_ptr, writefds.as_ref(), &ready_write))
+        .and_then(|_| write_darwin_fd_set(memory, exceptfds_ptr, exceptfds.as_ref(), &ready_except))
+    {
+        return Some(host_io_error(errno));
+    }
+
+    let ready_count = ready_read
+        .len()
+        .saturating_add(ready_write.len())
+        .saturating_add(ready_except.len());
+    Some(host_io_result(ready_count as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn add_poll_event(pollfds: &mut Vec<libc::pollfd>, fd: libc::c_int, event: libc::c_short) {
+    if let Some(existing) = pollfds.iter_mut().find(|pollfd| pollfd.fd == fd) {
+        existing.events |= event;
+    } else {
+        pollfds.push(libc::pollfd {
+            fd,
+            events: event,
+            revents: 0,
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_darwin_fd_set<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    nfds: u64,
+) -> Result<Option<HashSet<libc::c_int>>, u32> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    const DARWIN_FD_SET_BYTES: usize = 128;
+    const DARWIN_NFDBITS: usize = 32;
+    let bytes = memory
+        .read_memory(addr, DARWIN_FD_SET_BYTES)
+        .map_err(|_| libc::EFAULT as u32)?;
+    let mut fds = HashSet::new();
+    for fd in 0..(nfds as usize).min(DARWIN_FD_SET_BYTES * 8) {
+        let bit = fd % DARWIN_NFDBITS;
+        let word_start = (fd / DARWIN_NFDBITS) * 4;
+        if word_start + 4 > bytes.len() {
+            break;
+        }
+        let word = u32::from_le_bytes([
+            bytes[word_start],
+            bytes[word_start + 1],
+            bytes[word_start + 2],
+            bytes[word_start + 3],
+        ]);
+        if (word & (1u32 << bit)) != 0 {
+            fds.insert(fd as libc::c_int);
+        }
+    }
+    Ok(Some(fds))
+}
+
+#[cfg(target_os = "macos")]
+fn write_darwin_fd_set<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    original: Option<&HashSet<libc::c_int>>,
+    ready: &HashSet<libc::c_int>,
+) -> Result<(), u32> {
+    if addr == 0 || original.is_none() {
+        return Ok(());
+    }
+    const DARWIN_FD_SET_BYTES: usize = 128;
+    const DARWIN_NFDBITS: usize = 32;
+    let mut bytes = vec![0u8; DARWIN_FD_SET_BYTES];
+    for fd in ready {
+        if *fd < 0 {
+            continue;
+        }
+        let fd = *fd as usize;
+        let word_start = (fd / DARWIN_NFDBITS) * 4;
+        if word_start + 4 > bytes.len() {
+            continue;
+        }
+        let bit = fd % DARWIN_NFDBITS;
+        let mut word = u32::from_le_bytes([
+            bytes[word_start],
+            bytes[word_start + 1],
+            bytes[word_start + 2],
+            bytes[word_start + 3],
+        ]);
+        word |= 1u32 << bit;
+        bytes[word_start..word_start + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    memory
+        .write_memory(addr, &bytes)
+        .map_err(|_| libc::EFAULT as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn read_darwin_timeval_timeout_ms<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+) -> Result<libc::c_int, u32> {
+    if addr == 0 {
+        return Ok(-1);
+    }
+    let bytes = memory
+        .read_memory(addr, 16)
+        .map_err(|_| libc::EFAULT as u32)?;
+    let sec = i64::from_le_bytes(bytes[0..8].try_into().map_err(|_| libc::EFAULT as u32)?);
+    let usec = i32::from_le_bytes(bytes[8..12].try_into().map_err(|_| libc::EFAULT as u32)?);
+    let millis = sec
+        .saturating_mul(1000)
+        .saturating_add((usec.max(0) as i64 + 999) / 1000);
+    Ok(millis.clamp(0, libc::c_int::MAX as i64) as libc::c_int)
 }
 
 #[cfg(target_os = "macos")]
