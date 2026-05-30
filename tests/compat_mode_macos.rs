@@ -96,6 +96,284 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_memory_string_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_memory_string_compat.c");
+    let binary = out_dir.join("arm64_memory_string_compat");
+    fs::write(
+        &source,
+        r#"#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef void *(*malloc_fn)(size_t);
+typedef void *(*calloc_fn)(size_t, size_t);
+typedef void *(*realloc_fn)(void *, size_t);
+typedef void (*free_fn)(void *);
+typedef int (*posix_memalign_fn)(void **, size_t, size_t);
+typedef void *(*memcpy_fn)(void *, const void *, size_t);
+typedef void *(*memmove_fn)(void *, const void *, size_t);
+typedef void *(*memset_fn)(void *, int, size_t);
+typedef int (*memcmp_fn)(const void *, const void *, size_t);
+typedef size_t (*strlen_fn)(const char *);
+typedef int (*strcmp_fn)(const char *, const char *);
+typedef int (*strncmp_fn)(const char *, const char *, size_t);
+typedef char *(*strcpy_fn)(char *, const char *);
+typedef char *(*strncpy_fn)(char *, const char *, size_t);
+typedef char *(*strcat_fn)(char *, const char *);
+typedef char *(*strchr_fn)(const char *, int);
+typedef char *(*strrchr_fn)(const char *, int);
+typedef char *(*strdup_fn)(const char *);
+
+static int all_zero(const unsigned char *buf, unsigned long len) {
+    for (unsigned long i = 0; i < len; i++) {
+        if (buf[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int text_is(const char *text, const char *expected) {
+    while (*text && *expected && *text == *expected) {
+        text++;
+        expected++;
+    }
+    return *text == 0 && *expected == 0;
+}
+
+static int exercise_memstr(
+    const char *label,
+    malloc_fn malloc_impl,
+    calloc_fn calloc_impl,
+    realloc_fn realloc_impl,
+    free_fn free_impl,
+    posix_memalign_fn posix_memalign_impl,
+    memcpy_fn memcpy_impl,
+    memmove_fn memmove_impl,
+    memset_fn memset_impl,
+    memcmp_fn memcmp_impl,
+    strlen_fn strlen_impl,
+    strcmp_fn strcmp_impl,
+    strncmp_fn strncmp_impl,
+    strcpy_fn strcpy_impl,
+    strncpy_fn strncpy_impl,
+    strcat_fn strcat_impl,
+    strchr_fn strchr_impl,
+    strrchr_fn strrchr_impl,
+    strdup_fn strdup_impl
+) {
+    char dst[64];
+    memset_impl(dst, '?', sizeof(dst));
+    memcpy_impl(dst, "alpha", 6);
+
+    char overlap[16];
+    strcpy_impl(overlap, "abcdef");
+    memmove_impl(overlap + 2, overlap, 4);
+    overlap[6] = 0;
+
+    char copy[80];
+    strcpy_impl(copy, "left");
+    strcat_impl(copy, "-right");
+    strncpy_impl(copy + 11, "pad", 5);
+
+    char *hit = strchr_impl(copy, '-');
+    char *last = strrchr_impl(copy, 't');
+    char *dup = strdup_impl(copy);
+
+    char *heap = (char *)malloc_impl(16);
+    if (heap) {
+        strcpy_impl(heap, "heap");
+        heap = (char *)realloc_impl(heap, 32);
+        if (heap) {
+            strcat_impl(heap, "-ok");
+        }
+    }
+    unsigned char *zero = (unsigned char *)calloc_impl(4, 4);
+    int zero_ok = zero ? all_zero(zero, 16) : 0;
+
+    void *aligned = 0;
+    int pa = posix_memalign_impl(&aligned, 32, 24);
+    if (aligned) {
+        memset_impl(aligned, 'A', 24);
+    }
+
+    int memcmp_eq = memcmp_impl(dst, "alpha", 5);
+    unsigned long len = (unsigned long)strlen_impl(dst);
+    int cmp_eq = strcmp_impl(dst, "alpha");
+    int cmp_lt = strcmp_impl("alpha", "beta");
+    int ncmp = strncmp_impl(dst, "alphabet", 5);
+    long hit_off = hit ? (long)(hit - copy) : -1;
+    long last_off = last ? (long)(last - copy) : -1;
+    int ok = text_is(dst, "alpha")
+        && text_is(overlap, "ababcd")
+        && text_is(copy, "left-right")
+        && dup
+        && text_is(dup, "left-right")
+        && heap
+        && text_is(heap, "heap-ok")
+        && zero_ok
+        && pa == 0
+        && aligned
+        && (((uintptr_t)aligned) % 32) == 0
+        && memcmp_eq == 0
+        && len == 5
+        && cmp_eq == 0
+        && cmp_lt < 0
+        && ncmp == 0
+        && hit_off == 4
+        && last_off == 8;
+
+    printf(
+        "compat memstr %s dst=%s overlap=%s copy=%s dup=%s heap=%s zero_ok=%d pa=%d aligned_mod=%lu memcmp=%d len=%lu cmp=%d cmp_lt=%d ncmp=%d hit=%ld last=%ld ok=%d\n",
+        label,
+        dst,
+        overlap,
+        copy,
+        dup ? dup : "<null>",
+        heap ? heap : "<null>",
+        zero_ok,
+        pa,
+        aligned ? (unsigned long)(((uintptr_t)aligned) % 32) : 999UL,
+        memcmp_eq,
+        len,
+        cmp_eq,
+        cmp_lt,
+        ncmp,
+        hit_off,
+        last_off,
+        ok
+    );
+
+    if (dup) {
+        free_impl(dup);
+    }
+    if (heap) {
+        free_impl(heap);
+    }
+    if (zero) {
+        free_impl(zero);
+    }
+    if (aligned) {
+        free_impl(aligned);
+    }
+    return ok ? 0 : 1;
+}
+
+int main(void) {
+    int failures = 0;
+    failures += exercise_memstr(
+        "static",
+        malloc,
+        calloc,
+        realloc,
+        free,
+        posix_memalign,
+        memcpy,
+        memmove,
+        memset,
+        memcmp,
+        strlen,
+        strcmp,
+        strncmp,
+        strcpy,
+        strncpy,
+        strcat,
+        strchr,
+        strrchr,
+        strdup
+    );
+
+    void *self = dlopen(NULL, RTLD_NOW);
+    malloc_fn dyn_malloc = (malloc_fn)dlsym(self, "malloc");
+    calloc_fn dyn_calloc = (calloc_fn)dlsym(self, "calloc");
+    realloc_fn dyn_realloc = (realloc_fn)dlsym(self, "realloc");
+    free_fn dyn_free = (free_fn)dlsym(self, "free");
+    posix_memalign_fn dyn_posix_memalign = (posix_memalign_fn)dlsym(self, "posix_memalign");
+    memcpy_fn dyn_memcpy = (memcpy_fn)dlsym(self, "memcpy");
+    memmove_fn dyn_memmove = (memmove_fn)dlsym(self, "memmove");
+    memset_fn dyn_memset = (memset_fn)dlsym(self, "memset");
+    memcmp_fn dyn_memcmp = (memcmp_fn)dlsym(self, "memcmp");
+    strlen_fn dyn_strlen = (strlen_fn)dlsym(self, "strlen");
+    strcmp_fn dyn_strcmp = (strcmp_fn)dlsym(self, "strcmp");
+    strncmp_fn dyn_strncmp = (strncmp_fn)dlsym(self, "strncmp");
+    strcpy_fn dyn_strcpy = (strcpy_fn)dlsym(self, "strcpy");
+    strncpy_fn dyn_strncpy = (strncpy_fn)dlsym(self, "strncpy");
+    strcat_fn dyn_strcat = (strcat_fn)dlsym(self, "strcat");
+    strchr_fn dyn_strchr = (strchr_fn)dlsym(self, "strchr");
+    strrchr_fn dyn_strrchr = (strrchr_fn)dlsym(self, "strrchr");
+    strdup_fn dyn_strdup = (strdup_fn)dlsym(self, "strdup");
+    printf(
+        "compat memstr dlsym ptrs malloc=%p free=%p memcpy=%p strcmp=%p strcpy=%p strchr=%p strdup=%p posix_memalign=%p\n",
+        (void *)dyn_malloc,
+        (void *)dyn_free,
+        (void *)dyn_memcpy,
+        (void *)dyn_strcmp,
+        (void *)dyn_strcpy,
+        (void *)dyn_strchr,
+        (void *)dyn_strdup,
+        (void *)dyn_posix_memalign
+    );
+    if (!dyn_malloc || !dyn_calloc || !dyn_realloc || !dyn_free || !dyn_posix_memalign || !dyn_memcpy || !dyn_memmove || !dyn_memset || !dyn_memcmp || !dyn_strlen || !dyn_strcmp || !dyn_strncmp || !dyn_strcpy || !dyn_strncpy || !dyn_strcat || !dyn_strchr || !dyn_strrchr || !dyn_strdup) {
+        return 2;
+    }
+    failures += exercise_memstr(
+        "dlsym",
+        dyn_malloc,
+        dyn_calloc,
+        dyn_realloc,
+        dyn_free,
+        dyn_posix_memalign,
+        dyn_memcpy,
+        dyn_memmove,
+        dyn_memset,
+        dyn_memcmp,
+        dyn_strlen,
+        dyn_strcmp,
+        dyn_strncmp,
+        dyn_strcpy,
+        dyn_strncpy,
+        dyn_strcat,
+        dyn_strchr,
+        dyn_strrchr,
+        dyn_strdup
+    );
+    dlclose(self);
+    return failures == 0 ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 memory/string fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 memory/string fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 memory/string fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_network_fixture() -> PathBuf {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -293,6 +571,10 @@ fn compile_arm64_fd_fixture() -> (PathBuf, PathBuf) {
 #define SYS_FCNTL_NOCANCEL 0x2000196
 
 typedef int (*pipe_fn)(int *);
+typedef int (*open_fn)(const char *, int, ...);
+typedef ssize_t (*read_fn)(int, void *, size_t);
+typedef ssize_t (*write_fn)(int, const void *, size_t);
+typedef int (*close_fn)(int);
 typedef ssize_t (*readv_fn)(int, const struct iovec *, int);
 typedef ssize_t (*writev_fn)(int, const struct iovec *, int);
 typedef ssize_t (*pread_fn)(int, void *, size_t, off_t);
@@ -433,6 +715,10 @@ int main(void) {{
     }}
 
     void *self = dlopen(NULL, RTLD_NOW);
+    open_fn dyn_open = (open_fn)dlsym(self, "open");
+    read_fn dyn_read = (read_fn)dlsym(self, "read");
+    write_fn dyn_write = (write_fn)dlsym(self, "write");
+    close_fn dyn_close = (close_fn)dlsym(self, "close");
     pipe_fn dyn_pipe = (pipe_fn)dlsym(self, "pipe");
     readv_fn dyn_readv = (readv_fn)dlsym(self, "readv");
     writev_fn dyn_writev = (writev_fn)dlsym(self, "writev");
@@ -442,11 +728,22 @@ int main(void) {{
     select_fn dyn_select = (select_fn)dlsym(self, "select");
     dup_fn dyn_dup = (dup_fn)dlsym(self, "dup");
     dup2_fn dyn_dup2 = (dup2_fn)dlsym(self, "dup2");
-    printf("compat fd dlsym ptrs %p %p %p %p %p %p %p %p %p\n", (void *)dyn_pipe, (void *)dyn_readv, (void *)dyn_writev, (void *)dyn_pread, (void *)dyn_pwrite, (void *)dyn_lseek, (void *)dyn_select, (void *)dyn_dup, (void *)dyn_dup2);
-    if (!dyn_pipe || !dyn_readv || !dyn_writev || !dyn_pread || !dyn_pwrite || !dyn_lseek || !dyn_select || !dyn_dup || !dyn_dup2) {{
+    printf("compat fd dlsym ptrs open=%p read=%p write=%p close=%p pipe=%p readv=%p writev=%p pread=%p pwrite=%p lseek=%p select=%p dup=%p dup2=%p\n", (void *)dyn_open, (void *)dyn_read, (void *)dyn_write, (void *)dyn_close, (void *)dyn_pipe, (void *)dyn_readv, (void *)dyn_writev, (void *)dyn_pread, (void *)dyn_pwrite, (void *)dyn_lseek, (void *)dyn_select, (void *)dyn_dup, (void *)dyn_dup2);
+    if (!dyn_open || !dyn_read || !dyn_write || !dyn_close || !dyn_pipe || !dyn_readv || !dyn_writev || !dyn_pread || !dyn_pwrite || !dyn_lseek || !dyn_select || !dyn_dup || !dyn_dup2) {{
         return 50;
     }}
     failures += pipe_vec_roundtrip("dlsym", dyn_pipe, dyn_writev, dyn_readv);
+
+    int dyn_rw_fd = dyn_open(DATA_FILE, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    long dyn_write_count = dyn_rw_fd >= 0 ? (long)dyn_write(dyn_rw_fd, "rw-ok", 5) : -1;
+    long dyn_rw_seek = dyn_rw_fd >= 0 ? (long)dyn_lseek(dyn_rw_fd, 0, SEEK_SET) : -1;
+    char dyn_rw_buf[8] = {{0}};
+    long dyn_read_count = dyn_rw_fd >= 0 ? (long)dyn_read(dyn_rw_fd, dyn_rw_buf, 5) : -1;
+    int dyn_close_ret = dyn_rw_fd >= 0 ? dyn_close(dyn_rw_fd) : -1;
+    printf("compat fd dlsym rw open=%d write=%ld seek=%ld read=%ld text=%s close=%d errno=%d\n", dyn_rw_fd, dyn_write_count, dyn_rw_seek, dyn_read_count, dyn_rw_buf, dyn_close_ret, errno);
+    if (dyn_rw_fd < 0 || dyn_write_count != 5 || dyn_rw_seek != 0 || dyn_read_count != 5 || !text_is(dyn_rw_buf, "rw-ok", 5) || dyn_close_ret != 0) {{
+        failures += 55;
+    }}
 
     long dyn_pwrite_count = (long)dyn_pwrite(file_fd, "dyn-ok", 6, 16);
     long dyn_seek_pos = (long)dyn_lseek(file_fd, 16, SEEK_SET);
@@ -1634,6 +1931,90 @@ fn compat_mode_runs_fresh_arm64_write_program() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn compat_mode_proxies_memory_and_string_imports() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode memory/string test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_memory_string_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(memory/string): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(memory/string): status={status}");
+    eprintln!("compat proof(memory/string): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(memory/string): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("compat memstr static dst=alpha")
+            && stdout.contains("overlap=ababcd")
+            && stdout.contains("heap=heap-ok")
+            && stdout.contains("zero_ok=1")
+            && stdout.contains("aligned_mod=0")
+            && stdout.contains("ok=1"),
+        "memory/string fixture did not complete static import roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat memstr dlsym ptrs malloc=0x")
+            && stdout.contains(" memcpy=0x")
+            && stdout.contains(" strcmp=0x")
+            && stdout.contains(" strdup=0x")
+            && stdout.contains(" posix_memalign=0x"),
+        "memory/string fixture did not receive dlsym memory/string trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat memstr dlsym dst=alpha")
+            && stdout.contains("overlap=ababcd")
+            && stdout.contains("heap=heap-ok")
+            && stdout.contains("zero_ok=1")
+            && stdout.contains("aligned_mod=0")
+            && stdout.contains("ok=1"),
+        "memory/string fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn compat_mode_proxies_network_resolver_and_socket_imports() {
     if std::env::consts::ARCH != "x86_64" {
         eprintln!(
@@ -1802,12 +2183,21 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         "fd fixture did not complete raw *_nocancel syscall I/O probe; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat fd dlsym ptrs 0x"),
+        stdout.contains("compat fd dlsym ptrs open=0x")
+            && stdout.contains(" read=0x")
+            && stdout.contains(" write=0x")
+            && stdout.contains(" close=0x")
+            && stdout.contains(" pipe=0x"),
         "fd fixture did not receive dlsym trampolines; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat fd dlsym writev=6 readv=6 text=vec-ok"),
         "fd fixture did not complete dynamic pipe/writev/readv roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat fd dlsym rw open=")
+            && stdout.contains("write=5 seek=0 read=5 text=rw-ok close=0"),
+        "fd fixture did not complete dynamic open/write/read/close roundtrip; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat fd dlsym positioned pwrite=6 lseek=16 pread=6 text=dyn-ok"),

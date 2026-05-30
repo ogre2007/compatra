@@ -116,4 +116,13 @@ impl machina_compat::GuestMemory for Arm64CompatGuestMemory<'_> {
         }
         Ok(())
     }
+
+    fn allocation_size(&mut self, addr: u64) -> Option<usize> {
+        self.shared_state
+            .malloc_allocations
+            .lock()
+            .ok()
+            .and_then(|allocations| allocations.get(&addr).copied())
+            .map(|size| size as usize)
+    }
 }
