@@ -31,10 +31,8 @@ jobs:
         test "$(uname -s)" = "Darwin"
         test "$(uname -m)" = "x86_64"
         sw_vers
-    - name: Build release machina
-      run: cargo build --bin machina --release --verbose
-    - name: Run compat-mode smoke test with proof output
-      run: cargo test --test compat_mode_macos --verbose -- --nocapture
+    - name: Build release machina and run compat-mode smoke test with proof output
+      run: cargo test --release --test compat_mode_macos --verbose -- --nocapture
     - name: Package Intel macOS compatibility utility
       run: |
         mkdir -p dist

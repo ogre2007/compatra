@@ -1,0 +1,13 @@
+[package]
+name = "machina-analysis"
+version = "0.1.0"
+edition = "2021"
+description = "Analysis-mode services for Machina"
+license = "GPL-2.0"
+
+[dependencies]
+machina-mode = { path = "../machina-mode" }
+
+[lib]
+name = "machina_analysis"
+path = "src/lib.rs"

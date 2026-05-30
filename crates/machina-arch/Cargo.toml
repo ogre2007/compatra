@@ -1,0 +1,10 @@
+[package]
+name = "machina-arch"
+version = "0.1.0"
+edition = "2021"
+description = "Architecture-neutral traits and identifiers for Machina"
+license = "GPL-2.0"
+
+[lib]
+name = "machina_arch"
+path = "src/lib.rs"

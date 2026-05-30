@@ -1,5 +1,9 @@
 use crate::macos::{Emulator, MacOsError};
 use crate::UnicornEmulator;
+use machina_arch_arm64::stubs::{
+    DONE_STUB_OFFSET, IMPORT_STUB_STRIDE, RETURN_STUB_BYTES, STUB_REGION_BASE, STUB_REGION_SIZE,
+    THREAD_EXIT_STUB_OFFSET,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StubIsa {
@@ -17,19 +21,19 @@ pub struct StubRegion {
 impl StubIsa {
     fn base(self) -> u64 {
         match self {
-            Self::Arm64 => 0x2_0000_0000,
+            Self::Arm64 => STUB_REGION_BASE,
         }
     }
 
     fn size(self) -> u64 {
         match self {
-            Self::Arm64 => 0x100_0000,
+            Self::Arm64 => STUB_REGION_SIZE,
         }
     }
 
     fn done_bytes(self) -> &'static [u8] {
         match self {
-            Self::Arm64 => &[0xC0, 0x03, 0x5F, 0xD6], // ret
+            Self::Arm64 => RETURN_STUB_BYTES,
         }
     }
 }
@@ -40,7 +44,7 @@ impl StubRegion {
     }
 
     pub fn bucket(&self, address: u64) -> u64 {
-        self.base + ((address.saturating_sub(self.base)) / 0x100) * 0x100
+        self.base + ((address.saturating_sub(self.base)) / IMPORT_STUB_STRIDE) * IMPORT_STUB_STRIDE
     }
 }
 
@@ -53,11 +57,11 @@ pub fn install_stub_region(
     let size = isa.size();
     emulator.map_code_memory(base, size)?;
 
-    let done_addr = base + 0x800;
+    let done_addr = base + DONE_STUB_OFFSET;
     emulator.write_memory(done_addr, isa.done_bytes())?;
 
     let thread_exit_stub = if needs_thread_exit_stub {
-        let addr = base + 0x900;
+        let addr = base + THREAD_EXIT_STUB_OFFSET;
         emulator.write_memory(addr, isa.done_bytes())?;
         Some(addr)
     } else {

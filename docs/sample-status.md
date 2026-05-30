@@ -8,7 +8,7 @@ emulator behavior.
 - Path: [fixtures/macos/bin/arm64_hello](D:/dev/quiling/qiling/fixtures/macos/bin/arm64_hello)
 - Role: smoke-test fixture
 - Expected status: should execute successfully
-- Current note: used as the primary quick validation sample for `cargo build --bin machina` and basic runtime checks; on Darwin hosts, compat mode proxies the no-dyld arm64 `_puts` import through host `libc::puts`, so the macOS compat integration test proves observable guest behavior (`Hello World`) rather than only a clean process exit.
+- Current note: used as the primary quick validation sample for `cargo build --bin machina` and basic runtime checks; on Darwin hosts, compat mode proxies the no-dyld arm64 `_puts`, `_printf`, and `_putchar` imports through host libc, proxies `_open`/`_read`/`_write`/`_close` through host libc fd calls, and handles `_dlopen`/`_dlsym` by returning synthetic guest arm64 trampoline stubs instead of raw host pointers. The Intel macOS compat integration test now also compiles a fresh arm64 C program that calls `printf(...)`, `dlsym("printf")` followed by the returned guest trampoline, and `write(1, ...)`, so CI proves observable guest behavior from both the checked-in fixture (`Hello World`) and a newly built binary.
 
 ## `2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho`
 

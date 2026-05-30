@@ -1,10 +1,12 @@
-pub use crate::macos::arm64_runner_support::{Arm64ImportTracker, Arm64SharedState, *};
+pub use crate::macos::arm64_import_stubs::Arm64ImportTracker;
+pub use crate::macos::arm64_runner_support::*;
+pub use crate::macos::arm64_state::Arm64SharedState;
 
 pub type ImportTracker = Arm64ImportTracker;
 pub type SharedState = Arm64SharedState;
 
 pub fn initialize_import_tracker() -> ImportTracker {
-    crate::macos::arm64_runner_support::initialize_arm64_import_tracker()
+    crate::macos::arm64_import_stubs::initialize_arm64_import_tracker()
 }
 
 pub fn initialize_shared_state(
@@ -23,7 +25,7 @@ pub fn initialize_shared_state_with_mode(
     process_bootstrap: crate::macos::GuestProcessBootstrap,
     runtime_mode: crate::macos::RuntimeMode,
 ) -> SharedState {
-    crate::macos::arm64_runner_support::initialize_arm64_shared_state_with_mode(
+    crate::macos::arm64_state::initialize_arm64_shared_state_with_mode(
         guest_fs_base,
         process_bootstrap,
         runtime_mode,
@@ -41,11 +43,12 @@ pub fn install_return_stubs(
 ) -> Result<
     (
         std::collections::HashMap<String, u64>,
-        std::sync::Arc<std::collections::HashMap<u64, String>>,
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>>,
+        std::sync::Arc<std::sync::Mutex<u64>>,
     ),
     Box<dyn std::error::Error>,
 > {
-    crate::macos::arm64_runner_support::install_arm64_return_stubs(
+    crate::macos::arm64_import_stubs::install_arm64_return_stubs(
         emulator,
         stub_region,
         undefs,

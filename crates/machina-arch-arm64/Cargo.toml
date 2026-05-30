@@ -1,0 +1,13 @@
+[package]
+name = "machina-arch-arm64"
+version = "0.1.0"
+edition = "2021"
+description = "arm64 architecture primitives for Machina"
+license = "GPL-2.0"
+
+[dependencies]
+machina-arch = { path = "../machina-arch" }
+
+[lib]
+name = "machina_arch_arm64"
+path = "src/lib.rs"

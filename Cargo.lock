@@ -151,10 +151,44 @@ dependencies = [
  "byteorder",
  "libc",
  "log",
+ "machina-analysis",
+ "machina-arch-arm64",
+ "machina-compat",
+ "machina-mode",
  "thiserror",
  "unicorn-engine",
  "unicorn-engine-sys",
 ]
+
+[[package]]
+name = "machina-analysis"
+version = "0.1.0"
+dependencies = [
+ "machina-mode",
+]
+
+[[package]]
+name = "machina-arch"
+version = "0.1.0"
+
+[[package]]
+name = "machina-arch-arm64"
+version = "0.1.0"
+dependencies = [
+ "machina-arch",
+]
+
+[[package]]
+name = "machina-compat"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "machina-mode",
+]
+
+[[package]]
+name = "machina-mode"
+version = "0.1.0"
 
 [[package]]
 name = "memchr"

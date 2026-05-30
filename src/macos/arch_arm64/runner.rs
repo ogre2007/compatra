@@ -2,6 +2,7 @@
 
 use crate::macos::apple_imports::install_apple_imports;
 use crate::macos::arm64_cpp_imports::install_arm64_cpp_imports;
+use crate::macos::arm64_dynamic_imports::install_arm64_dynamic_imports;
 use crate::macos::binary_bootstrap::{map_binary_segments, setup_bootstrap_state};
 use crate::macos::binary_setup::{
     find_runtime_symbols, install_arm64_indirect_branch_hooks, install_arm64_lse_atomic_hooks,
@@ -441,7 +442,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
     }
 
     let import_tracker = initialize_import_tracker();
-    let (mut stub_map, _stub_name_map) = install_return_stubs(
+    let (mut stub_map, stub_name_map, next_dynamic_stub_addr) = install_return_stubs(
         &mut emulator,
         stub_region,
         &undefs,
@@ -753,6 +754,18 @@ pub fn emulate_macos_arm64_binary_with_mode(
     install_apple_imports(
         &mut emulator,
         &stub_map,
+        &trace_bus,
+        &shared_state,
+        &import_tracker,
+        &process_name,
+    )?;
+
+    install_arm64_dynamic_imports(
+        &mut emulator,
+        &stub_map,
+        stub_region,
+        stub_name_map.clone(),
+        next_dynamic_stub_addr.clone(),
         &trace_bus,
         &shared_state,
         &import_tracker,

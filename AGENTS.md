@@ -7,6 +7,20 @@ repo. The intent is to keep direction stable across short, automated sessions.
 
 - Project name: `Machina` (Cargo package `machina`, lib `machina`, bin `machina`).
 - Language: Rust, edition 2021.
+- Workspace architecture crates:
+  - `crates/machina-arch` — architecture-neutral identifiers and traits.
+  - `crates/machina-arch-arm64` — pure arm64 ABI, stub-layout,
+    instruction-decoder, and pointer-sanitizer primitives with no dependency
+    on the main `machina` crate.
+- Workspace runtime-mode crates:
+  - `crates/machina-mode` — `RuntimeMode` parsing/defaults and mode
+    predicates.
+  - `crates/machina-analysis` — analysis-only services: capture artifact
+    writing, payload summaries, synthetic analyst fixtures such as log-stream
+    output, and synthetic guest artifact/bait data.
+  - `crates/machina-compat` — compatibility-only host proxy services behind a
+    guest-memory trait; it must not depend on analysis services or the main
+    `machina` crate.
 - Scope: macOS `arm64` Mach-O userland emulation for malware analysis.
 - CPU backend: published `unicorn-engine` / `unicorn-engine-sys` crates (no
   vendored source, no submodule).
@@ -34,8 +48,10 @@ Group ownership:
   tracing, plugin and runtime façades, batch
   emulation driver (`emulation.rs`), JSONL trace pipeline (`trace.rs`,
   `plugin_events.rs`, `runner_plugins.rs`).
-- `src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics, LSE
-  atomic / indirect-branch hooks, and arm64 `*_imports.rs` thunk groups.
+- `src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics,
+  shared arm64 runtime state (`state.rs`), import-stub plumbing
+  (`import_stubs.rs`), dynamic import trampolines (`dynamic_imports.rs`),
+  LSE atomic / indirect-branch hooks, and arm64 `*_imports.rs` thunk groups.
 - `src/macos/platform_apple` — CoreFoundation, Security, XPC, libobjc and
   other Apple-facing synthetic runtime services.
 - `src/macos/guest_model` — guest filesystem (`files.rs`), guest memory
@@ -45,6 +61,19 @@ Group ownership:
 
 Architecture-neutral logic should not live in `arch_arm64`. Prefer reusable
 services or plugins over one-off hook-local hacks.
+
+Pure architecture facts should not live in the main `machina` crate. Put
+arm64 instruction masks/decoders, ABI constants, register naming/layout, and
+stub-layout constants in `crates/machina-arch-arm64`. Keep emulator lifecycle,
+Unicorn hooks, trace events, guest filesystem, and Apple/Darwin service
+modeling in the main crate until their runtime dependencies are split cleanly.
+
+Analysis and compatibility behavior should not live in the same implementation
+module. `src/macos/core/analysis.rs`, `compat.rs`, `capture.rs`, `mode.rs`, and
+`src/macos/guest_model/analysis_artifacts.rs` are facades/adapters only; real
+behavior belongs in `crates/machina-analysis`, `crates/machina-compat`, or
+`crates/machina-mode`. Compatibility code must not emit detections, write
+captures, synthesize analyst bait data, or depend on the analysis crate.
 
 ## Logging rules
 

@@ -6,6 +6,14 @@ use crate::macos::{
     patch_section64_u64_slots, process_event, runtime_process_metadata, trim_name, SharedTraceBus,
 };
 use crate::{Emulator, MachoBinary, UnicornEmulator};
+use machina_arch_arm64::abi::{
+    DEFAULT_IMAGE_BASE, MACHO_MAIN_ABSOLUTE_MAX, MACHO_MAIN_ABSOLUTE_MIN,
+};
+use machina_arch_arm64::decode::{
+    decode_indirect_branch, decode_ldr_uimm64, is_ldapr, is_lse_atomic_op, is_lse_cas,
+    is_lse_ldadd, is_lse_swp,
+};
+use machina_arch_arm64::pointer::{sanitize_indirect_target, sanitize_signed_code_pointer};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Arm64RuntimeSymbols {
@@ -135,7 +143,7 @@ pub fn patch_arm64_symbol_pointers(
         .filter(|seg| seg.segname_str() != "__PAGEZERO" && seg.vmaddr != 0)
         .map(|seg| seg.vmaddr)
         .min()
-        .unwrap_or(0x1000_00000);
+        .unwrap_or(DEFAULT_IMAGE_BASE);
     let mapped_ranges = binary
         .segments
         .iter()
@@ -193,7 +201,7 @@ pub fn patch_arm64_symbol_pointers(
                 }
 
                 if let Some(target) =
-                    sanitize_arm64_signed_code_pointer(raw_value, image_base, &mapped_ranges)
+                    sanitize_signed_code_pointer(raw_value, image_base, &mapped_ranges)
                 {
                     let _ = emulator.write_memory(slot_addr, &target.to_le_bytes());
                     signed_code_ptrs_patched += 1;
@@ -246,11 +254,11 @@ pub fn install_arm64_lse_atomic_hooks(
     let mut installed = 0u64;
     for (index, chunk) in bytes.chunks_exact(4).enumerate() {
         let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        if !is_arm64_lse_cas(word)
-            && !is_arm64_lse_ldadd(word)
-            && !is_arm64_lse_atomic_op(word)
-            && !is_arm64_lse_swp(word)
-            && !is_arm64_ldapr(word)
+        if !is_lse_cas(word)
+            && !is_lse_ldadd(word)
+            && !is_lse_atomic_op(word)
+            && !is_lse_swp(word)
+            && !is_ldapr(word)
         {
             continue;
         }
@@ -268,15 +276,15 @@ pub fn install_arm64_lse_atomic_hooks(
                     return;
                 };
                 let instr = u32::from_le_bytes(raw4);
-                let event = if is_arm64_lse_cas(instr) {
+                let event = if is_lse_cas(instr) {
                     emulate_arm64_lse_cas(emu, instr)
-                } else if is_arm64_lse_swp(instr) {
+                } else if is_lse_swp(instr) {
                     emulate_arm64_lse_swp(emu, instr)
-                } else if is_arm64_lse_ldadd(instr) {
+                } else if is_lse_ldadd(instr) {
                     emulate_arm64_lse_ldadd(emu, instr)
-                } else if is_arm64_lse_atomic_op(instr) {
+                } else if is_lse_atomic_op(instr) {
                     emulate_arm64_lse_atomic_op(emu, instr)
-                } else if is_arm64_ldapr(instr) {
+                } else if is_ldapr(instr) {
                     emulate_arm64_ldapr(emu, instr)
                 } else {
                     None
@@ -331,7 +339,7 @@ pub fn install_arm64_indirect_branch_hooks(
         .filter(|seg| seg.segname_str() != "__PAGEZERO" && seg.vmaddr != 0)
         .map(|seg| seg.vmaddr)
         .min()
-        .unwrap_or(0x1000_00000);
+        .unwrap_or(DEFAULT_IMAGE_BASE);
     let mapped_ranges = binary
         .segments
         .iter()
@@ -344,9 +352,11 @@ pub fn install_arm64_indirect_branch_hooks(
     let mut load_sanitizers = 0u64;
     for (index, chunk) in bytes.chunks_exact(4).enumerate() {
         let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let Some((kind, reg)) = decode_arm64_indirect_branch(word) else {
+        let Some(branch) = decode_indirect_branch(word) else {
             continue;
         };
+        let kind = branch.kind;
+        let reg = branch.reg;
         let hook_addr = text.addr + (index as u64 * 4);
         if index > 0 {
             let prev = u32::from_le_bytes([
@@ -355,8 +365,8 @@ pub fn install_arm64_indirect_branch_hooks(
                 bytes[(index - 1) * 4 + 2],
                 bytes[(index - 1) * 4 + 3],
             ]);
-            if let Some((rt, rn, imm)) = decode_arm64_ldr_uimm64(prev) {
-                if rt == reg {
+            if let Some(load) = decode_ldr_uimm64(prev) {
+                if load.rt == reg {
                     let trace_bus_for_load = trace_bus.clone();
                     let process_name = process_name.to_string();
                     let mapped_ranges = mapped_ranges.clone();
@@ -365,10 +375,10 @@ pub fn install_arm64_indirect_branch_hooks(
                         load_addr,
                         load_addr + 4,
                         move |emu: &mut machina::UnicornEmulator, address: u64, _size: u32| {
-                            let Some(base) = read_arm64_addr_reg(emu, rn) else {
+                            let Some(base) = read_arm64_addr_reg(emu, load.rn) else {
                                 return;
                             };
-                            let slot_addr = base.saturating_add(imm);
+                            let slot_addr = base.saturating_add(load.offset);
                             let Ok(raw) = emu.read_memory(slot_addr, 8) else {
                                 return;
                             };
@@ -377,7 +387,7 @@ pub fn install_arm64_indirect_branch_hooks(
                             };
                             let current = u64::from_le_bytes(raw8);
                             let Some(sanitized) =
-                                sanitize_arm64_indirect_target(current, image_base, &mapped_ranges)
+                                sanitize_indirect_target(current, image_base, &mapped_ranges)
                             else {
                                 return;
                             };
@@ -393,9 +403,9 @@ pub fn install_arm64_indirect_branch_hooks(
                                 &[
                                     ("Pc", format!("0x{:X}", address)),
                                     ("BranchReg", format!("x{}", reg)),
-                                    ("BaseReg", format!("x{}", rn)),
+                                    ("BaseReg", format!("x{}", load.rn)),
                                     ("Slot", format!("0x{:X}", slot_addr)),
-                                    ("Offset", format!("0x{:X}", imm)),
+                                    ("Offset", format!("0x{:X}", load.offset)),
                                     ("Target", format!("0x{:X}", current)),
                                     ("Sanitized", format!("0x{:X}", sanitized)),
                                 ],
@@ -414,8 +424,7 @@ pub fn install_arm64_indirect_branch_hooks(
             hook_addr + 4,
             move |emu: &mut machina::UnicornEmulator, address: u64, _size: u32| {
                 let target = read_arm64_gpr(emu, reg, true).unwrap_or(0);
-                let Some(sanitized) =
-                    sanitize_arm64_indirect_target(target, image_base, &mapped_ranges)
+                let Some(sanitized) = sanitize_indirect_target(target, image_base, &mapped_ranges)
                 else {
                     return;
                 };
@@ -472,7 +481,7 @@ pub fn install_arm64_indirect_branch_hooks(
 
 pub fn resolve_arm64_entry(binary: &MachoBinary) -> u64 {
     let entry = binary.entry_point.unwrap_or(0);
-    if entry >= 0x100000000 && entry < 0x300000000 {
+    if (MACHO_MAIN_ABSOLUTE_MIN..MACHO_MAIN_ABSOLUTE_MAX).contains(&entry) {
         entry
     } else if let Some(seg) = binary.segments.iter().find(|s| s.segname_str() == "__TEXT") {
         seg.vmaddr + entry
@@ -499,115 +508,6 @@ fn emit_arm64_binary_event(
         }
         let _ = bus.send(event);
     }
-}
-
-fn is_arm64_lse_cas(instr: u32) -> bool {
-    let mask = (1u32 << 31)
-        | (1u32 << 29)
-        | (1u32 << 28)
-        | (1u32 << 27)
-        | (1u32 << 26)
-        | (1u32 << 25)
-        | (1u32 << 24)
-        | (1u32 << 23)
-        | (1u32 << 21)
-        | (0x1Fu32 << 10);
-    let value = (1u32 << 31) | (1u32 << 27) | (1u32 << 23) | (1u32 << 21) | (0x1Fu32 << 10);
-    (instr & mask) == value
-}
-
-fn is_arm64_lse_ldadd(instr: u32) -> bool {
-    // Atomic memory operation, LDADD/STADD family. This covers acquire/release
-    // variants and both 32-bit and 64-bit forms.
-    (instr & 0x3F20_F000) == 0x3820_0000
-}
-
-fn is_arm64_lse_atomic_op(instr: u32) -> bool {
-    // ARMv8.1 LSE atomic memory operations: LDADD, LDCLR, LDEOR, LDSET,
-    // LDSMAX, LDSMIN, LDUMAX, LDUMIN (and their A/L acquire/release
-    // variants). The opc field at bits 14..12 selects the operation;
-    // bit 15 must be 0 (1 means SWP) and bits 11..10 must be 00.
-    (instr & 0x3F20_8C00) == 0x3820_0000
-}
-
-fn is_arm64_lse_swp(instr: u32) -> bool {
-    // ARMv8.1 LSE SWP[A][L]. Same prefix as the other LSE atomic memory ops
-    // but with bit 15 set and the opc field in bits 14..12 zero. Without an
-    // explicit hook, some Unicorn builds fail to advance PC for SWP, so
-    // RustDoor's parking_lot-style OnceLock release at `0x10018242C` would
-    // hang and burn the entire instruction budget on a single SWPAL.
-    (instr & 0x3F20_FC00) == 0x3820_8000
-}
-
-fn is_arm64_ldapr(instr: u32) -> bool {
-    // LDAPR is an acquire load used by modern arm64 runtime code. Some Unicorn
-    // builds do not advance it correctly, so emulate it as a plain load plus pc.
-    (instr & 0x3FFF_FC00) == 0x38BF_C000
-}
-
-fn decode_arm64_indirect_branch(instr: u32) -> Option<(&'static str, u8)> {
-    let reg = ((instr >> 5) & 0x1F) as u8;
-    match instr & 0xFFFF_FC1F {
-        0xD61F_0000 => Some(("br", reg)),
-        0xD63F_0000 => Some(("blr", reg)),
-        _ => None,
-    }
-}
-
-fn decode_arm64_ldr_uimm64(instr: u32) -> Option<(u8, u8, u64)> {
-    if (instr & 0xFFC0_0000) != 0xF940_0000 {
-        return None;
-    }
-    let rt = (instr & 0x1F) as u8;
-    let rn = ((instr >> 5) & 0x1F) as u8;
-    let imm12 = ((instr >> 10) & 0xFFF) as u64;
-    Some((rt, rn, imm12 << 3))
-}
-
-fn sanitize_arm64_indirect_target(
-    target: u64,
-    image_base: u64,
-    mapped_ranges: &[(u64, u64)],
-) -> Option<u64> {
-    if is_in_mapped_ranges(target, mapped_ranges) {
-        return Some(target);
-    }
-    if (target >> 48) == 0 {
-        return None;
-    }
-    let low32 = target & 0xFFFF_FFFF;
-    let image_high = image_base & 0xFFFF_FFFF_0000_0000;
-    let candidate = image_high | low32;
-    if is_in_mapped_ranges(candidate, mapped_ranges) {
-        return Some(candidate);
-    }
-    None
-}
-
-fn is_in_mapped_ranges(addr: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges
-        .iter()
-        .any(|(start, end)| addr >= *start && addr < *end)
-}
-
-fn sanitize_arm64_signed_code_pointer(
-    raw_value: u64,
-    image_base: u64,
-    mapped_ranges: &[(u64, u64)],
-) -> Option<u64> {
-    if is_in_mapped_ranges(raw_value, mapped_ranges) {
-        return Some(raw_value);
-    }
-    if (raw_value >> 48) == 0 {
-        return None;
-    }
-    let low32 = raw_value & 0xFFFF_FFFF;
-    let image_high = image_base & 0xFFFF_FFFF_0000_0000;
-    let candidate = image_high | low32;
-    if is_in_mapped_ranges(candidate, mapped_ranges) {
-        return Some(candidate);
-    }
-    None
 }
 
 fn emulate_arm64_lse_cas(

@@ -17,6 +17,7 @@ use crate::macos::arm64_runner_support::{
     arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
     record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
+use crate::macos::compat::CompatibilityServices;
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
     duplicate_synthetic_fd, fstat_guest_file, lossy_data_preview, open_directory_stream,
@@ -261,6 +262,7 @@ pub fn install_arm64_io_imports(
     let synthetic_stop_reason = shared_state.synthetic_stop_reason.clone();
     let process_bootstrap = shared_state.process_bootstrap;
     let analysis = AnalysisServices::for_mode(shared_state.runtime_mode);
+    let compat = CompatibilityServices::for_mode(shared_state.runtime_mode);
 
     if let Some(&addr) = stub_map.get("_kqueue") {
         let os_runtime = shared_state.os_runtime.clone();
@@ -1477,6 +1479,7 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1495,6 +1498,32 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.open_path_arg0(emu, path_ptr, flags, mode) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_open(host path={:?}, flags=0x{:X}, mode=0x{:X}) -> {} errno={}",
+                                result.path, flags, mode, result.return_value, result.errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "open")
+                            .arg("HostProxy", "true")
+                            .arg("Path", result.path)
+                            .arg("Flags", format!("0x{:X}", flags))
+                            .arg("Mode", format!("0x{:X}", mode))
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", result.errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (result, errno, resolved) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -1652,6 +1681,8 @@ pub fn install_arm64_io_imports(
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1668,6 +1699,34 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&thread_id).copied())
                     .unwrap_or(1);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.close_fd(fd) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_close(host fd={}, pid={}, tid={}, lr=0x{:X}) -> {} errno={}",
+                                fd,
+                                current_pid,
+                                thread_id,
+                                lr,
+                                result.return_value,
+                                result.errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, thread_id, "close")
+                            .arg("HostProxy", "true")
+                            .arg("Fd", fd.to_string())
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", result.errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let target_before_close = os_runtime
                     .lock()
                     .ok()
@@ -1850,6 +1909,7 @@ pub fn install_arm64_io_imports(
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
         let synthetic_stop_reason = synthetic_stop_reason.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1867,6 +1927,37 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.read_fd(emu, fd, buf, count) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_read(host fd={}, count={}, pid={}, tid={}) -> {} errno={}",
+                                fd,
+                                count,
+                                current_pid,
+                                current_tid,
+                                result.return_value,
+                                result.errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "read")
+                            .arg("HostProxy", "true")
+                            .arg("Fd", fd.to_string())
+                            .arg("Count", count.to_string())
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", result.errno.to_string())
+                            .arg("Preview", lossy_data_preview(&result.preview, 128));
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (result, preview, eof, idle_stop_reason) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -2496,6 +2587,7 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -2526,6 +2618,48 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.write_fd(emu, fd, buf, count) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let sp = emu.read_reg("sp").unwrap_or(0);
+                        let caller_lr = if sp != 0 {
+                            emu.read_memory(sp, 8).ok().and_then(vec_u64_le).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_write(host fd={}, count={}, transferred={}, pid={}, tid={}, lr=0x{:X}, caller=0x{:X}) -> {} errno={}",
+                                fd,
+                                count,
+                                result.transferred,
+                                current_pid,
+                                current_tid,
+                                lr,
+                                caller_lr,
+                                result.return_value,
+                                result.errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "write")
+                            .arg("HostProxy", "true")
+                            .arg("Fd", fd.to_string())
+                            .arg("Count", count.to_string())
+                            .arg("Transferred", result.transferred.to_string())
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", result.errno.to_string())
+                            .arg("Buf", format!("0x{:X}", buf))
+                            .arg("Preview", lossy_data_preview(&result.preview, 128));
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 if fd >= 65536
                     && count == 8
                     && data.iter().all(|byte| *byte == 0)

@@ -13,6 +13,10 @@ pub mod arm64_bootstrap;
 pub mod arm64_cpp_imports;
 #[path = "arch_arm64/diagnostics.rs"]
 pub mod arm64_diagnostics;
+#[path = "arch_arm64/dynamic_imports.rs"]
+pub mod arm64_dynamic_imports;
+#[path = "arch_arm64/import_stubs.rs"]
+pub mod arm64_import_stubs;
 #[path = "arch_arm64/io_imports.rs"]
 pub mod arm64_io_imports;
 #[path = "arch_arm64/process_imports.rs"]
@@ -27,6 +31,8 @@ pub mod arm64_runner_support;
 pub mod arm64_runtime;
 #[path = "arch_arm64/runtime_hooks.rs"]
 pub mod arm64_runtime_hooks;
+#[path = "arch_arm64/state.rs"]
+pub mod arm64_state;
 #[path = "arch_arm64/time_imports.rs"]
 pub mod arm64_time_imports;
 #[path = "core/binary_bootstrap.rs"]

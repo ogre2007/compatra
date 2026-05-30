@@ -1,0 +1,10 @@
+[package]
+name = "machina-mode"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime mode selection for Machina"
+license = "GPL-2.0"
+
+[lib]
+name = "machina_mode"
+path = "src/lib.rs"
