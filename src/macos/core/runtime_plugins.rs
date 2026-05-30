@@ -14,6 +14,9 @@ use crate::macos::{
     SyscallRuntimeState, TraceMetadata,
 };
 use crate::{ArchType, Emulator, MacOsError, UnicornEmulator};
+use machina_arch_arm64::abi::DEFAULT_IMAGE_BASE;
+
+const ARM64_SVC_0X80: u32 = 0xD400_1001;
 
 pub fn runtime_process_metadata(process_name: impl Into<String>) -> TraceMetadata {
     TraceMetadata::new()
@@ -217,47 +220,71 @@ impl Arm64RuntimePlugin for Arm64SyscallRuntimePlugin {
         let metadata = context.metadata();
 
         emulator.hook_syscall(Box::new(move |emu: &mut dyn Emulator| {
-            if emu.arch_type() != ArchType::Arm64 {
-                return Ok(0);
-            }
-
-            let pc = emu.read_reg("pc")?;
-            let num = emu.read_reg("x16")?;
-            let args = [
-                emu.read_reg("x0")?,
-                emu.read_reg("x1")?,
-                emu.read_reg("x2")?,
-                emu.read_reg("x3")?,
-                emu.read_reg("x4")?,
-                emu.read_reg("x5")?,
-            ];
-            let invocation = SyscallInvocation {
-                num,
-                name: default_syscall_name(num),
-                pc,
-                args,
-            };
-            let outcome = handle_basic_macos_syscall(
-                emu,
-                &invocation,
-                &metadata,
-                &runtime,
-                "arm64-syscall-runtime",
-            )?;
-
-            emu.write_reg("x0", outcome.return_value)?;
-            if let Some(stop_addr) = outcome.stop_addr {
-                emu.write_reg("pc", stop_addr)?;
-            } else {
-                emu.write_reg("pc", pc + 4)?;
-            }
-
-            emit_runner_trace_event(&trace_bus, &TraceMetadata::new(), outcome.event);
+            handle_arm64_syscall_trap(emu, &runtime, &trace_bus, &metadata)?;
             Ok(0)
         }));
 
+        if context.core.runtime_mode == RuntimeMode::Compat {
+            let runtime = context.core.runtime.clone();
+            let trace_bus = context.core.trace_bus.clone();
+            let metadata = context.metadata();
+            let hook_end = context.core.heap_base.max(DEFAULT_IMAGE_BASE + 4);
+            emulator.add_code_hook(DEFAULT_IMAGE_BASE, hook_end, move |emu, address, _size| {
+                let is_svc_0x80 = emu
+                    .read_memory(address, 4)
+                    .ok()
+                    .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok())
+                    .map(u32::from_le_bytes)
+                    == Some(ARM64_SVC_0X80);
+                if !is_svc_0x80 {
+                    return;
+                }
+                let _ = handle_arm64_syscall_trap(emu, &runtime, &trace_bus, &metadata);
+            })?;
+        }
+
         Ok(())
     }
+}
+
+fn handle_arm64_syscall_trap(
+    emu: &mut dyn Emulator,
+    runtime: &SyscallRuntimeState,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) -> Result<(), MacOsError> {
+    if emu.arch_type() != ArchType::Arm64 {
+        return Ok(());
+    }
+
+    let pc = emu.read_reg("pc")?;
+    let num = emu.read_reg("x16")?;
+    let args = [
+        emu.read_reg("x0")?,
+        emu.read_reg("x1")?,
+        emu.read_reg("x2")?,
+        emu.read_reg("x3")?,
+        emu.read_reg("x4")?,
+        emu.read_reg("x5")?,
+    ];
+    let invocation = SyscallInvocation {
+        num,
+        name: default_syscall_name(num),
+        pc,
+        args,
+    };
+    let outcome =
+        handle_basic_macos_syscall(emu, &invocation, metadata, runtime, "arm64-syscall-runtime")?;
+
+    emu.write_reg("x0", outcome.return_value)?;
+    if let Some(stop_addr) = outcome.stop_addr {
+        emu.write_reg("pc", stop_addr)?;
+    } else {
+        emu.write_reg("pc", pc + 4)?;
+    }
+
+    emit_runner_trace_event(trace_bus, &TraceMetadata::new(), outcome.event);
+    Ok(())
 }
 
 #[cfg(test)]

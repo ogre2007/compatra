@@ -68,7 +68,10 @@ cargo run --bin machina -- fixtures\macos\bin\arm64_hello
 ```
 
 Compatibility mode keeps the same arm64 userland execution path but uses
-non-analysis defaults:
+non-analysis defaults. It is a userland compatibility path, not a security or
+analysis sandbox: selected Darwin/libSystem imports and raw `svc #0x80` syscall
+traps are proxied into host-backed helpers so small arm64 programs can make
+observable progress under an Intel macOS host.
 
 ```powershell
 cargo run --bin machina -- --mode compat fixtures\macos\bin\arm64_hello
@@ -83,6 +86,20 @@ validated:
 ```
 cargo test --test compat_mode_macos
 ```
+
+Use `-- --nocapture` when debugging CI or a local Intel macOS machine. The test
+prints `compat ...` proof lines with real guest-observed return values and
+outputs, including:
+
+- arm64 guest stdout from the emulated program
+- static imports and `dlsym` imports for file descriptors, positioned I/O,
+  path metadata and mutation, directory iteration, environment, time, resource,
+  and entropy calls
+- raw Darwin syscall traps and imported syscall thunks for process, time,
+  resource, sysctl, and file descriptor calls
+
+On non-macOS hosts the test is a skip guard; the AMOS and RustDoor regression
+tests remain the portable analysis checks.
 
 ## Local AMOS integration check
 
@@ -119,7 +136,9 @@ See [fixtures/README.md](D:/dev/quiling/qiling/fixtures/README.md) and
 Working today:
 
 - arm64 Mach-O loading and execution
-- synthetic imports, syscalls, guest filesystem model
+- synthetic imports, syscall shims, guest filesystem model
+- host-backed compatibility shims for selected Darwin/libSystem imports and
+  raw arm64 Darwin syscall traps in compat mode
 - JSONL plugin events
 - real sample progression into malware logic for AMOS-style paths
 
@@ -127,7 +146,8 @@ Still in progress:
 
 - deeper normalization of all remaining legacy stdout diagnostics
 - broader synthetic macOS API coverage
-- directory-heavy profile emulation and richer artifact capture
+- broader host-backed static/dynamic import and syscall coverage for compat
+- directory-heavy profile emulation and richer artifact capture for analysis
 - publication cleanup of remaining legacy compatibility layers inherited from the Qiling-era codebase
 
 ## License

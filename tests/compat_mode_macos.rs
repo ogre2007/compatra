@@ -713,7 +713,8 @@ int main(void) {{
     long raw_read = raw_fd >= 0 ? machina_syscall6(SYS_READ_NOCANCEL, raw_fd, (long)raw_buf, 5, 0, 0, 0) : -1;
     long raw_fcntl = raw_fd >= 0 ? machina_syscall6(SYS_FCNTL_NOCANCEL, raw_fd, F_GETFD, 0, 0, 0, 0) : -1;
     long raw_close = raw_fd >= 0 ? machina_syscall6(SYS_CLOSE_NOCANCEL, raw_fd, 0, 0, 0, 0, 0) : -1;
-    printf("compat fd nocancel open=%ld write=%ld seek=%ld read=%ld text=%s fcntl=%ld close=%ld errno=%d\n", raw_fd, raw_write, raw_seek, raw_read, raw_buf, raw_fcntl, raw_close, errno);
+    printf("compat fd nocancel io open=%ld write=%ld seek=%ld read=%ld errno=%d\n", raw_fd, raw_write, raw_seek, raw_read, errno);
+    printf("compat fd nocancel result text=%s fcntl=%ld close=%ld errno=%d\n", raw_buf, raw_fcntl, raw_close, errno);
     if (raw_fd < 0 || raw_write != 5 || raw_seek != 0 || raw_read != 5 || !text_is(raw_buf, "nc-ok", 5) || raw_fcntl < 0 || raw_close != 0) {{
         failures += 45;
     }}
@@ -738,13 +739,14 @@ int main(void) {{
     }}
     failures += pipe_vec_roundtrip("dlsym", dyn_pipe, dyn_writev, dyn_readv);
 
-    int dyn_rw_fd = dyn_open(DATA_FILE, O_RDWR);
+    int dyn_rw_fd = dyn_open(DATA_FILE, O_CREAT | O_TRUNC | O_RDWR, 0600);
     long dyn_write_count = dyn_rw_fd >= 0 ? (long)dyn_write(dyn_rw_fd, "rw-ok", 5) : -1;
     long dyn_rw_seek = dyn_rw_fd >= 0 ? (long)dyn_lseek(dyn_rw_fd, 0, SEEK_SET) : -1;
     char dyn_rw_buf[8] = {{0}};
     long dyn_read_count = dyn_rw_fd >= 0 ? (long)dyn_read(dyn_rw_fd, dyn_rw_buf, 5) : -1;
     int dyn_close_ret = dyn_rw_fd >= 0 ? dyn_close(dyn_rw_fd) : -1;
-    printf("compat fd dlsym rw open=%d write=%ld seek=%ld read=%ld text=%s close=%d errno=%d\n", dyn_rw_fd, dyn_write_count, dyn_rw_seek, dyn_read_count, dyn_rw_buf, dyn_close_ret, errno);
+    printf("compat fd dlsym rw io open=%d write=%ld seek=%ld read=%ld errno=%d\n", dyn_rw_fd, dyn_write_count, dyn_rw_seek, dyn_read_count, errno);
+    printf("compat fd dlsym rw result text=%s close=%d errno=%d\n", dyn_rw_buf, dyn_close_ret, errno);
     if (dyn_rw_fd < 0 || dyn_write_count != 5 || dyn_rw_seek != 0 || dyn_read_count != 5 || !text_is(dyn_rw_buf, "rw-ok", 5) || dyn_close_ret != 0) {{
         failures += 55;
     }}
@@ -1108,6 +1110,9 @@ int main(void) {{
         resolved,
         errno
     );
+    printf("compat path static stat access=%d stat=%d fstat=%d lstat=%d errno=%d\n", access_ret, stat_ret, fstat_ret, lstat_ret, errno);
+    printf("compat path static sizes stat=%lld fstat=%lld link=%lld\n", (long long)st.st_size, (long long)fst.st_size, (long long)lst.st_size);
+    printf("compat path static link symlink=%d readlink=%ld target=%s realpath=%p errno=%d\n", symlink_ret, readlink_ret, link_target, (void *)realpath_ret, errno);
     if (fd < 0 || access_ret != 0 || stat_ret != 0 || st.st_size != 5 || fstat_ret != 0 || fst.st_size != 5 || symlink_ret != 0 || readlink_ret != 9 || !text_is(link_target, "alpha.txt") || lstat_ret != 0 || realpath_ret == 0) {{
         failures += 20;
     }}
@@ -1201,6 +1206,9 @@ int main(void) {{
         dyn_resolved,
         errno
     );
+    printf("compat path dlsym stat rename=%d access=%d stat=%d fstat=%d lstat=%d errno=%d\n", dyn_rename_ret, dyn_access_ret, dyn_stat_ret, dyn_fstat_ret, dyn_lstat_ret, errno);
+    printf("compat path dlsym sizes stat=%lld fstat=%lld\n", (long long)dyn_st.st_size, (long long)dyn_fst.st_size);
+    printf("compat path dlsym link symlink=%d readlink=%ld target=%s realpath=%p errno=%d\n", dyn_symlink_ret, dyn_readlink_ret, dyn_link_target, (void *)dyn_realpath_ret, errno);
     if (dyn_fd < 0 || dyn_rename_ret != 0 || dyn_access_ret != 0 || dyn_stat_ret != 0 || dyn_st.st_size != 7 || dyn_fstat_ret != 0 || dyn_fst.st_size != 7 || dyn_symlink_ret != 0 || dyn_readlink_ret != 11 || !text_is(dyn_link_target, "dyn-new.txt") || dyn_lstat_ret != 0 || dyn_realpath_ret == 0) {{
         failures += 60;
     }}
@@ -1319,6 +1327,7 @@ int main(void) {
     gid_t egid = getegid();
     long syscall_pid = machina_syscall6(0x2000014, 0, 0, 0, 0, 0, 0);
     printf("compat proc ids pid=%d ppid=%d uid=%u euid=%u gid=%u egid=%u syscall_pid=%ld\n", pid, ppid, uid, euid, gid, egid, syscall_pid);
+    printf("compat proc syscall pid=%ld host_pid=%d\n", syscall_pid, pid);
     if (pid <= 0 || syscall_pid <= 0) {
         failures += 20;
     }
@@ -1366,6 +1375,9 @@ int main(void) {
         timebase.numer,
         timebase.denom,
         errno);
+    printf("compat time imported gtod=%d clock=%d nanosleep=%d usleep=%d sleep=%u errno=%d\n", gtod_ret, clock_ret, nanosleep_ret, usleep_ret, sleep_ret, errno);
+    printf("compat time syscall ret=%ld tv_sec=%lld mach=%llu\n", syscall_gtod, (long long)syscall_tv.tv_sec, (unsigned long long)syscall_mach);
+    printf("compat time timebase ret=%d numer=%u denom=%u mach=%llu\n", timebase_ret, timebase.numer, timebase.denom, (unsigned long long)mach_now);
     if (gtod_ret != 0 || syscall_gtod != 0 || syscall_tv.tv_sec <= 0 || clock_ret != 0 || nanosleep_ret != 0 || usleep_ret != 0 || sleep_ret != 0 || mach_now == 0 || timebase_ret != 0 || timebase.numer == 0 || timebase.denom == 0) {
         failures += 40;
     }
@@ -1382,6 +1394,7 @@ int main(void) {
         (unsigned long long)syscall_lim.rlim_cur,
         (unsigned long long)syscall_lim.rlim_max,
         errno);
+    printf("compat rlimit syscall ret=%ld cur=%llu imported=%d\n", syscall_rlimit, (unsigned long long)syscall_lim.rlim_cur, rlimit_ret);
     if (rlimit_ret != 0 || syscall_rlimit != 0 || lim.rlim_cur == 0 || syscall_lim.rlim_cur == 0) {
         failures += 50;
     }
@@ -1394,6 +1407,7 @@ int main(void) {
     size_t syscall_page_len = sizeof(syscall_page);
     long syscall_sysctl = machina_syscall6(0x20000CA, (long)mib, 2, (long)&syscall_page, (long)&syscall_page_len, 0, 0);
     printf("compat sysctl byname=%d page=%d len=%lu syscall=%ld sc_page=%d sc_len=%lu errno=%d\n", byname_ret, byname_page, (unsigned long)byname_len, syscall_sysctl, syscall_page, (unsigned long)syscall_page_len, errno);
+    printf("compat sysctl syscall ret=%ld page=%d len=%lu byname=%d\n", syscall_sysctl, syscall_page, (unsigned long)syscall_page_len, byname_ret);
     if (byname_ret != 0 || byname_page <= 0 || syscall_sysctl != 0 || syscall_page <= 0) {
         failures += 60;
     }
@@ -2193,8 +2207,9 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         "fd fixture did not complete positioned file I/O probe; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat fd nocancel open=")
-            && stdout.contains("write=5 seek=0 read=5 text=nc-ok")
+        stdout.contains("compat fd nocancel io open=")
+            && stdout.contains("write=5 seek=0 read=5")
+            && stdout.contains("compat fd nocancel result text=nc-ok")
             && stdout.contains("close=0"),
         "fd fixture did not complete raw *_nocancel syscall I/O probe; stdout:\n{stdout}"
     );
@@ -2211,8 +2226,9 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         "fd fixture did not complete dynamic pipe/writev/readv roundtrip; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat fd dlsym rw open=")
-            && stdout.contains("write=5 seek=0 read=5 text=rw-ok close=0"),
+        stdout.contains("compat fd dlsym rw io open=")
+            && stdout.contains("write=5 seek=0 read=5")
+            && stdout.contains("compat fd dlsym rw result text=rw-ok close=0"),
         "fd fixture did not complete dynamic open/write/read/close roundtrip; stdout:\n{stdout}"
     );
     assert!(
@@ -2379,11 +2395,13 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         "path fixture did not complete static mkdir/chdir/getcwd; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat path static access=0 stat=0 size=5 fstat=0 size=5"),
+        stdout.contains("compat path static stat access=0 stat=0 fstat=0 lstat=0")
+            && stdout.contains("compat path static sizes stat=5 fstat=5"),
         "path fixture did not complete static access/stat/fstat; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("symlink=0 readlink=9 target=alpha.txt lstat=0"),
+        stdout
+            .contains("compat path static link symlink=0 readlink=9 target=alpha.txt realpath=0x"),
         "path fixture did not complete static symlink/readlink/lstat; stdout:\n{stdout}"
     );
     assert!(
@@ -2401,11 +2419,14 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         "path fixture did not complete dlsym chdir/getcwd; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat path dlsym file rename=0 access=0 stat=0 size=7 fstat=0 size=7"),
+        stdout.contains("compat path dlsym stat rename=0 access=0 stat=0 fstat=0 lstat=0")
+            && stdout.contains("compat path dlsym sizes stat=7 fstat=7"),
         "path fixture did not complete dlsym path metadata; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("readlink=11 target=dyn-new.txt lstat=0 realpath=0x"),
+        stdout.contains(
+            "compat path dlsym link symlink=0 readlink=11 target=dyn-new.txt realpath=0x"
+        ),
         "path fixture did not complete dlsym readlink/realpath; stdout:\n{stdout}"
     );
     assert!(
@@ -2475,7 +2496,8 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
         "env fixture did not complete static setenv/getenv/unsetenv; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat proc ids pid=") && stdout.contains(" syscall_pid="),
+        stdout.contains("compat proc syscall pid=")
+            && !stdout.contains("compat proc syscall pid=0 "),
         "env/time fixture did not print host-backed process identity and raw syscall pid; stdout:\n{stdout}"
     );
     assert!(
@@ -2485,20 +2507,19 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
         "env/time fixture did not complete sysconf/gethostname/uname; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat time gtod=0")
-            && stdout.contains(" syscall=0 ")
-            && stdout.contains(" clock=0 ")
-            && stdout.contains(" nanosleep=0 usleep=0 sleep=0 "),
+        stdout.contains("compat time imported gtod=0 clock=0 nanosleep=0 usleep=0 sleep=0")
+            && stdout.contains("compat time syscall ret=0")
+            && stdout.contains("compat time timebase ret=0 numer="),
         "env/time fixture did not complete imported and raw-syscall time probes; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat rlimit static=0") && stdout.contains(" syscall=0 "),
+        stdout.contains("compat rlimit syscall ret=0") && stdout.contains(" imported=0"),
         "env/time fixture did not complete imported and raw-syscall getrlimit; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat sysctl byname=0")
-            && stdout.contains(" syscall=0 ")
-            && stdout.contains(" sc_page="),
+        stdout.contains("compat sysctl syscall ret=0")
+            && stdout.contains(" page=")
+            && stdout.contains(" byname=0"),
         "env/time fixture did not complete sysctlbyname and raw sysctl; stdout:\n{stdout}"
     );
     assert!(

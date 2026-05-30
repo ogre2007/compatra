@@ -3006,6 +3006,10 @@ const DARWIN_IOVEC_BASE: usize = 0;
 #[cfg(target_os = "macos")]
 const DARWIN_IOVEC_LEN: usize = 8;
 #[cfg(target_os = "macos")]
+const DARWIN_STAT_SIZE: usize = 128;
+#[cfg(target_os = "macos")]
+const DARWIN_STAT_SIZE_OFFSET: usize = 48;
+#[cfg(target_os = "macos")]
 const MAX_GUEST_IOV: usize = 1024;
 #[cfg(target_os = "macos")]
 const MAX_GUEST_IOV_BYTES: usize = 16 * 1024 * 1024;
@@ -3534,28 +3538,17 @@ fn proxy_host_getcwd<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_stat_from_metadata(metadata: &fs::Metadata) -> MaybeUninit<libc::stat> {
-    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+fn darwin_stat_from_metadata(metadata: &fs::Metadata) -> MaybeUninit<[u8; DARWIN_STAT_SIZE]> {
+    darwin_minimal_stat(metadata.size())
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_minimal_stat(size: u64) -> MaybeUninit<[u8; DARWIN_STAT_SIZE]> {
+    let mut stat = MaybeUninit::<[u8; DARWIN_STAT_SIZE]>::zeroed();
     unsafe {
         let stat = &mut *stat.as_mut_ptr();
-        stat.st_dev = metadata.dev() as _;
-        stat.st_mode = metadata.mode() as _;
-        stat.st_nlink = metadata.nlink() as _;
-        stat.st_ino = metadata.ino() as _;
-        stat.st_uid = metadata.uid() as _;
-        stat.st_gid = metadata.gid() as _;
-        stat.st_rdev = metadata.rdev() as _;
-        stat.st_atime = metadata.atime() as _;
-        stat.st_atime_nsec = metadata.atime_nsec() as _;
-        stat.st_mtime = metadata.mtime() as _;
-        stat.st_mtime_nsec = metadata.mtime_nsec() as _;
-        stat.st_ctime = metadata.ctime() as _;
-        stat.st_ctime_nsec = metadata.ctime_nsec() as _;
-        stat.st_birthtime = metadata.ctime() as _;
-        stat.st_birthtime_nsec = metadata.ctime_nsec() as _;
-        stat.st_size = metadata.size() as _;
-        stat.st_blocks = metadata.blocks() as _;
-        stat.st_blksize = metadata.blksize() as _;
+        stat[DARWIN_STAT_SIZE_OFFSET..DARWIN_STAT_SIZE_OFFSET + 8]
+            .copy_from_slice(&size.to_le_bytes());
     }
     stat
 }
@@ -3602,8 +3595,12 @@ fn proxy_host_fstat<M: GuestMemory + ?Sized>(
     let mut stat = MaybeUninit::<libc::stat>::zeroed();
     clear_errno();
     let ret = unsafe { libc::fstat(fd as libc::c_int, stat.as_mut_ptr()) };
-    if ret == 0 && write_guest_host_struct(memory, stat_ptr, &stat).is_err() {
-        return Some(host_io_error(libc::EFAULT as u32));
+    if ret == 0 {
+        let size = unsafe { (*stat.as_ptr()).st_size }.max(0) as u64;
+        let guest_stat = darwin_minimal_stat(size);
+        if write_guest_host_struct(memory, stat_ptr, &guest_stat).is_err() {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
     }
     Some(host_io_result(ret as isize, Vec::new()))
 }
@@ -4925,7 +4922,7 @@ fn proxy_host_select<M: GuestMemory + ?Sized>(
     };
 
     clear_errno();
-    let ret = unsafe {
+    let mut ret = unsafe {
         libc::select(
             nfds as libc::c_int,
             read_host
@@ -4950,9 +4947,15 @@ fn proxy_host_select<M: GuestMemory + ?Sized>(
         return Some(host_io_result(ret as isize, Vec::new()));
     }
 
-    let ready_read = collect_ready_host_fd_set(readfds.as_ref(), read_host.as_ref());
+    let mut ready_read = collect_ready_host_fd_set(readfds.as_ref(), read_host.as_ref());
     let ready_write = collect_ready_host_fd_set(writefds.as_ref(), write_host.as_ref());
     let ready_except = collect_ready_host_fd_set(exceptfds.as_ref(), except_host.as_ref());
+    if ready_read.is_empty() {
+        ready_read = collect_fionread_ready(readfds.as_ref());
+        if !ready_read.is_empty() && ret == 0 {
+            ret = ready_read.len() as libc::c_int;
+        }
+    }
 
     if let Err(errno) = write_darwin_fd_set(memory, readfds_ptr, readfds.as_ref(), &ready_read)
         .and_then(|_| write_darwin_fd_set(memory, writefds_ptr, writefds.as_ref(), &ready_write))
@@ -5069,6 +5072,22 @@ fn collect_ready_host_fd_set(
     for fd in original {
         let is_ready = unsafe { libc::FD_ISSET(*fd, host.as_ptr()) };
         if is_ready {
+            ready.insert(*fd);
+        }
+    }
+    ready
+}
+
+#[cfg(target_os = "macos")]
+fn collect_fionread_ready(original: Option<&HashSet<libc::c_int>>) -> HashSet<libc::c_int> {
+    let mut ready = HashSet::new();
+    let Some(original) = original else {
+        return ready;
+    };
+    for fd in original {
+        let mut available: libc::c_int = 0;
+        let ret = unsafe { libc::ioctl(*fd, libc::FIONREAD, &mut available as *mut libc::c_int) };
+        if ret == 0 && available > 0 {
             ready.insert(*fd);
         }
     }
