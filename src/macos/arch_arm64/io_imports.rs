@@ -12,12 +12,11 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
-use crate::macos::analysis::{AnalysisServices, FilePayloadDump};
 use crate::macos::arm64_runner_support::{
     arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
     record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
-use crate::macos::capture::lossy_data_preview;
+use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::compat::CompatibilityServices;
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
@@ -261,7 +260,7 @@ pub fn install_arm64_io_imports(
     let malloc_next_addr = shared_state.malloc_next_addr.clone();
     let synthetic_stop_reason = shared_state.synthetic_stop_reason.clone();
     let process_bootstrap = shared_state.process_bootstrap;
-    let analysis = AnalysisServices::for_mode(shared_state.runtime_mode);
+    let analysis = shared_state.analysis.clone();
     let compat = CompatibilityServices::for_mode(shared_state.runtime_mode);
 
     if let Some(&addr) = stub_map.get("_kqueue") {
@@ -593,9 +592,6 @@ pub fn install_arm64_io_imports(
                             buffer: std::collections::VecDeque::new(),
                             read_open: true,
                             write_open: true,
-                            capture_label: None,
-                            capture_consumer_pid: None,
-                            captured_data: Vec::new(),
                         },
                     );
                     os.fd_targets
@@ -1683,6 +1679,7 @@ pub fn install_arm64_io_imports(
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
         let compat_for_hook = compat;
+        let analysis_for_hook = analysis.clone();
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1731,42 +1728,30 @@ pub fn install_arm64_io_imports(
                     .lock()
                     .ok()
                     .and_then(|os| resolve_process_fd_target(&os, current_pid, fd));
-                let closed_pipe = {
+                {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
                         Err(_) => return,
                     };
-                    close_synthetic_fd(&mut os, current_pid, fd)
-                };
+                    let _ = close_synthetic_fd(&mut os, current_pid, fd);
+                }
                 let capture_closed = match target_before_close {
                     Some(SyntheticFdTarget::PipeWrite(pipe_id)) => {
-                        let live_capture = os_runtime.lock().ok().and_then(|mut os| {
-                            let (label, consumer_pid, data, still_open) = {
-                                let pipe = os.pipes.get(&pipe_id)?;
-                                (
-                                    pipe.capture_label.clone()?,
-                                    pipe.capture_consumer_pid,
-                                    pipe.captured_data.clone(),
-                                    pipe.write_open,
-                                )
-                            };
-                            if still_open {
-                                return None;
+                        let write_still_open = os_runtime
+                            .lock()
+                            .ok()
+                            .and_then(|os| os.pipes.get(&pipe_id).map(|pipe| pipe.write_open))
+                            .unwrap_or(false);
+                        if write_still_open {
+                            None
+                        } else {
+                            if let Some(pid) = analysis_for_hook.pipe_stdin_consumer_pid(pipe_id) {
+                                if let Ok(mut os) = os_runtime.lock() {
+                                    terminate_synthetic_process(&mut os, pid, 0);
+                                }
                             }
-                            if let Some(pid) = consumer_pid {
-                                terminate_synthetic_process(&mut os, pid, 0);
-                            }
-                            Some((pipe_id, label, consumer_pid, data))
-                        });
-                        live_capture.or_else(|| {
-                            let pipe = closed_pipe.as_ref()?;
-                            Some((
-                                pipe_id,
-                                pipe.capture_label.clone()?,
-                                pipe.capture_consumer_pid,
-                                pipe.captured_data.clone(),
-                            ))
-                        })
+                            analysis_for_hook.complete_pipe_stdin_capture(pipe_id)
+                        }
                     }
                     _ => None,
                 };
@@ -1778,11 +1763,7 @@ pub fn install_arm64_io_imports(
                     &import_tracker,
                     format!("_close(fd={}, pid={}, tid={}, lr=0x{:X}) -> 0", fd, current_pid, thread_id, lr),
                 );
-                if let (Some(analysis), Some((pipe_id, label, consumer_pid, data))) =
-                    (analysis, capture_closed)
-                {
-                    let report =
-                        analysis.complete_pipe_stdin_capture(pipe_id, label, consumer_pid, &data);
+                if let Some(report) = capture_closed {
                     println!(
                         "[CAPTURE][arm64] process-stdin complete pipe_id={} closed_by_pid={} consumer_pid={:?} target={} total_bytes={} raw_fnv1a64={} raw_entropy={:.3} preview={}{}{}",
                         report.pipe_id,
@@ -2588,6 +2569,7 @@ pub fn install_arm64_io_imports(
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
         let compat_for_hook = compat;
+        let analysis_for_hook = analysis.clone();
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -2733,17 +2715,16 @@ pub fn install_arm64_io_imports(
                 }
                 let mut pipe_capture = None;
                 let mut substituted_recent_read = false;
-                let mut file_payload_dump: Option<FilePayloadDump> = None;
+                let mut file_payload_dump = None;
                 if !data.is_empty() {
-                    if let Some(analysis) = analysis {
-                        if let Ok(os_guard) = os_runtime.lock() {
+                    if let Ok(os_guard) = os_runtime.lock() {
                         if let Some(SyntheticFdTarget::File(file_id)) =
                             resolve_process_fd_target(&os_guard, current_pid, fd)
                         {
                             if let Some(file) = os_guard.guest_files.files.get(&file_id) {
                                 let raw_path = file.raw_path.clone();
                                 drop(os_guard);
-                                if let Some(dump) = analysis.capture_file_write_payload(
+                                if let Some(dump) = analysis_for_hook.capture_file_write_payload(
                                     current_pid,
                                     fd,
                                     raw_path,
@@ -2752,7 +2733,6 @@ pub fn install_arm64_io_imports(
                                     file_payload_dump = Some(dump);
                                 }
                             }
-                        }
                         }
                     }
                     if let Ok(mut os) = os_runtime.lock() {
@@ -2782,11 +2762,8 @@ pub fn install_arm64_io_imports(
                             }
                             if let Some(pipe) = os.pipes.get_mut(&pipe_id) {
                                 pipe.buffer.extend(data.iter().copied());
-                                if let Some(label) = pipe.capture_label.clone() {
-                                    pipe.captured_data.extend(data.iter().copied());
-                                    let preview = lossy_data_preview(&pipe.captured_data, 256);
-                                    pipe_capture = Some((label, pipe.captured_data.len(), preview));
-                                }
+                                pipe_capture =
+                                    analysis_for_hook.observe_pipe_stdin_write(pipe_id, &data);
                             }
                         }
                     }
@@ -2818,10 +2795,10 @@ pub fn install_arm64_io_imports(
                             fd, substituted_recent_read, lr_code
                         );
                     }
-                    if let Some((label, total_len, capture_preview)) = pipe_capture {
+                    if let Some(capture) = pipe_capture {
                         println!(
                             "[CAPTURE][arm64] process-stdin source_fd={} pid={} tid={} target={} total_bytes={} preview={}",
-                            fd, current_pid, current_tid, label, total_len, capture_preview
+                            fd, current_pid, current_tid, capture.label, capture.bytes, capture.preview
                         );
                     }
                 } else {

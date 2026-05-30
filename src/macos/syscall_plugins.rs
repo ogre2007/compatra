@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::macos::analysis::AnalysisServices;
-use crate::macos::capture::lossy_data_preview;
+use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::{
     align_up, read_cstring, resolve_guest_path, syscall_event, RuntimeMode, TraceEvent,
     TraceMetadata,

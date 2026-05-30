@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::macos::capture::lossy_data_preview;
+use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::{
     emit_runner_trace_event, process_event, runtime_process_metadata, SharedTraceBus,
 };

@@ -18,7 +18,7 @@ repo. The intent is to keep direction stable across short, automated sessions.
   - `crates/machina-analysis` — analysis-only services: capture artifact
     writing, payload summaries, synthetic analyst fixtures such as log-stream
     output, synthetic guest artifact/bait data, and built-in analysis plugin
-    preset specifications.
+    preset specifications and operator hook env parsing.
   - `crates/machina-compat` — compatibility-only host proxy services behind a
     guest-memory trait; it must not depend on analysis services or the main
     `machina` crate.
@@ -31,14 +31,14 @@ repo. The intent is to keep direction stable across short, automated sessions.
 ## Code organization rules
 
 `src/macos/mod.rs` is intentionally flat: each leaf file is declared once via
-`#[path = ".../foo.rs"] pub mod foo;` and then the four "grouped" façades
-re-export the same modules under shorter names. When you add a new file:
+`#[path = ".../foo.rs"] pub mod foo;` and then the grouped façades re-export
+the same modules under shorter names. When you add a new file:
 
 1. Decide which group it belongs to (see below).
 2. Add the `#[path]` declaration in `src/macos/mod.rs`.
 3. Re-export it from the matching group's `mod.rs` (`core`, `arch_arm64`,
-   `platform_apple`, `guest_model`) using `pub use` so callers can keep
-   importing through the façade.
+   `analysis_arm64`, `platform_apple`, `guest_model`) using `pub use` so
+   callers can keep importing through the façade.
 4. If the new symbol is part of the public surface, add a `pub use` entry to
    `src/lib.rs` as well.
 
@@ -52,7 +52,12 @@ Group ownership:
 - `src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics,
   shared arm64 runtime state (`state.rs`), import-stub plumbing
   (`import_stubs.rs`), dynamic import trampolines (`dynamic_imports.rs`),
-  LSE atomic / indirect-branch hooks, and arm64 `*_imports.rs` thunk groups.
+  LSE atomic / indirect-branch hooks, and arm64 `*_imports.rs` thunk groups
+  that are required by both runtime modes.
+- `src/macos/analysis_arm64` — arm64-only analysis hooks and diagnostic shims
+  that are not part of the compatibility runtime. C++/libc++ synthetic hook
+  models, fake analysis data symbols, and other operator-facing arm64 analysis
+  glue belong here behind `AnalysisRuntimeHooks`/analysis-mode gating.
 - `src/macos/platform_apple` — CoreFoundation, Security, XPC, libobjc and
   other Apple-facing synthetic runtime services.
 - `src/macos/guest_model` — guest filesystem (`files.rs`), guest memory
@@ -75,6 +80,10 @@ module. `src/macos/core/analysis.rs`, `compat.rs`, `capture.rs`, `mode.rs`, and
 behavior belongs in `crates/machina-analysis`, `crates/machina-compat`, or
 `crates/machina-mode`. Compatibility code must not emit detections, write
 captures, synthesize analyst bait data, or depend on the analysis crate.
+If arm64 code needs analysis behavior, route it through
+`AnalysisRuntimeHooks` or an `analysis_arm64` module instead of storing
+capture state or parsing analysis-only env knobs directly in
+`src/macos/arch_arm64`.
 
 ## Logging rules
 

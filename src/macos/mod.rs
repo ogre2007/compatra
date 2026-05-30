@@ -1,5 +1,8 @@
 #[path = "core/analysis.rs"]
 pub mod analysis;
+pub mod analysis_arm64;
+#[path = "analysis_arm64/cpp_imports.rs"]
+pub mod analysis_arm64_cpp_imports;
 #[path = "platform_apple/imports.rs"]
 pub mod apple_imports;
 #[path = "platform_apple/runtime.rs"]
@@ -9,8 +12,6 @@ pub mod arch_arm64;
 pub mod arm64_binary_setup;
 #[path = "arch_arm64/bootstrap.rs"]
 pub mod arm64_bootstrap;
-#[path = "arch_arm64/cpp_imports.rs"]
-pub mod arm64_cpp_imports;
 #[path = "arch_arm64/diagnostics.rs"]
 pub mod arm64_diagnostics;
 #[path = "arch_arm64/dynamic_imports.rs"]
@@ -41,6 +42,8 @@ pub mod binary_bootstrap;
 pub mod binary_setup;
 #[path = "core/bootstrap.rs"]
 pub mod bootstrap;
+#[path = "core/byte_preview.rs"]
+pub mod byte_preview;
 #[path = "core/capture.rs"]
 pub mod capture;
 #[path = "core/compat.rs"]

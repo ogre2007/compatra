@@ -2,6 +2,7 @@ pub use crate::macos::analysis;
 pub mod binary_bootstrap;
 pub mod binary_setup;
 pub mod bootstrap;
+pub mod byte_preview;
 pub mod capture;
 pub use crate::macos::compat;
 pub mod diagnostics;

@@ -1,7 +1,10 @@
 //! Legacy arm64 Mach-O runner used by the no-dyld binary entrypoint.
 
+use crate::macos::analysis::AnalysisRuntimeHooks;
+use crate::macos::analysis_arm64_cpp_imports::{
+    install_analysis_arm64_cpp_imports, setup_analysis_arm64_cpp_data_region,
+};
 use crate::macos::apple_imports::install_apple_imports;
-use crate::macos::arm64_cpp_imports::install_arm64_cpp_imports;
 use crate::macos::arm64_dynamic_imports::install_arm64_dynamic_imports;
 use crate::macos::binary_bootstrap::{map_binary_segments, setup_bootstrap_state};
 use crate::macos::binary_setup::{
@@ -30,21 +33,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const INDIRECT_BRANCH_MODE_ENV: &str = "MACHINA_INDIRECT_BRANCH_MODE";
-
-/// Size of the fake C++ data region carved out of the mmap arena.
-/// Large enough to host a generic ostream object, a small vtable
-/// table, and a few extra fake-data symbols (ctype::id, etc.)
-/// without bumping into surrounding allocations.
-const ARM64_CPP_DATA_REGION_SIZE: u64 = 0x2000;
-
-/// Offsets inside the C++ data region for each kind of fake symbol.
-/// The region only supplies imported data symbols with stable data-shaped
-/// addresses; libc++ behavior belongs in `cpp_imports.rs` hooks.
-const ARM64_CPP_VTABLE_STORAGE_OFFSET: u64 = 0x100;
-const ARM64_CPP_VTT_OFFSET: u64 = 0x300;
-const ARM64_CPP_CERR_OBJECT_OFFSET: u64 = 0x400;
-const ARM64_CPP_CIN_OBJECT_OFFSET: u64 = 0x500;
-const ARM64_CPP_CTYPE_ID_OFFSET: u64 = 0x600;
 
 /// Build a synthetic trampoline that invokes each
 /// `__mod_init_func` entry in order, then tail-jumps to the real
@@ -213,113 +201,6 @@ fn build_mod_init_trampoline(
     Ok(Some(base))
 }
 
-/// Allocate and initialize a fake C++ data-symbol region.
-///
-/// Returns a map of known C++ data-symbol names → resolved
-/// addresses. Pass it to `process_chained_fixups_with_binary` as
-/// `data_symbols` so the chain walker patches data binds (like
-/// `__ZNSt3__14cerrE`) into this region instead of a function
-/// stub. The fake region survives for the lifetime of the
-/// emulator process and is never read by anything else, so the
-/// initial layout is locked in here and not rebuilt.
-fn setup_arm64_cpp_data_region(
-    emulator: &mut UnicornEmulator,
-    mmap_next: &Arc<AtomicU64>,
-    mmap_end: u64,
-    done_addr: u64,
-    trace_bus: &Option<SharedTraceBus>,
-    metadata: &TraceMetadata,
-) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
-    let region_size = ARM64_CPP_DATA_REGION_SIZE;
-    let base = mmap_next.fetch_add(region_size, Ordering::Relaxed);
-    if base.saturating_add(region_size) > mmap_end {
-        // The mmap arena is exhausted — extremely unlikely in
-        // practice (it's 16 GB), but bail rather than wrap.
-        return Err("mmap arena exhausted while allocating C++ data region".into());
-    }
-    // The mmap arena overlaps the already-mapped heap region in
-    // arm64 bootstrap layout (see memory_arena::arm64) so we
-    // don't need to (and can't) re-map here. Just zero the slice.
-    let zeros = vec![0u8; region_size as usize];
-    emulator.write_memory(base, &zeros)?;
-
-    // Populate one ABI-shaped vtable placeholder: offset-to-top,
-    // typeinfo, then a modest run of return-zero entries. Imported
-    // vtable symbols resolve to the address point, matching the value
-    // guest objects normally store in their vptr slot.
-    let vtable_storage_addr = base + ARM64_CPP_VTABLE_STORAGE_OFFSET;
-    let vtable_addr = vtable_storage_addr + 16;
-    emulator.write_memory(vtable_storage_addr, &0u64.to_le_bytes())?;
-    emulator.write_memory(vtable_storage_addr + 8, &0u64.to_le_bytes())?;
-    for i in 0..32 {
-        emulator.write_memory(vtable_addr + i * 8, &done_addr.to_le_bytes())?;
-    }
-
-    // Minimal iostream global placeholders: just enough object shape
-    // for imports that load `std::cerr`/`std::cin` as data symbols.
-    let cerr_addr = base + ARM64_CPP_CERR_OBJECT_OFFSET;
-    emulator.write_memory(cerr_addr, &vtable_addr.to_le_bytes())?;
-    let cin_addr = base + ARM64_CPP_CIN_OBJECT_OFFSET;
-    emulator.write_memory(cin_addr, &vtable_addr.to_le_bytes())?;
-    let ctype_id_addr = base + ARM64_CPP_CTYPE_ID_OFFSET;
-    // ctype::id is a small std::locale::id object; a single zeroed
-    // page is enough — the C++ runtime only uses it for identity
-    // comparisons.
-
-    let mut data_symbols: HashMap<String, u64> = HashMap::new();
-
-    // C++ globals (std::cerr / std::cin) — instances.
-    data_symbols.insert("__ZNSt3__14cerrE".to_string(), cerr_addr);
-    data_symbols.insert("__ZNSt3__14cinE".to_string(), cin_addr);
-    data_symbols.insert("__ZNSt3__15wcerrE".to_string(), cerr_addr);
-    data_symbols.insert("__ZNSt3__15wcinE".to_string(), cin_addr);
-    data_symbols.insert("__ZNSt3__15ctypeIcE2idE".to_string(), ctype_id_addr);
-
-    // C++ vtable and VTT symbols. These remain placeholders, but
-    // they are ABI-shaped data placeholders rather than per-sample
-    // crash pads.
-    let vtable_names = [
-        "__ZTVNSt3__18ios_baseE",
-        "__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE",
-        "__ZTVNSt3__113basic_ostreamIcNS_11char_traitsIcEEEE",
-        "__ZTVNSt3__113basic_istreamIcNS_11char_traitsIcEEEE",
-        "__ZTVNSt3__115basic_streambufIcNS_11char_traitsIcEEEE",
-        "__ZTVNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
-        "__ZTVNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
-        "__ZTVNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
-        "__ZTVNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
-        "__ZTVNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
-    ];
-    for name in vtable_names {
-        data_symbols.insert(name.to_string(), vtable_addr);
-    }
-
-    let vtt_addr = base + ARM64_CPP_VTT_OFFSET;
-    for i in 0..8 {
-        emulator.write_memory(vtt_addr + i * 8, &vtable_addr.to_le_bytes())?;
-    }
-    for name in [
-        "__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
-        "__ZTTNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
-        "__ZTTNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
-        "__ZTTNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
-    ] {
-        data_symbols.insert(name.to_string(), vtt_addr);
-    }
-
-    if let Some(bus) = trace_bus {
-        let _ = bus.send(
-            memory_event(metadata, "cpp-data-region")
-                .arg("Base", format!("0x{:X}", base))
-                .arg("Size", format!("0x{:X}", region_size))
-                .arg("VTable", format!("0x{:X}", vtable_addr))
-                .arg("Vtt", format!("0x{:X}", vtt_addr))
-                .arg("Cerr", format!("0x{:X}", cerr_addr)),
-        );
-    }
-    Ok(data_symbols)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndirectBranchMode {
     Fast,
@@ -456,28 +337,24 @@ pub fn emulate_macos_arm64_binary_with_mode(
         stub_map.entry(normalized).or_insert(addr);
     }
 
-    // Build a fake C++ data-symbol region so chained-fixups can
-    // bind C++ globals (std::cerr, vtables) to a region that won't
-    // crash when the binary dereferences them as ostream/vtable
-    // pointers. Without this, the chained-fixups walker binds
-    // every C++ data symbol to a function stub address, and the
-    // first time the C++ code does `ldr xN, [cerr_slot]` followed
-    // by `ldr xN, [xN]` (vtable load) it fetches 8 bytes of stub
-    // code (`mov x0,0; ret` = 0xd65f03c0d2800000) as data and the
-    // next vtable-relative LDUR faults on the bogus address.
-    let cpp_data_symbols = match setup_arm64_cpp_data_region(
-        &mut emulator,
-        &mmap_next,
-        mmap_end,
-        done_addr,
-        &trace_bus,
-        &metadata,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[CPP-DATA-REGION] setup failed: {}", e);
-            HashMap::new()
+    let analysis_hooks = AnalysisRuntimeHooks::for_mode(runtime_mode);
+    let cpp_data_symbols = if analysis_hooks.is_enabled() {
+        match setup_analysis_arm64_cpp_data_region(
+            &mut emulator,
+            &mmap_next,
+            mmap_end,
+            done_addr,
+            &trace_bus,
+            &metadata,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[CPP-DATA-REGION] setup failed: {}", e);
+                HashMap::new()
+            }
         }
+    } else {
+        HashMap::new()
     };
 
     // Apply LC_DYLD_CHAINED_FIXUPS: walk every chain in the data
@@ -514,194 +391,100 @@ pub fn emulate_macos_arm64_binary_with_mode(
             }
         }
     }
-    // Install C++ ostream stub overrides. Without these, every
-    // operator<< call construct/destructs a sentry but never
-    // writes — and `basic_ostream::write` silently returns 0
-    // instead of producing the actual message bytes. Wire these
-    // up after install_return_stubs so the stub addresses are
-    // already populated.
-    install_arm64_cpp_imports(
-        &mut emulator,
-        &stub_map,
-        &mmap_next,
-        mmap_end,
-        &trace_bus,
-        &import_tracker,
-        &process_name,
-    )?;
-
-    // Optional: bypass the obfuscated argc/usage decision so the
-    // profile collection path runs even when the binary's argc
-    // check is broken or expects an environment we don't
-    // synthesize. Set `MACHINA_BYPASS_USAGE_CHECK=<comma-list of
-    // hex addresses>` to override the bool functions at those
-    // PCs to return 0 (skip-usage path). Specific to the Mach-O
-    // Man profiler — the obfuscator wraps the real
-    // `should_print_usage` check in
-    // `sub_10022AE68 → sub_10022AE90 → sub_10022AEB4 →
-    // sub_10022AED4: return sub_100232C28() == 0`, where
-    // `sub_100232C28 → sub_100232C58` is an obfuscated argc
-    // probe IDA gave up on.
-    // Optional: install probe hooks at known function entry
-    // points to surface which paths the binary actually runs.
-    // Pass `MACHINA_TRACE_FN_ENTRY=<name>:<hex addr>,...` (no
-    // colons in the name; use any human-readable label). Each
-    // address gets a code hook that emits a `function-entry`
-    // JSONL event when execution reaches it. The probe is
-    // non-modifying: it logs and falls through.
-    if let Ok(spec) = std::env::var("MACHINA_TRACE_FN_ENTRY") {
-        for entry in spec.split(',') {
-            let Some((label, addr_str)) = entry.trim().split_once(':') else {
-                continue;
-            };
-            let stripped = addr_str.trim_start_matches("0x").trim_start_matches("0X");
-            let addr = match u64::from_str_radix(stripped, 16) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let label_owned = label.to_string();
-            let trace_bus_for_hook = trace_bus.clone();
-            let proc_name = process_name.to_string();
-            emulator.add_code_hook(
-                addr,
-                addr + 4,
-                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
-                    let x0 = emu.read_reg("x0").unwrap_or(0);
-                    let x1 = emu.read_reg("x1").unwrap_or(0);
-                    let lr = emu.read_reg("lr").unwrap_or(0);
-                    if let Some(bus) = &trace_bus_for_hook {
-                        let _ = bus.send(
-                            process_event(
-                                &runtime_process_metadata(proc_name.clone()),
-                                "function-entry",
-                                "function_entry",
-                            )
-                            .arg("Label", label_owned.clone())
-                            .arg("Pc", format!("0x{:X}", addr))
-                            .arg("X0", format!("0x{:X}", x0))
-                            .arg("X1", format!("0x{:X}", x1))
-                            .arg("Lr", format!("0x{:X}", lr)),
-                        );
-                    }
-                },
-            )?;
-        }
+    if analysis_hooks.is_enabled() {
+        install_analysis_arm64_cpp_imports(
+            &mut emulator,
+            &stub_map,
+            &mmap_next,
+            mmap_end,
+            &trace_bus,
+            &import_tracker,
+            &process_name,
+        )?;
     }
 
-    if let Ok(pcs) = std::env::var("MACHINA_BYPASS_USAGE_CHECK") {
-        // Tokens are separated by `;`. Each token is one of:
-        //   `0xADDR`                       — return 0 for every call
-        //   `0xADDR@0xLR=VAL`              — return VAL only when LR matches
-        //   `0xADDR=VAL`                   — return VAL (hex/dec) for every call
-        //   `0xADDR=VAL0,VAL1,VAL2`        — return VALn for the n-th call;
-        //                                    after the list is exhausted the
-        //                                    last value is reused. Useful when
-        //                                    the same wrapper is invoked from
-        //                                    multiple call sites that each
-        //                                    expect a different boolean answer
-        //                                    (Mach-O Man's `sub_10022AE68` is
-        //                                    called once for the usage decision
-        //                                    and then once per URL-prefix check).
-        // Backwards-compatibility: a single `,`-separated list with no
-        // semicolons still parses as ONE hook with a value sequence,
-        // matching the previous comma-only form when only addresses
-        // were used.
-        let token_iter: Box<dyn Iterator<Item = &str>> = if pcs.contains(';') {
-            Box::new(pcs.split(';'))
-        } else if pcs.split(',').all(|t| !t.contains('=')) {
-            // Legacy form: comma-separated list of addresses.
-            Box::new(pcs.split(','))
-        } else {
-            // Single hook with a value sequence.
-            Box::new(std::iter::once(pcs.as_str()))
-        };
-        for token in token_iter {
-            let token = token.trim();
-            if token.is_empty() {
-                continue;
-            }
-            let (addr_str, values_str) = match token.split_once('=') {
-                Some((a, v)) => (a, v),
-                None => (token, "0"),
-            };
-            let (addr_str, lr_filter) = match addr_str.split_once('@') {
-                Some((a, lr)) => {
-                    let stripped = lr.trim().trim_start_matches("0x").trim_start_matches("0X");
-                    let Ok(lr) = u64::from_str_radix(stripped, 16) else {
-                        continue;
-                    };
-                    (a, Some(lr))
+    for spec in analysis_hooks.function_entry_specs_from_env() {
+        let label_owned = spec.label;
+        let addr = spec.addr;
+        let trace_bus_for_hook = trace_bus.clone();
+        let proc_name = process_name.to_string();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let x0 = emu.read_reg("x0").unwrap_or(0);
+                let x1 = emu.read_reg("x1").unwrap_or(0);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                if let Some(bus) = &trace_bus_for_hook {
+                    let _ = bus.send(
+                        process_event(
+                            &runtime_process_metadata(proc_name.clone()),
+                            "function-entry",
+                            "function_entry",
+                        )
+                        .arg("Label", label_owned.clone())
+                        .arg("Pc", format!("0x{:X}", addr))
+                        .arg("X0", format!("0x{:X}", x0))
+                        .arg("X1", format!("0x{:X}", x1))
+                        .arg("Lr", format!("0x{:X}", lr)),
+                    );
                 }
-                None => (addr_str, None),
-            };
-            let addr = match u64::from_str_radix(
-                addr_str
-                    .trim()
-                    .trim_start_matches("0x")
-                    .trim_start_matches("0X"),
-                16,
-            ) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let parse_val = |s: &str| -> u64 {
-                let s = s.trim();
-                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    u64::from_str_radix(hex, 16).unwrap_or(0)
+            },
+        )?;
+    }
+
+    for spec in analysis_hooks.usage_bypass_specs_from_env() {
+        let addr = spec.addr;
+        let lr_filter = spec.lr_filter;
+        let values = spec.values;
+        let trace_bus_for_hook = trace_bus.clone();
+        let proc_name = process_name.to_string();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let x0_in = emu.read_reg("x0").unwrap_or(0);
+                let x1_in = emu.read_reg("x1").unwrap_or(0);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                if lr_filter.is_some_and(|expected| expected != lr) {
+                    return;
+                }
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let value = if values.is_empty() {
+                    0
+                } else if n < values.len() {
+                    values[n]
                 } else {
-                    s.parse::<u64>().unwrap_or(0)
+                    *values.last().unwrap()
+                };
+                let _ = emu.write_reg("x0", value);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
                 }
-            };
-            let values: Vec<u64> = values_str.split(',').map(parse_val).collect();
-            let trace_bus_for_hook = trace_bus.clone();
-            let proc_name = process_name.to_string();
-            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            emulator.add_code_hook(
-                addr,
-                addr + 4,
-                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
-                    let x0_in = emu.read_reg("x0").unwrap_or(0);
-                    let x1_in = emu.read_reg("x1").unwrap_or(0);
-                    let lr = emu.read_reg("lr").unwrap_or(0);
-                    if lr_filter.is_some_and(|expected| expected != lr) {
-                        return;
-                    }
-                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let value = if values.is_empty() {
-                        0
-                    } else if n < values.len() {
-                        values[n]
-                    } else {
-                        *values.last().unwrap()
-                    };
-                    let _ = emu.write_reg("x0", value);
-                    if lr != 0 {
-                        let _ = emu.write_reg("pc", lr);
-                    }
-                    if let Some(bus) = &trace_bus_for_hook {
-                        let _ = bus.send(
-                            process_event(
-                                &runtime_process_metadata(proc_name.clone()),
-                                "bypass-usage-check",
-                                "bypass_usage_check",
-                            )
-                            .arg("Pc", format!("0x{:X}", addr))
-                            .arg("CallIndex", n.to_string())
-                            .arg("ReturnValue", format!("0x{:X}", value))
-                            .arg("X0In", format!("0x{:X}", x0_in))
-                            .arg("X1In", format!("0x{:X}", x1_in))
-                            .arg("Lr", format!("0x{:X}", lr))
-                            .arg(
-                                "LrFilter",
-                                lr_filter
-                                    .map(|expected| format!("0x{:X}", expected))
-                                    .unwrap_or_else(|| "none".to_string()),
-                            ),
-                        );
-                    }
-                },
-            )?;
-        }
+                if let Some(bus) = &trace_bus_for_hook {
+                    let _ = bus.send(
+                        process_event(
+                            &runtime_process_metadata(proc_name.clone()),
+                            "bypass-usage-check",
+                            "bypass_usage_check",
+                        )
+                        .arg("Pc", format!("0x{:X}", addr))
+                        .arg("CallIndex", n.to_string())
+                        .arg("ReturnValue", format!("0x{:X}", value))
+                        .arg("X0In", format!("0x{:X}", x0_in))
+                        .arg("X1In", format!("0x{:X}", x1_in))
+                        .arg("Lr", format!("0x{:X}", lr))
+                        .arg(
+                            "LrFilter",
+                            lr_filter
+                                .map(|expected| format!("0x{:X}", expected))
+                                .unwrap_or_else(|| "none".to_string()),
+                        ),
+                    );
+                }
+            },
+        )?;
     }
 
     let last_stub = import_tracker.last_stub.clone();

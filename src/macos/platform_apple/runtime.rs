@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::macos::capture::lossy_data_preview;
+use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::Emulator;
 
 #[derive(Clone, Debug)]

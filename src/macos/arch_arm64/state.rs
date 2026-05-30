@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
+use crate::macos::analysis::AnalysisRuntimeHooks;
 use crate::macos::{
     AppleRuntime, Arm64SyntheticOsRuntime, Arm64ThreadRuntime, GuestFileTable, GuestPathPolicy,
     GuestProcessBootstrap, RuntimeMode, SyntheticProcess, ARM64_SYNTHETIC_THREAD_STACK_BASE,
@@ -31,6 +32,7 @@ pub struct Arm64SharedState {
     pub thread_runtime: Arc<Mutex<Arm64ThreadRuntime>>,
     pub os_runtime: Arc<Mutex<Arm64SyntheticOsRuntime>>,
     pub apple_runtime: Arc<Mutex<AppleRuntime>>,
+    pub analysis: AnalysisRuntimeHooks,
     pub child_trace_budget: Arc<AtomicUsize>,
 }
 
@@ -94,6 +96,7 @@ pub fn initialize_arm64_shared_state_with_mode(
             ..Default::default()
         })),
         apple_runtime: Arc::new(Mutex::new(AppleRuntime::default())),
+        analysis: AnalysisRuntimeHooks::for_mode(runtime_mode),
         child_trace_budget: Arc::new(AtomicUsize::new(80)),
     }
 }

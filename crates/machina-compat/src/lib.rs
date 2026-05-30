@@ -188,12 +188,19 @@ fn read_cstring<M: GuestMemory + ?Sized>(
     addr: u64,
     max_len: usize,
 ) -> Result<String, GuestMemoryError> {
-    let bytes = memory.read_memory(addr, max_len)?;
-    let nul = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    Ok(String::from_utf8_lossy(&bytes[..nul]).into_owned())
+    let mut bytes = Vec::new();
+    for offset in 0..max_len {
+        let byte = memory
+            .read_memory(addr.saturating_add(offset as u64), 1)?
+            .first()
+            .copied()
+            .ok_or(GuestMemoryError)?;
+        if byte == 0 {
+            break;
+        }
+        bytes.push(byte);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(target_os = "macos")]

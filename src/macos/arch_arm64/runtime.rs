@@ -73,9 +73,6 @@ pub struct SyntheticPipe {
     pub buffer: VecDeque<u8>,
     pub read_open: bool,
     pub write_open: bool,
-    pub capture_label: Option<String>,
-    pub capture_consumer_pid: Option<u64>,
-    pub captured_data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

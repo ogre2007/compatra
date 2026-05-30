@@ -1,4 +1,4 @@
-//! C++ libc++ import hooks for arm64.
+//! arm64 C++/libc++ hooks used by analysis mode.
 //!
 //! These hooks cover small, well-defined libc++ functions that commonly appear
 //! as imported symbols in no-dyld Mach-O runs. They intentionally model function
@@ -10,8 +10,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::macos::arm64_runner_support::Arm64ImportTracker;
-use crate::macos::{process_event, runtime_process_metadata, SharedTraceBus};
+use crate::macos::{
+    memory_event, process_event, runtime_process_metadata, SharedTraceBus, TraceMetadata,
+};
 use crate::{Emulator, UnicornEmulator};
+
+/// Size of the fake C++ data region carved out of the mmap arena.
+/// Large enough to host a generic ostream object, a small vtable
+/// table, and a few extra fake-data symbols (ctype::id, etc.)
+/// without bumping into surrounding allocations.
+const ARM64_CPP_DATA_REGION_SIZE: u64 = 0x2000;
+
+/// Offsets inside the C++ data region for each kind of fake symbol.
+/// The region only supplies imported data symbols with stable data-shaped
+/// addresses; libc++ behavior belongs in the hooks below.
+const ARM64_CPP_VTABLE_STORAGE_OFFSET: u64 = 0x100;
+const ARM64_CPP_VTT_OFFSET: u64 = 0x300;
+const ARM64_CPP_CERR_OBJECT_OFFSET: u64 = 0x400;
+const ARM64_CPP_CIN_OBJECT_OFFSET: u64 = 0x500;
+const ARM64_CPP_CTYPE_ID_OFFSET: u64 = 0x600;
 
 const SENTRY_C1_SYMBOL: &str = "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_";
 const ISTREAM_SENTRY_C1_SYMBOL: &str =
@@ -61,6 +78,94 @@ const LIBCPP_SHORT_MAX: usize = 22;
 const MAX_SYNTHETIC_STRING_LEN: usize = 0x10_000;
 const ALT_LONG_FLAG: u64 = 1u64 << 63;
 const NPOS: usize = usize::MAX;
+
+/// Allocate and initialize a fake C++ data-symbol region.
+///
+/// Returns a map of known C++ data-symbol names -> resolved
+/// addresses. Pass it to `process_chained_fixups_with_binary` as
+/// `data_symbols` so the chain walker patches data binds (like
+/// `__ZNSt3__14cerrE`) into this region instead of a function
+/// stub.
+pub fn setup_analysis_arm64_cpp_data_region(
+    emulator: &mut UnicornEmulator,
+    mmap_next: &Arc<AtomicU64>,
+    mmap_end: u64,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
+    let region_size = ARM64_CPP_DATA_REGION_SIZE;
+    let base = mmap_next.fetch_add(region_size, Ordering::Relaxed);
+    if base.saturating_add(region_size) > mmap_end {
+        return Err("mmap arena exhausted while allocating C++ data region".into());
+    }
+
+    let zeros = vec![0u8; region_size as usize];
+    emulator.write_memory(base, &zeros)?;
+
+    let vtable_storage_addr = base + ARM64_CPP_VTABLE_STORAGE_OFFSET;
+    let vtable_addr = vtable_storage_addr + 16;
+    emulator.write_memory(vtable_storage_addr, &0u64.to_le_bytes())?;
+    emulator.write_memory(vtable_storage_addr + 8, &0u64.to_le_bytes())?;
+    for i in 0..32 {
+        emulator.write_memory(vtable_addr + i * 8, &done_addr.to_le_bytes())?;
+    }
+
+    let cerr_addr = base + ARM64_CPP_CERR_OBJECT_OFFSET;
+    emulator.write_memory(cerr_addr, &vtable_addr.to_le_bytes())?;
+    let cin_addr = base + ARM64_CPP_CIN_OBJECT_OFFSET;
+    emulator.write_memory(cin_addr, &vtable_addr.to_le_bytes())?;
+    let ctype_id_addr = base + ARM64_CPP_CTYPE_ID_OFFSET;
+
+    let mut data_symbols: HashMap<String, u64> = HashMap::new();
+
+    data_symbols.insert("__ZNSt3__14cerrE".to_string(), cerr_addr);
+    data_symbols.insert("__ZNSt3__14cinE".to_string(), cin_addr);
+    data_symbols.insert("__ZNSt3__15wcerrE".to_string(), cerr_addr);
+    data_symbols.insert("__ZNSt3__15wcinE".to_string(), cin_addr);
+    data_symbols.insert("__ZNSt3__15ctypeIcE2idE".to_string(), ctype_id_addr);
+
+    let vtable_names = [
+        "__ZTVNSt3__18ios_baseE",
+        "__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__113basic_ostreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__113basic_istreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__115basic_streambufIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
+        "__ZTVNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTVNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTVNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+    ];
+    for name in vtable_names {
+        data_symbols.insert(name.to_string(), vtable_addr);
+    }
+
+    let vtt_addr = base + ARM64_CPP_VTT_OFFSET;
+    for i in 0..8 {
+        emulator.write_memory(vtt_addr + i * 8, &vtable_addr.to_le_bytes())?;
+    }
+    for name in [
+        "__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
+        "__ZTTNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
+        "__ZTTNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTTNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+    ] {
+        data_symbols.insert(name.to_string(), vtt_addr);
+    }
+
+    if let Some(bus) = trace_bus {
+        let _ = bus.send(
+            memory_event(metadata, "cpp-data-region")
+                .arg("Base", format!("0x{:X}", base))
+                .arg("Size", format!("0x{:X}", region_size))
+                .arg("VTable", format!("0x{:X}", vtable_addr))
+                .arg("Vtt", format!("0x{:X}", vtt_addr))
+                .arg("Cerr", format!("0x{:X}", cerr_addr)),
+        );
+    }
+    Ok(data_symbols)
+}
 
 #[derive(Clone)]
 struct DecodedString {
@@ -294,7 +399,7 @@ fn record_import(tracker: &Arm64ImportTracker, name: &str, address: u64) {
     }
 }
 
-pub fn install_arm64_cpp_imports(
+pub fn install_analysis_arm64_cpp_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
     mmap_next: &Arc<AtomicU64>,

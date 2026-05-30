@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::macos::analysis::AnalysisServices;
 use crate::macos::arm64_io_imports::allocate_arm64_heap;
 use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
@@ -44,7 +43,7 @@ fn install_posix_spawn_hook(
     let thread_runtime = shared_state.thread_runtime.clone();
     let import_tracker = import_tracker.clone();
     let trace_bus_for_hook = trace_bus.clone();
-    let analysis = AnalysisServices::for_mode(shared_state.runtime_mode);
+    let analysis = shared_state.analysis.clone();
     // Per-installation sequence counter so multiple `posix_spawnp`
     // calls from the same parent get distinct dump files.
     let spawn_sequence = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -69,7 +68,7 @@ fn install_posix_spawn_hook(
                 .ok()
                 .and_then(|actions| actions.get(&file_actions_ptr).cloned())
                 .unwrap_or_default();
-            let log_stream = analysis.and_then(|analysis| analysis.synthetic_log_stream(&path, &argv));
+            let log_stream = analysis.synthetic_log_stream(&path, &argv);
             let log_stream_messages = log_stream
                 .as_ref()
                 .map(|stream| stream.messages.clone())
@@ -138,17 +137,14 @@ fn install_posix_spawn_hook(
             );
             let sequence = spawn_sequence
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dump_path = analysis
-                .and_then(|analysis| {
-                    analysis.write_posix_spawn_argv_capture(
-                        current_pid,
-                        child_pid,
-                        sequence,
-                        &path,
-                        &argv,
-                        envp_ptr,
-                    )
-                });
+            let dump_path = analysis.write_posix_spawn_argv_capture(
+                current_pid,
+                child_pid,
+                sequence,
+                &path,
+                &argv,
+                envp_ptr,
+            );
             if let Some(dump_path) = &dump_path {
                 println!(
                     "[CAPTURE][arm64] posix-spawn argv pid={} tid={} child_pid={} seq={} path={} dump={}",
@@ -285,7 +281,7 @@ pub fn install_arm64_process_imports(
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let analysis = AnalysisServices::for_mode(shared_state.runtime_mode);
+    let analysis = shared_state.analysis.clone();
     install_posix_spawn_file_action_hooks(emulator, stub_map, shared_state, import_tracker)?;
 
     if let Some(&addr) = stub_map.get("_popen") {
@@ -762,18 +758,14 @@ pub fn install_arm64_process_imports(
                     if let Some(proc_state) = os.processes.get_mut(&current_pid) {
                         proc_state.exec_path = Some(path.clone());
                     }
-                    if let Some(analysis) = analysis {
-                        if let Some(SyntheticFdTarget::PipeRead(pipe_id)) =
-                            resolve_process_fd_target(&os, current_pid, 0)
-                        {
-                            if let Some(pipe) = os.pipes.get_mut(&pipe_id) {
-                                pipe.capture_label =
-                                    Some(analysis.process_stdin_capture_label(
-                                        current_pid,
-                                        &path,
-                                        &argv,
-                                    ));
-                                pipe.capture_consumer_pid = Some(current_pid);
+                    if let Some(SyntheticFdTarget::PipeRead(pipe_id)) =
+                        resolve_process_fd_target(&os, current_pid, 0)
+                    {
+                        if let Some(pipe) = os.pipes.get(&pipe_id) {
+                            if analysis
+                                .arm_pipe_stdin_capture(pipe_id, current_pid, &path, &argv)
+                                .is_some()
+                            {
                                 stdin_capture_info = Some((pipe_id, pipe.read_fd, pipe.write_fd));
                             }
                         }
