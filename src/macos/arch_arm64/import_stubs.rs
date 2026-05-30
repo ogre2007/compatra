@@ -108,6 +108,8 @@ fn arm64_static_symbol_has_exact_hook(symbol: &str) -> bool {
             | "_dup2"
             | "_read"
             | "_readdir_r"
+            | "_stat"
+            | "_lstat"
             | "_fstat"
             | "_getcwd"
             | "_getrlimit"
@@ -120,6 +122,18 @@ fn arm64_static_symbol_has_exact_hook(symbol: &str) -> bool {
             | "_sysctl"
             | "_sysctlbyname"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_stat_imports_are_handled_by_exact_hooks() {
+        assert!(arm64_static_symbol_has_exact_hook("_stat"));
+        assert!(arm64_static_symbol_has_exact_hook("_lstat"));
+        assert!(arm64_static_symbol_has_exact_hook("_fstat"));
+    }
 }
 
 pub fn install_arm64_return_stubs(

@@ -1,7 +1,7 @@
 //! Compatibility-mode host service boundary.
 
 #[cfg(target_os = "macos")]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "macos")]
@@ -3099,6 +3099,83 @@ fn host_dir_handles() -> &'static Mutex<std::collections::HashMap<u64, HostDirHa
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct HostFdReadiness {
+    pipe_write_to_read: HashMap<libc::c_int, libc::c_int>,
+    pending_read_bytes: HashMap<libc::c_int, usize>,
+}
+
+#[cfg(target_os = "macos")]
+fn host_fd_readiness() -> &'static Mutex<HostFdReadiness> {
+    static READINESS: OnceLock<Mutex<HostFdReadiness>> = OnceLock::new();
+    READINESS.get_or_init(|| Mutex::new(HostFdReadiness::default()))
+}
+
+#[cfg(target_os = "macos")]
+fn note_host_pipe(read_fd: libc::c_int, write_fd: libc::c_int) {
+    if let Ok(mut readiness) = host_fd_readiness().lock() {
+        readiness.pipe_write_to_read.insert(write_fd, read_fd);
+        readiness.pending_read_bytes.entry(read_fd).or_default();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn note_host_fd_write(fd: u64, ret: isize) {
+    if ret <= 0 {
+        return;
+    }
+    let fd = fd as libc::c_int;
+    if let Ok(mut readiness) = host_fd_readiness().lock() {
+        let Some(read_fd) = readiness.pipe_write_to_read.get(&fd).copied() else {
+            return;
+        };
+        let pending = readiness.pending_read_bytes.entry(read_fd).or_default();
+        *pending = pending.saturating_add(ret as usize);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn note_host_fd_read(fd: u64, ret: isize) {
+    if ret <= 0 {
+        return;
+    }
+    let fd = fd as libc::c_int;
+    if let Ok(mut readiness) = host_fd_readiness().lock() {
+        if let Some(pending) = readiness.pending_read_bytes.get_mut(&fd) {
+            *pending = pending.saturating_sub(ret as usize);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn note_host_fd_dup(from: u64, to: libc::c_int) {
+    if to < 0 {
+        return;
+    }
+    let from = from as libc::c_int;
+    if let Ok(mut readiness) = host_fd_readiness().lock() {
+        if let Some(read_fd) = readiness.pipe_write_to_read.get(&from).copied() {
+            readiness.pipe_write_to_read.insert(to, read_fd);
+        }
+        if let Some(pending) = readiness.pending_read_bytes.get(&from).copied() {
+            readiness.pending_read_bytes.insert(to, pending);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn note_host_fd_close(fd: u64) {
+    let fd = fd as libc::c_int;
+    if let Ok(mut readiness) = host_fd_readiness().lock() {
+        readiness.pipe_write_to_read.remove(&fd);
+        readiness
+            .pipe_write_to_read
+            .retain(|_write_fd, read_fd| *read_fd != fd);
+        readiness.pending_read_bytes.remove(&fd);
+    }
+}
+
+#[cfg(target_os = "macos")]
 extern "C" {
     fn inet_pton(af: libc::c_int, src: *const libc::c_char, dst: *mut libc::c_void) -> libc::c_int;
     fn inet_ntop(
@@ -3455,6 +3532,7 @@ fn proxy_host_read<M: GuestMemory + ?Sized>(
             });
         }
         data.truncate(read_len.min(128));
+        note_host_fd_read(fd, ret);
     } else {
         data.clear();
     }
@@ -3485,6 +3563,7 @@ fn proxy_host_write<M: GuestMemory + ?Sized>(
     };
     clear_errno();
     let ret = unsafe { libc::write(fd as libc::c_int, data.as_ptr().cast(), data.len()) };
+    note_host_fd_write(fd, ret);
     Some(host_io_result(ret, data[..data.len().min(128)].to_vec()))
 }
 
@@ -3492,6 +3571,9 @@ fn proxy_host_write<M: GuestMemory + ?Sized>(
 fn proxy_host_close(fd: u64) -> Option<HostIoResult> {
     clear_errno();
     let ret = unsafe { libc::close(fd as libc::c_int) };
+    if ret == 0 {
+        note_host_fd_close(fd);
+    }
     Some(host_io_result(ret as isize, Vec::new()))
 }
 
@@ -4758,6 +4840,7 @@ fn proxy_host_readv<M: GuestMemory + ?Sized>(
         if let Err(errno) = write_guest_iovec_bytes(memory, &iovecs, &buffers, read_len) {
             return Some(host_io_error(errno));
         }
+        note_host_fd_read(fd, ret);
     }
     let preview = if ret > 0 {
         preview_iovec_bytes(&buffers)
@@ -4795,6 +4878,7 @@ fn proxy_host_writev<M: GuestMemory + ?Sized>(
             host_iovecs.len() as libc::c_int,
         )
     };
+    note_host_fd_write(fd, ret);
     Some(host_io_result(ret, preview))
 }
 
@@ -4873,6 +4957,9 @@ fn proxy_host_lseek(fd: u64, offset: u64, whence: u64) -> Option<HostIoResult> {
 fn proxy_host_dup(fd: u64) -> Option<HostIoResult> {
     clear_errno();
     let ret = unsafe { libc::dup(fd as libc::c_int) };
+    if ret >= 0 {
+        note_host_fd_dup(fd, ret);
+    }
     Some(host_io_result(ret as isize, Vec::new()))
 }
 
@@ -4880,6 +4967,9 @@ fn proxy_host_dup(fd: u64) -> Option<HostIoResult> {
 fn proxy_host_dup2(from: u64, to: u64) -> Option<HostIoResult> {
     clear_errno();
     let ret = unsafe { libc::dup2(from as libc::c_int, to as libc::c_int) };
+    if ret >= 0 {
+        note_host_fd_dup(from, ret);
+    }
     Some(host_io_result(ret as isize, Vec::new()))
 }
 
@@ -4899,6 +4989,7 @@ fn proxy_host_pipe<M: GuestMemory + ?Sized>(memory: &mut M, fds_ptr: u64) -> Opt
             let _ = unsafe { libc::close(fds[1]) };
             return Some(host_io_error(libc::EFAULT as u32));
         }
+        note_host_pipe(fds[0], fds[1]);
     }
     Some(host_io_result(ret as isize, Vec::new()))
 }
@@ -5002,10 +5093,24 @@ fn proxy_host_select<M: GuestMemory + ?Sized>(
     let mut ready_read = collect_ready_host_fd_set(readfds.as_ref(), read_host.as_ref());
     let ready_write = collect_ready_host_fd_set(writefds.as_ref(), write_host.as_ref());
     let ready_except = collect_ready_host_fd_set(exceptfds.as_ref(), except_host.as_ref());
+    let inferred_readfds = infer_single_read_fd(readfds.as_ref(), readfds_ptr, nfds);
+    let fallback_readfds = inferred_readfds.as_ref().or(readfds.as_ref());
     if ready_read.is_empty() {
-        ready_read = collect_fionread_ready(readfds.as_ref());
+        ready_read = collect_tracked_read_ready(readfds.as_ref());
+        if ready_read.is_empty() {
+            ready_read = collect_fionread_ready(readfds.as_ref());
+        }
         if ready_read.is_empty() {
             ready_read = collect_poll_ready(readfds.as_ref());
+        }
+        if ready_read.is_empty() && inferred_readfds.is_some() {
+            ready_read = collect_tracked_read_ready(fallback_readfds);
+            if ready_read.is_empty() {
+                ready_read = collect_fionread_ready(fallback_readfds);
+            }
+            if ready_read.is_empty() {
+                ready_read = collect_poll_ready(fallback_readfds);
+            }
         }
         if !ready_read.is_empty() {
             ret = ret.max(ready_read.len() as libc::c_int);
@@ -5016,7 +5121,7 @@ fn proxy_host_select<M: GuestMemory + ?Sized>(
         }
     }
 
-    if let Err(errno) = write_darwin_fd_set(memory, readfds_ptr, readfds.as_ref(), &ready_read)
+    if let Err(errno) = write_darwin_fd_set(memory, readfds_ptr, fallback_readfds, &ready_read)
         .and_then(|_| write_darwin_fd_set(memory, writefds_ptr, writefds.as_ref(), &ready_write))
         .and_then(|_| write_darwin_fd_set(memory, exceptfds_ptr, exceptfds.as_ref(), &ready_except))
     {
@@ -5131,6 +5236,45 @@ fn collect_ready_host_fd_set(
     for fd in original {
         let is_ready = unsafe { libc::FD_ISSET(*fd, host.as_ptr()) };
         if is_ready {
+            ready.insert(*fd);
+        }
+    }
+    ready
+}
+
+#[cfg(target_os = "macos")]
+fn infer_single_read_fd(
+    original: Option<&HashSet<libc::c_int>>,
+    readfds_ptr: u64,
+    nfds: u64,
+) -> Option<HashSet<libc::c_int>> {
+    if readfds_ptr == 0 || !original.is_some_and(HashSet::is_empty) || nfds == 0 {
+        return None;
+    }
+    let fd = nfds.checked_sub(1)? as libc::c_int;
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+        return None;
+    }
+    Some(HashSet::from([fd]))
+}
+
+#[cfg(target_os = "macos")]
+fn collect_tracked_read_ready(original: Option<&HashSet<libc::c_int>>) -> HashSet<libc::c_int> {
+    let mut ready = HashSet::new();
+    let Some(original) = original else {
+        return ready;
+    };
+    let Ok(readiness) = host_fd_readiness().lock() else {
+        return ready;
+    };
+    for fd in original {
+        if readiness
+            .pending_read_bytes
+            .get(fd)
+            .copied()
+            .unwrap_or_default()
+            > 0
+        {
             ready.insert(*fd);
         }
     }
@@ -7064,5 +7208,41 @@ mod tests {
             ),
             "compat dlsym path\n"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pipe_readiness_cache_marks_read_end_ready() {
+        let read_fd = 700;
+        let write_fd = 701;
+        note_host_fd_close(read_fd as u64);
+        note_host_fd_close(write_fd as u64);
+
+        note_host_pipe(read_fd, write_fd);
+        let read_set = HashSet::from([read_fd]);
+        assert!(collect_tracked_read_ready(Some(&read_set)).is_empty());
+
+        note_host_fd_write(write_fd as u64, 1);
+        assert_eq!(collect_tracked_read_ready(Some(&read_set)), read_set);
+
+        note_host_fd_read(read_fd as u64, 1);
+        assert!(collect_tracked_read_ready(Some(&read_set)).is_empty());
+
+        note_host_fd_close(read_fd as u64);
+        note_host_fd_close(write_fd as u64);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn select_fallback_can_infer_single_requested_read_fd() {
+        let empty = HashSet::new();
+        let inferred = infer_single_read_fd(Some(&empty), 0x1000, 4)
+            .expect("empty read fd_set with nfds should infer the highest fd");
+        assert_eq!(inferred, HashSet::from([3]));
+
+        let non_empty = HashSet::from([2]);
+        assert!(infer_single_read_fd(Some(&non_empty), 0x1000, 4).is_none());
+        assert!(infer_single_read_fd(Some(&empty), 0, 4).is_none());
+        assert!(infer_single_read_fd(Some(&empty), 0x1000, 0).is_none());
     }
 }
