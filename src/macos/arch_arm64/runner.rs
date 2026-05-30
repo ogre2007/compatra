@@ -578,21 +578,81 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     }
 
     if let Ok(pcs) = std::env::var("MACHINA_BYPASS_USAGE_CHECK") {
-        for token in pcs.split(',') {
+        // Tokens are separated by `;`. Each token is one of:
+        //   `0xADDR`                       — return 0 for every call
+        //   `0xADDR=VAL`                   — return VAL (hex/dec) for every call
+        //   `0xADDR=VAL0,VAL1,VAL2`        — return VALn for the n-th call;
+        //                                    after the list is exhausted the
+        //                                    last value is reused. Useful when
+        //                                    the same wrapper is invoked from
+        //                                    multiple call sites that each
+        //                                    expect a different boolean answer
+        //                                    (Mach-O Man's `sub_10022AE68` is
+        //                                    called once for the usage decision
+        //                                    and then once per URL-prefix check).
+        // Backwards-compatibility: a single `,`-separated list with no
+        // semicolons still parses as ONE hook with a value sequence,
+        // matching the previous comma-only form when only addresses
+        // were used.
+        let token_iter: Box<dyn Iterator<Item = &str>> = if pcs.contains(';') {
+            Box::new(pcs.split(';'))
+        } else if pcs.split(',').all(|t| !t.contains('=')) {
+            // Legacy form: comma-separated list of addresses.
+            Box::new(pcs.split(','))
+        } else {
+            // Single hook with a value sequence.
+            Box::new(std::iter::once(pcs.as_str()))
+        };
+        for token in token_iter {
             let token = token.trim();
-            let stripped = token.trim_start_matches("0x").trim_start_matches("0X");
-            let addr = match u64::from_str_radix(stripped, 16) {
+            if token.is_empty() {
+                continue;
+            }
+            let (addr_str, values_str) = match token.split_once('=') {
+                Some((a, v)) => (a, v),
+                None => (token, "0"),
+            };
+            let addr = match u64::from_str_radix(
+                addr_str.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            ) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            let parse_val = |s: &str| -> u64 {
+                let s = s.trim();
+                if let Some(hex) = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                {
+                    u64::from_str_radix(hex, 16).unwrap_or(0)
+                } else {
+                    s.parse::<u64>().unwrap_or(0)
+                }
+            };
+            let values: Vec<u64> = values_str
+                .split(',')
+                .map(parse_val)
+                .collect();
             let trace_bus_for_hook = trace_bus.clone();
             let proc_name = process_name.to_string();
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             emulator.add_code_hook(
                 addr,
                 addr + 4,
                 move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
-                    let _ = emu.write_reg("x0", 0u64);
+                    let x0_in = emu.read_reg("x0").unwrap_or(0);
+                    let x1_in = emu.read_reg("x1").unwrap_or(0);
                     let lr = emu.read_reg("lr").unwrap_or(0);
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let value = if values.is_empty() {
+                        0
+                    } else if n < values.len() {
+                        values[n]
+                    } else {
+                        *values.last().unwrap()
+                    };
+                    let _ = emu.write_reg("x0", value);
                     if lr != 0 {
                         let _ = emu.write_reg("pc", lr);
                     }
@@ -603,7 +663,12 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
                                 "bypass-usage-check",
                                 "bypass_usage_check",
                             )
-                            .arg("Pc", format!("0x{:X}", addr)),
+                            .arg("Pc", format!("0x{:X}", addr))
+                            .arg("CallIndex", n.to_string())
+                            .arg("ReturnValue", format!("0x{:X}", value))
+                            .arg("X0In", format!("0x{:X}", x0_in))
+                            .arg("X1In", format!("0x{:X}", x1_in))
+                            .arg("Lr", format!("0x{:X}", lr)),
                         );
                     }
                 },
