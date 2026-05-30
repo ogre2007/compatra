@@ -3042,8 +3042,6 @@ const DARWIN_IOVEC_BASE: usize = 0;
 #[cfg(target_os = "macos")]
 const DARWIN_IOVEC_LEN: usize = 8;
 #[cfg(target_os = "macos")]
-const DARWIN_STAT_SIZE: usize = 144;
-#[cfg(target_os = "macos")]
 const DARWIN_STAT_SIZE_OFFSET: usize = 96;
 #[cfg(target_os = "macos")]
 const MAX_GUEST_IOV: usize = 1024;
@@ -3597,11 +3595,10 @@ fn write_darwin_minimal_stat<M: GuestMemory + ?Sized>(
     stat_ptr: u64,
     size: u64,
 ) -> Result<(), u32> {
-    let mut stat = [0u8; DARWIN_STAT_SIZE];
-    stat[DARWIN_STAT_SIZE_OFFSET..DARWIN_STAT_SIZE_OFFSET + 8].copy_from_slice(&size.to_le_bytes());
-    if memory.write_memory(stat_ptr, &stat).is_ok() {
-        return Ok(());
-    }
+    // Small compatibility fixtures and real guests may allocate a Darwin
+    // `struct stat` shape that is smaller than the host Rust libc view. The
+    // size field is the contract used by current compat callers, so write it
+    // directly instead of treating an oversized full-struct write as EFAULT.
     memory
         .write_memory(
             stat_ptr + DARWIN_STAT_SIZE_OFFSET as u64,
@@ -5007,11 +5004,15 @@ fn proxy_host_select<M: GuestMemory + ?Sized>(
     let ready_except = collect_ready_host_fd_set(exceptfds.as_ref(), except_host.as_ref());
     if ready_read.is_empty() {
         ready_read = collect_fionread_ready(readfds.as_ref());
-        if ready_read.is_empty() && readfds_ptr != 0 {
-            ready_read = collect_fionread_ready_range(nfds);
+        if ready_read.is_empty() {
+            ready_read = collect_poll_ready(readfds.as_ref());
         }
         if !ready_read.is_empty() {
             ret = ret.max(ready_read.len() as libc::c_int);
+        } else if ret > 0 {
+            if let Some(original) = readfds.as_ref() {
+                ready_read = original.iter().copied().take(ret as usize).collect();
+            }
         }
     }
 
@@ -5153,15 +5154,31 @@ fn collect_fionread_ready(original: Option<&HashSet<libc::c_int>>) -> HashSet<li
 }
 
 #[cfg(target_os = "macos")]
-fn collect_fionread_ready_range(nfds: u64) -> HashSet<libc::c_int> {
+fn collect_poll_ready(original: Option<&HashSet<libc::c_int>>) -> HashSet<libc::c_int> {
     let mut ready = HashSet::new();
-    let max_fd = nfds.min(libc::FD_SETSIZE as u64);
-    for fd in 0..max_fd {
-        let fd = fd as libc::c_int;
-        let mut available: libc::c_int = 0;
-        let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available as *mut libc::c_int) };
-        if ret == 0 && available > 0 {
-            ready.insert(fd);
+    let Some(original) = original else {
+        return ready;
+    };
+    let mut fds = original
+        .iter()
+        .copied()
+        .filter(|fd| *fd >= 0)
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect::<Vec<_>>();
+    if fds.is_empty() {
+        return ready;
+    }
+    let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+    if ret <= 0 {
+        return ready;
+    }
+    for fd in fds {
+        if (fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+            ready.insert(fd.fd);
         }
     }
     ready

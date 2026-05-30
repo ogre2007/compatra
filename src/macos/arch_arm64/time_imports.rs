@@ -379,7 +379,12 @@ pub fn install_arm64_time_imports(
                 if let Some(compat) = compat_for_hook {
                     if let Some(result) = compat.mach_timebase_info(emu, info_ptr) {
                         let lr = emu.read_reg("lr").unwrap_or(0);
-                        let _ = emu.write_reg("x0", result.return_value);
+                        let return_value = if result.return_value == u64::MAX {
+                            0
+                        } else {
+                            result.return_value
+                        };
+                        let _ = emu.write_reg("x0", return_value);
                         if lr != 0 {
                             let _ = emu.write_reg("pc", lr);
                         }
@@ -387,7 +392,7 @@ pub fn install_arm64_time_imports(
                             &import_tracker,
                             format!(
                                 "_mach_timebase_info(host info=0x{:X}) -> {} errno={:?}",
-                                info_ptr, result.return_value, result.errno
+                                info_ptr, return_value, result.errno
                             ),
                         );
                         return;
