@@ -1512,6 +1512,8 @@ typedef long (*telldir_fn)(DIR *);
 typedef void (*seekdir_fn)(DIR *, long);
 typedef int (*getentropy_fn)(void *, size_t);
 
+extern int getentropy(void *, size_t);
+
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
     register long x0 asm("x0") = a0;
     register long x1 asm("x1") = a1;

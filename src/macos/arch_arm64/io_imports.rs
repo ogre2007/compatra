@@ -509,6 +509,8 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let shared_state_for_hook = shared_state.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -524,6 +526,36 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if compat_for_hook.is_some() {
+                    let mut memory = Arm64CompatGuestMemory {
+                        emulator: emu,
+                        shared_state: &shared_state_for_hook,
+                    };
+                    if let Some(result) =
+                        machina_compat::CompatibilityServices.pipe_fds(&mut memory, pipefd_ptr)
+                    {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_pipe(host pipefd=0x{:X}) -> {} errno={}",
+                                pipefd_ptr, result.return_value, result.errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "pipe")
+                            .arg("HostProxy", "true")
+                            .arg("PipefdPtr", format!("0x{:X}", pipefd_ptr))
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", result.errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (read_fd, write_fd) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -1997,6 +2029,7 @@ pub fn install_arm64_io_imports(
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -2014,6 +2047,29 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&thread_id).copied())
                     .unwrap_or(1);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.dup2_fd(oldfd, newfd) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_dup2(host oldfd={}, newfd={}, pid={}, tid={}, lr=0x{:X}) -> {} errno={}",
+                                oldfd,
+                                newfd,
+                                current_pid,
+                                thread_id,
+                                lr,
+                                result.return_value,
+                                result.errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 let result = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,

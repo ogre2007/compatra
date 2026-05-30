@@ -84,6 +84,44 @@ fn arm64_proxy_compat_host_import(
     };
 }
 
+fn arm64_static_symbol_has_exact_hook(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "_pipe"
+            | "_fcntl"
+            | "_memcpy"
+            | "_memmove"
+            | "_memset"
+            | "_memcmp"
+            | "_calloc"
+            | "_cmalloc"
+            | "_realloc"
+            | "_free"
+            | "_sysconf"
+            | "_getenv"
+            | "_strlen"
+            | "_open"
+            | "_opendir"
+            | "_fdopendir"
+            | "_close"
+            | "_closedir"
+            | "_dup2"
+            | "_read"
+            | "_readdir_r"
+            | "_fstat"
+            | "_getcwd"
+            | "_getrlimit"
+            | "_malloc"
+            | "_posix_memalign"
+            | "_write"
+            | "_mach_absolute_time"
+            | "_sleep"
+            | "_usleep"
+            | "_sysctl"
+            | "_sysctlbyname"
+    )
+}
+
 pub fn install_arm64_return_stubs(
     emulator: &mut UnicornEmulator,
     stub_region: StubRegion,
@@ -167,7 +205,9 @@ pub fn install_arm64_return_stubs(
                 );
                 if address == bucket {
                     if let Some(compat) = compat_for_hook {
-                        if compat.should_proxy_import(&name) {
+                        if compat.should_proxy_import(&name)
+                            && !arm64_static_symbol_has_exact_hook(&name)
+                        {
                             arm64_proxy_compat_host_import(
                                 emu,
                                 &name,
