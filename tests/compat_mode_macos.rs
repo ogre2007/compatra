@@ -225,7 +225,7 @@ static int exercise_memstr(
         && cmp_lt < 0
         && ncmp == 0
         && hit_off == 4
-        && last_off == 8;
+        && last_off == 9;
 
     printf(
         "compat memstr %s dst=%s overlap=%s copy=%s dup=%s heap=%s zero_ok=%d pa=%d aligned_mod=%lu memcmp=%d len=%lu cmp=%d cmp_lt=%d ncmp=%d hit=%ld last=%ld ok=%d\n",
@@ -601,21 +601,19 @@ static int text_is(const char *text, const char *expected, unsigned long len) {{
 }}
 
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
-    long ret;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    register long x16 __asm__("x16") = num;
     asm volatile(
-        "mov x0, %[a0]\n"
-        "mov x1, %[a1]\n"
-        "mov x2, %[a2]\n"
-        "mov x3, %[a3]\n"
-        "mov x4, %[a4]\n"
-        "mov x5, %[a5]\n"
-        "mov x16, %[num]\n"
-        "svc #0x80\n"
-        "mov %[ret], x0\n"
-        : [ret] "=r"(ret)
-        : [num] "r"(num), [a0] "r"(a0), [a1] "r"(a1), [a2] "r"(a2), [a3] "r"(a3), [a4] "r"(a4), [a5] "r"(a5)
-        : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "memory", "cc");
-    return ret;
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+        : "memory", "cc");
+    return x0;
 }}
 
 static int pipe_vec_roundtrip(const char *label, pipe_fn pipe_impl, writev_fn writev_impl, readv_fn readv_impl) {{
@@ -1286,21 +1284,19 @@ typedef long (*sysconf_fn)(int);
 typedef int (*sysctlbyname_fn)(const char *, void *, size_t *, void *, size_t);
 
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
-    long ret;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    register long x16 __asm__("x16") = num;
     asm volatile(
-        "mov x0, %[a0]\n"
-        "mov x1, %[a1]\n"
-        "mov x2, %[a2]\n"
-        "mov x3, %[a3]\n"
-        "mov x4, %[a4]\n"
-        "mov x5, %[a5]\n"
-        "mov x16, %[num]\n"
-        "svc #0x80\n"
-        "mov %[ret], x0\n"
-        : [ret] "=r"(ret)
-        : [num] "r"(num), [a0] "r"(a0), [a1] "r"(a1), [a2] "r"(a2), [a3] "r"(a3), [a4] "r"(a4), [a5] "r"(a5)
-        : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "memory", "cc");
-    return ret;
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+        : "memory", "cc");
+    return x0;
 }
 
 int main(void) {
@@ -1529,21 +1525,19 @@ typedef int (*getentropy_fn)(void *, size_t);
 extern int getentropy(void *, size_t);
 
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
-    long ret;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    register long x16 __asm__("x16") = num;
     asm volatile(
-        "mov x0, %[a0]\n"
-        "mov x1, %[a1]\n"
-        "mov x2, %[a2]\n"
-        "mov x3, %[a3]\n"
-        "mov x4, %[a4]\n"
-        "mov x5, %[a5]\n"
-        "mov x16, %[num]\n"
-        "svc #0x80\n"
-        "mov %[ret], x0\n"
-        : [ret] "=r"(ret)
-        : [num] "r"(num), [a0] "r"(a0), [a1] "r"(a1), [a2] "r"(a2), [a3] "r"(a3), [a4] "r"(a4), [a5] "r"(a5)
-        : "x0", "x1", "x2", "x3", "x4", "x5", "x16", "memory", "cc");
-    return ret;
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+        : "memory", "cc");
+    return x0;
 }}
 
 static int streq(const char *a, const char *b) {{
@@ -2013,7 +2007,7 @@ fn compat_mode_proxies_memory_and_string_imports() {
             && stdout.contains("heap=heap-ok")
             && stdout.contains("zero_ok=1")
             && stdout.contains("aligned_mod=0")
-            && stdout.contains("ok=1"),
+            && stdout.contains("hit=4 last=9 ok=1"),
         "memory/string fixture did not complete static import roundtrip; stdout:\n{stdout}"
     );
     assert!(
@@ -2030,7 +2024,7 @@ fn compat_mode_proxies_memory_and_string_imports() {
             && stdout.contains("heap=heap-ok")
             && stdout.contains("zero_ok=1")
             && stdout.contains("aligned_mod=0")
-            && stdout.contains("ok=1"),
+            && stdout.contains("hit=4 last=9 ok=1"),
         "memory/string fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"
     );
 }
