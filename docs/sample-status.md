@@ -193,6 +193,13 @@ emulator behavior.
 - Recommended local invocation:
   - `.\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-trace.jsonl`
   - `MACHINA_BYPASS_USAGE_CHECK="0x10022AE68" MACHINA_ARGV_APPEND="http://127.0.0.1:8888" .\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-bypass.jsonl` to skip the obfuscated usage check and see the URL-validation path execute
+  - `MACHINA_BYPASS_USAGE_CHECK` now also accepts a comma-separated
+    list of per-call return values (e.g. `0x10022AE68=1,0,0`) so the
+    same wrapper can answer "true" for the usage decision and "false"
+    for the two subsequent prefix-check invocations. The legacy
+    address-only form keeps returning 0 for every call. Each hook hit
+    emits a `CallIndex` field on the existing `bypass-usage-check`
+    JSONL event so the sequence is easy to inspect.
 
 ## Corpus hygiene
 
