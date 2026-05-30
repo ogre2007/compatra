@@ -2,7 +2,8 @@
 
 use crate::macos::analysis::AnalysisRuntimeHooks;
 use crate::macos::analysis_arm64_cpp_imports::{
-    install_analysis_arm64_cpp_imports, setup_analysis_arm64_cpp_data_region,
+    install_analysis_arm64_cpp_imports, install_analysis_arm64_operator_hooks,
+    setup_analysis_arm64_cpp_data_region,
 };
 use crate::macos::apple_imports::install_apple_imports;
 use crate::macos::arm64_dynamic_imports::install_arm64_dynamic_imports;
@@ -21,9 +22,8 @@ use crate::macos::runner_support::{
 use crate::macos::runtime_hooks::install_runtime_hooks;
 use crate::macos::time_imports::install_time_imports;
 use crate::macos::{
-    default_guest_fs_base, ensure_macho_cpu, install_runtime_plugins, process_event,
-    runtime_process_metadata, MacosCpu, RuntimeContext, RuntimeMode, SyscallRuntimePlugin,
-    TraceMetadata,
+    default_guest_fs_base, ensure_macho_cpu, install_runtime_plugins, process_event, MacosCpu,
+    RuntimeContext, RuntimeMode, SyscallRuntimePlugin, TraceMetadata,
 };
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
@@ -411,89 +411,13 @@ pub fn emulate_macos_arm64_binary_with_mode(
         )?;
     }
 
-    for spec in analysis_hooks.function_entry_specs_from_env() {
-        let label_owned = spec.label;
-        let addr = spec.addr;
-        let trace_bus_for_hook = trace_bus.clone();
-        let proc_name = process_name.to_string();
-        emulator.add_code_hook(
-            addr,
-            addr + 4,
-            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
-                let x0 = emu.read_reg("x0").unwrap_or(0);
-                let x1 = emu.read_reg("x1").unwrap_or(0);
-                let lr = emu.read_reg("lr").unwrap_or(0);
-                if let Some(bus) = &trace_bus_for_hook {
-                    let _ = bus.send(
-                        process_event(
-                            &runtime_process_metadata(proc_name.clone()),
-                            "function-entry",
-                            "function_entry",
-                        )
-                        .arg("Label", label_owned.clone())
-                        .arg("Pc", format!("0x{:X}", addr))
-                        .arg("X0", format!("0x{:X}", x0))
-                        .arg("X1", format!("0x{:X}", x1))
-                        .arg("Lr", format!("0x{:X}", lr)),
-                    );
-                }
-            },
-        )?;
-    }
-
-    for spec in analysis_hooks.usage_bypass_specs_from_env() {
-        let addr = spec.addr;
-        let lr_filter = spec.lr_filter;
-        let values = spec.values;
-        let trace_bus_for_hook = trace_bus.clone();
-        let proc_name = process_name.to_string();
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        emulator.add_code_hook(
-            addr,
-            addr + 4,
-            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
-                let x0_in = emu.read_reg("x0").unwrap_or(0);
-                let x1_in = emu.read_reg("x1").unwrap_or(0);
-                let lr = emu.read_reg("lr").unwrap_or(0);
-                if lr_filter.is_some_and(|expected| expected != lr) {
-                    return;
-                }
-                let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let value = if values.is_empty() {
-                    0
-                } else if n < values.len() {
-                    values[n]
-                } else {
-                    *values.last().unwrap()
-                };
-                let _ = emu.write_reg("x0", value);
-                if lr != 0 {
-                    let _ = emu.write_reg("pc", lr);
-                }
-                if let Some(bus) = &trace_bus_for_hook {
-                    let _ = bus.send(
-                        process_event(
-                            &runtime_process_metadata(proc_name.clone()),
-                            "bypass-usage-check",
-                            "bypass_usage_check",
-                        )
-                        .arg("Pc", format!("0x{:X}", addr))
-                        .arg("CallIndex", n.to_string())
-                        .arg("ReturnValue", format!("0x{:X}", value))
-                        .arg("X0In", format!("0x{:X}", x0_in))
-                        .arg("X1In", format!("0x{:X}", x1_in))
-                        .arg("Lr", format!("0x{:X}", lr))
-                        .arg(
-                            "LrFilter",
-                            lr_filter
-                                .map(|expected| format!("0x{:X}", expected))
-                                .unwrap_or_else(|| "none".to_string()),
-                        ),
-                    );
-                }
-            },
-        )?;
-    }
+    install_analysis_arm64_operator_hooks(
+        &mut emulator,
+        analysis_hooks.function_entry_specs_from_env(),
+        analysis_hooks.usage_bypass_specs_from_env(),
+        &trace_bus,
+        &process_name,
+    )?;
 
     let last_stub = import_tracker.last_stub.clone();
     let import_count = import_tracker.import_count.clone();

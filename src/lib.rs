@@ -46,14 +46,14 @@ pub use macos::runner_plugins::{
 pub use macos::runtime::{
     bind_process_fd_target, block_active_arm64_thread_on_cond, block_current_arm64_thread_on_cond,
     close_directory_stream, close_synthetic_fd, dispatch_pending_arm64_thread,
-    dispatch_pending_arm64_thread_by_id, has_pipe_endpoint_ref, open_directory_stream,
-    read_guest_directory_entry, register_process_fd, resolve_directory_stream_fd,
-    resolve_process_fd_target, restore_context, save_context, terminate_synthetic_process,
-    wake_cond_waiters, wake_one_cond_waiter, yield_active_arm64_thread, ActiveArm64Thread,
-    Arm64ThreadRuntime, ForkParentResume, PendingArm64Thread, SyntheticFdTarget,
-    SyntheticKeventRegistration, SyntheticOsRuntime, SyntheticPipe, SyntheticProcess,
-    ThreadContext, WaitingArm64Thread, ARM64_SYNTHETIC_THREAD_STACK_BASE,
-    ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
+    dispatch_pending_arm64_thread_by_id, dispatch_pending_arm64_thread_by_id_with_exit_action,
+    has_pipe_endpoint_ref, open_directory_stream, read_guest_directory_entry, register_process_fd,
+    resolve_directory_stream_fd, resolve_process_fd_target, restore_context, save_context,
+    terminate_synthetic_process, wake_cond_waiters, wake_one_cond_waiter,
+    yield_active_arm64_thread, ActiveArm64Thread, Arm64ThreadRuntime, ForkParentResume,
+    PendingArm64Thread, SyntheticFdTarget, SyntheticKeventRegistration, SyntheticOsRuntime,
+    SyntheticPipe, SyntheticProcess, ThreadContext, WaitingArm64Thread,
+    ARM64_SYNTHETIC_THREAD_STACK_BASE, ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
 };
 pub use macos::runtime_plugins::{
     install_arm64_runtime_plugins, install_runtime_plugins, runtime_process_metadata,

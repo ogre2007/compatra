@@ -3044,10 +3044,8 @@ pub fn install_arm64_io_imports(
                             } else {
                                 parent_resume.parent_tid
                             };
-                            runtime
-                                .pending_threads
-                                .retain(|thread| thread.thread_id != queued_parent_tid);
-                            runtime.pending_threads.push_front(PendingArm64Thread {
+                            runtime.remove_pending_by_id(queued_parent_tid);
+                            runtime.enqueue_pending_front(PendingArm64Thread {
                                 thread_id: queued_parent_tid,
                                 entry: 0,
                                 arg: 0,

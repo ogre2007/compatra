@@ -14,6 +14,7 @@ members = [
     "crates/machina-analysis",
     "crates/machina-compat",
     "crates/machina-mode",
+    "crates/machina-threading",
 ]
 resolver = "2"
 
@@ -27,6 +28,7 @@ machina-analysis = { path = "crates/machina-analysis" }
 machina-arch-arm64 = { path = "crates/machina-arch-arm64" }
 machina-compat = { path = "crates/machina-compat" }
 machina-mode = { path = "crates/machina-mode" }
+machina-threading = { path = "crates/machina-threading" }
 unicorn-engine-sys = "2.1.5"
 unicorn-engine = "2.1.5"
 

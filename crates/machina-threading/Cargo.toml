@@ -1,0 +1,10 @@
+[package]
+name = "machina-threading"
+version = "0.1.0"
+edition = "2021"
+description = "Guest threading scheduler state for Machina"
+license = "GPL-2.0"
+
+[lib]
+name = "machina_threading"
+path = "src/lib.rs"

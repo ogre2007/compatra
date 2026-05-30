@@ -3,6 +3,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
+use machina_threading::{
+    ActiveGuestThread, ForkParentResume as GuestForkParentResume, GuestThreadExitAction,
+    GuestThreadRuntime, PendingGuestThread, WaitingGuestThread,
+};
+
 use crate::macos::guest_files::{
     fstat_guest_file as shared_fstat_guest_file,
     open_guest_path_with_flags as shared_open_guest_path_with_flags,
@@ -25,36 +30,10 @@ pub struct Arm64ThreadContext {
     pub pc: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct PendingArm64Thread {
-    pub thread_id: u64,
-    pub entry: u64,
-    pub arg: u64,
-    pub stack_top: u64,
-    pub exit_pc: u64,
-    pub resume: Option<Arm64ThreadContext>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ActiveArm64Thread {
-    pub thread_id: u64,
-    pub parent_thread_id: u64,
-    pub parent: Arm64ThreadContext,
-}
-
-#[derive(Clone, Debug)]
-pub struct ForkParentResume {
-    pub parent_tid: u64,
-    pub child_pid: u64,
-    pub context: Arm64ThreadContext,
-}
-
-#[derive(Clone, Debug)]
-pub struct WaitingArm64Thread {
-    pub thread_id: u64,
-    pub mutex: u64,
-    pub pending: PendingArm64Thread,
-}
+pub type PendingArm64Thread = PendingGuestThread<Arm64ThreadContext>;
+pub type ActiveArm64Thread = ActiveGuestThread<Arm64ThreadContext>;
+pub type ForkParentResume = GuestForkParentResume<Arm64ThreadContext>;
+pub type WaitingArm64Thread = WaitingGuestThread<Arm64ThreadContext>;
 
 #[derive(Clone, Debug)]
 pub struct SyntheticProcess {
@@ -225,19 +204,7 @@ pub fn close_directory_stream(
     Ok(fd)
 }
 
-#[derive(Debug, Default)]
-pub struct Arm64ThreadRuntime {
-    pub next_thread_id: u64,
-    pub current_thread_id: u64,
-    pub next_stack_base: u64,
-    pub pending_threads: VecDeque<PendingArm64Thread>,
-    pub active_thread: Option<ActiveArm64Thread>,
-    pub cond_wait_streaks: HashMap<(u64, u64), u32>,
-    pub cond_signal_counts: HashMap<u64, u32>,
-    pub mutex_owners: HashMap<u64, u64>,
-    pub cond_waiters: HashMap<u64, VecDeque<WaitingArm64Thread>>,
-    pub fork_parent_resumes: HashMap<u64, ForkParentResume>,
-}
+pub type Arm64ThreadRuntime = GuestThreadRuntime<Arm64ThreadContext>;
 
 pub fn register_process_fd(os: &mut Arm64SyntheticOsRuntime, pid: u64, fd: u64) {
     os.process_fds.entry(pid).or_default().insert(fd);
@@ -432,31 +399,10 @@ pub fn restore_arm64_context(
     Ok(())
 }
 
-pub fn dispatch_pending_arm64_thread(
+fn enter_pending_arm64_thread(
     emu: &mut UnicornEmulator,
-    runtime: &mut Arm64ThreadRuntime,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if runtime.active_thread.is_some() {
-        return Ok(false);
-    }
-    let Some(next) = runtime.pending_threads.pop_front() else {
-        return Ok(false);
-    };
-
-    let parent = save_arm64_context(emu);
-    let parent_thread_id = if runtime.current_thread_id == 0 {
-        runtime.current_thread_id = 1;
-        1
-    } else {
-        runtime.current_thread_id
-    };
-    runtime.current_thread_id = next.thread_id;
-    runtime.active_thread = Some(ActiveArm64Thread {
-        thread_id: next.thread_id,
-        parent_thread_id,
-        parent,
-    });
-
+    next: &PendingArm64Thread,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ctx) = next.resume.as_ref() {
         restore_arm64_context(emu, ctx, ctx.x[0], ctx.pc)?;
     } else {
@@ -466,6 +412,18 @@ pub fn dispatch_pending_arm64_thread(
         emu.write_reg("lr", next.exit_pc)?;
         emu.write_reg("pc", next.entry)?;
     }
+    Ok(())
+}
+
+pub fn dispatch_pending_arm64_thread(
+    emu: &mut UnicornEmulator,
+    runtime: &mut Arm64ThreadRuntime,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let parent = save_arm64_context(emu);
+    let Some(dispatch) = runtime.dispatch_next(parent) else {
+        return Ok(false);
+    };
+    enter_pending_arm64_thread(emu, &dispatch.next)?;
     Ok(true)
 }
 
@@ -474,38 +432,27 @@ pub fn dispatch_pending_arm64_thread_by_id(
     runtime: &mut Arm64ThreadRuntime,
     thread_id: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if runtime.active_thread.is_some() {
-        return Ok(false);
-    }
-    let Some(index) = runtime
-        .pending_threads
-        .iter()
-        .position(|thread| thread.thread_id == thread_id)
+    dispatch_pending_arm64_thread_by_id_with_exit_action(
+        emu,
+        runtime,
+        thread_id,
+        GuestThreadExitAction::ReturnChildResult,
+    )
+}
+
+pub fn dispatch_pending_arm64_thread_by_id_with_exit_action(
+    emu: &mut UnicornEmulator,
+    runtime: &mut Arm64ThreadRuntime,
+    thread_id: u64,
+    exit_action: GuestThreadExitAction,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let parent = save_arm64_context(emu);
+    let Some(dispatch) =
+        runtime.dispatch_thread_by_id_with_exit_action(thread_id, parent, exit_action)
     else {
         return Ok(false);
     };
-    let Some(next) = runtime.pending_threads.remove(index) else {
-        return Ok(false);
-    };
-
-    let parent = save_arm64_context(emu);
-    let parent_thread_id = runtime.current_thread_id.max(1);
-    runtime.current_thread_id = next.thread_id;
-    runtime.active_thread = Some(ActiveArm64Thread {
-        thread_id: next.thread_id,
-        parent_thread_id,
-        parent,
-    });
-
-    if let Some(ctx) = next.resume.as_ref() {
-        restore_arm64_context(emu, ctx, ctx.x[0], ctx.pc)?;
-    } else {
-        emu.write_reg("x0", next.arg)?;
-        emu.write_reg("sp", next.stack_top)?;
-        emu.write_reg("fp", 0)?;
-        emu.write_reg("lr", next.exit_pc)?;
-        emu.write_reg("pc", next.entry)?;
-    }
+    enter_pending_arm64_thread(emu, &dispatch.next)?;
     Ok(true)
 }
 
@@ -515,50 +462,31 @@ pub fn yield_active_arm64_thread(
     x0: u64,
     pc: u64,
 ) -> Result<Option<(u64, u64)>, Box<dyn std::error::Error>> {
-    if runtime.pending_threads.is_empty() {
-        return Ok(None);
-    }
-    let Some(active) = runtime.active_thread.take() else {
-        return Ok(None);
-    };
-
     let mut resume_ctx = save_arm64_context(emu);
     resume_ctx.x[0] = x0;
     resume_ctx.pc = pc;
-    runtime.pending_threads.push_back(PendingArm64Thread {
-        thread_id: active.thread_id,
+    let thread_id = runtime
+        .active_thread
+        .as_ref()
+        .map(|active| active.thread_id)
+        .unwrap_or(0);
+    let resume = PendingArm64Thread {
+        thread_id,
         entry: 0,
         arg: 0,
         stack_top: 0,
         exit_pc: 0,
         resume: Some(resume_ctx),
-    });
-
-    let Some(next) = runtime.pending_threads.pop_front() else {
-        runtime.active_thread = Some(active);
+    };
+    let Some(thread_switch) = runtime.yield_active_to_next(resume) else {
         return Ok(None);
     };
 
-    let from_thread_id = active.thread_id;
-    let parent_thread_id = active.parent_thread_id;
-    let parent = active.parent;
-    runtime.current_thread_id = next.thread_id;
-    runtime.active_thread = Some(ActiveArm64Thread {
-        thread_id: next.thread_id,
-        parent_thread_id,
-        parent,
-    });
-
-    if let Some(ctx) = next.resume.as_ref() {
-        restore_arm64_context(emu, ctx, ctx.x[0], ctx.pc)?;
-    } else {
-        emu.write_reg("x0", next.arg)?;
-        emu.write_reg("sp", next.stack_top)?;
-        emu.write_reg("fp", 0)?;
-        emu.write_reg("lr", next.exit_pc)?;
-        emu.write_reg("pc", next.entry)?;
-    }
-    Ok(Some((from_thread_id, next.thread_id)))
+    enter_pending_arm64_thread(emu, &thread_switch.next)?;
+    Ok(Some((
+        thread_switch.from_thread_id,
+        thread_switch.to_thread_id,
+    )))
 }
 
 pub fn block_active_arm64_thread_on_cond(
@@ -569,57 +497,31 @@ pub fn block_active_arm64_thread_on_cond(
     x0: u64,
     pc: u64,
 ) -> Result<Option<(u64, u64)>, Box<dyn std::error::Error>> {
-    let Some(active) = runtime.active_thread.take() else {
-        return Ok(None);
-    };
-
     let mut resume_ctx = save_arm64_context(emu);
     resume_ctx.x[0] = x0;
     resume_ctx.pc = pc;
-    let blocked_thread_id = active.thread_id;
+    let thread_id = runtime
+        .active_thread
+        .as_ref()
+        .map(|active| active.thread_id)
+        .unwrap_or(0);
     let pending = PendingArm64Thread {
-        thread_id: active.thread_id,
+        thread_id,
         entry: 0,
         arg: 0,
         stack_top: 0,
         exit_pc: 0,
         resume: Some(resume_ctx),
     };
-    runtime
-        .cond_waiters
-        .entry(cond)
-        .or_default()
-        .push_back(WaitingArm64Thread {
-            thread_id: blocked_thread_id,
-            mutex,
-            pending,
-        });
-
-    let Some(next) = runtime.pending_threads.pop_front() else {
-        runtime.active_thread = Some(active);
-        runtime.cond_waiters.entry(cond).or_default().pop_back();
+    let Some(thread_switch) = runtime.block_active_on_cond(cond, mutex, pending) else {
         return Ok(None);
     };
 
-    let parent_thread_id = active.parent_thread_id;
-    let parent = active.parent;
-    runtime.current_thread_id = next.thread_id;
-    runtime.active_thread = Some(ActiveArm64Thread {
-        thread_id: next.thread_id,
-        parent_thread_id,
-        parent,
-    });
-
-    if let Some(ctx) = next.resume.as_ref() {
-        restore_arm64_context(emu, ctx, ctx.x[0], ctx.pc)?;
-    } else {
-        emu.write_reg("x0", next.arg)?;
-        emu.write_reg("sp", next.stack_top)?;
-        emu.write_reg("fp", 0)?;
-        emu.write_reg("lr", next.exit_pc)?;
-        emu.write_reg("pc", next.entry)?;
-    }
-    Ok(Some((blocked_thread_id, next.thread_id)))
+    enter_pending_arm64_thread(emu, &thread_switch.next)?;
+    Ok(Some((
+        thread_switch.from_thread_id,
+        thread_switch.to_thread_id,
+    )))
 }
 
 pub fn block_current_arm64_thread_on_cond(
@@ -630,63 +532,33 @@ pub fn block_current_arm64_thread_on_cond(
     x0: u64,
     pc: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if runtime.active_thread.is_some() || runtime.pending_threads.is_empty() {
-        return Ok(false);
-    }
-
     let thread_id = runtime.current_thread_id.max(1);
-    let mut resume_ctx = save_arm64_context(emu);
+    let parent = save_arm64_context(emu);
+    let mut resume_ctx = parent.clone();
     resume_ctx.x[0] = x0;
     resume_ctx.pc = pc;
-    runtime
-        .cond_waiters
-        .entry(cond)
-        .or_default()
-        .push_back(WaitingArm64Thread {
-            thread_id,
-            mutex,
-            pending: PendingArm64Thread {
-                thread_id,
-                entry: 0,
-                arg: 0,
-                stack_top: 0,
-                exit_pc: 0,
-                resume: Some(resume_ctx),
-            },
-        });
-
-    dispatch_pending_arm64_thread(emu, runtime)
+    let pending = PendingArm64Thread {
+        thread_id,
+        entry: 0,
+        arg: 0,
+        stack_top: 0,
+        exit_pc: 0,
+        resume: Some(resume_ctx),
+    };
+    let Some(dispatch) = runtime.block_current_on_cond_and_dispatch(cond, mutex, pending, parent)
+    else {
+        return Ok(false);
+    };
+    enter_pending_arm64_thread(emu, &dispatch.next)?;
+    Ok(true)
 }
 
 pub fn wake_one_arm64_cond_waiter(runtime: &mut Arm64ThreadRuntime) -> Option<(u64, u64)> {
-    let cond = runtime
-        .cond_waiters
-        .iter()
-        .find_map(|(cond, queue)| (!queue.is_empty()).then_some(*cond))?;
-    let waiter = runtime.cond_waiters.get_mut(&cond)?.pop_front()?;
-    if runtime
-        .cond_waiters
-        .get(&cond)
-        .map(|queue| queue.is_empty())
-        .unwrap_or(false)
-    {
-        runtime.cond_waiters.remove(&cond);
-    }
-    runtime.mutex_owners.insert(waiter.mutex, waiter.thread_id);
-    let waiter_tid = waiter.thread_id;
-    runtime.pending_threads.push_front(waiter.pending);
-    Some((cond, waiter_tid))
+    machina_threading::wake_one_cond_waiter(runtime)
 }
 
 pub fn wake_arm64_cond_waiters(runtime: &mut Arm64ThreadRuntime, limit: usize) -> Vec<(u64, u64)> {
-    let mut woken = Vec::new();
-    while woken.len() < limit {
-        let Some((cond, tid)) = wake_one_arm64_cond_waiter(runtime) else {
-            break;
-        };
-        woken.push((cond, tid));
-    }
-    woken
+    machina_threading::wake_cond_waiters(runtime, limit)
 }
 
 #[cfg(test)]

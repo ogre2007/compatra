@@ -155,6 +155,7 @@ dependencies = [
  "machina-arch-arm64",
  "machina-compat",
  "machina-mode",
+ "machina-threading",
  "thiserror",
  "unicorn-engine",
  "unicorn-engine-sys",
@@ -188,6 +189,10 @@ dependencies = [
 
 [[package]]
 name = "machina-mode"
+version = "0.1.0"
+
+[[package]]
+name = "machina-threading"
 version = "0.1.0"
 
 [[package]]

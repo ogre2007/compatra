@@ -16,6 +16,7 @@ use crate::macos::{
     save_arm64_context, SharedTraceBus,
 };
 use crate::{Emulator, UnicornEmulator};
+use machina_threading::GuestThreadExitAction;
 
 pub fn install_arm64_runtime_hooks(
     emulator: &mut UnicornEmulator,
@@ -128,17 +129,41 @@ pub fn install_arm64_runtime_hooks(
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let child_result = emu.read_reg("x0").unwrap_or(0);
                 let mut resumed_parent = false;
+                let mut exited_thread_id = 0;
+                let mut exit_action = GuestThreadExitAction::ReturnChildResult;
+                let mut resume_parent = None;
                 if let Ok(mut runtime) = thread_runtime.lock() {
                     if let Some(active) = runtime.active_thread.take() {
+                        exited_thread_id = active.thread_id;
+                        exit_action = active.exit_action;
+                        if !matches!(
+                            exit_action,
+                            GuestThreadExitAction::StoreResultAndReturn { .. }
+                        ) {
+                            runtime.record_thread_completion(active.thread_id, child_result);
+                        }
                         runtime.current_thread_id = active.parent_thread_id;
-                        let _ = restore_arm64_context(
-                            emu,
-                            &active.parent,
-                            child_result,
-                            active.parent.lr,
-                        );
-                        resumed_parent = true;
+                        let resume_pc = active.parent.lr;
+                        let resume_x0 = match exit_action {
+                            GuestThreadExitAction::ReturnChildResult => child_result,
+                            GuestThreadExitAction::ReturnValue(value) => value,
+                            GuestThreadExitAction::StoreResultAndReturn {
+                                result_addr,
+                                return_value,
+                            } => {
+                                if result_addr != 0 {
+                                    let _ =
+                                        emu.write_memory(result_addr, &child_result.to_le_bytes());
+                                }
+                                return_value
+                            }
+                        };
+                        resume_parent = Some((active.parent, resume_x0, resume_pc));
                     }
+                }
+                if let Some((parent, resume_x0, resume_pc)) = resume_parent {
+                    let _ = restore_arm64_context(emu, &parent, resume_x0, resume_pc);
+                    resumed_parent = true;
                 }
                 if resumed_parent {
                     println!(
@@ -150,7 +175,9 @@ pub fn install_arm64_runtime_hooks(
                 }
                 let event = arm64_thread_event(0, "thread-exit", "thread_exit_stub")
                     .arg("ChildResult", format!("0x{:X}", child_result))
-                    .arg("ResumedParent", resumed_parent.to_string());
+                    .arg("ResumedParent", resumed_parent.to_string())
+                    .arg("ThreadId", exited_thread_id.to_string())
+                    .arg("ExitAction", format!("{:?}", exit_action));
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;

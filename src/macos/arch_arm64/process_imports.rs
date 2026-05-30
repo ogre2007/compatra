@@ -20,7 +20,7 @@ use crate::macos::arm64_runner_support::{
 use crate::macos::{
     close_synthetic_fd, dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id,
     read_arm64_argv, read_cstring, resolve_process_fd_target, restore_arm64_context,
-    save_arm64_context, terminate_synthetic_process, ActiveArm64Thread, Emulator, ForkParentResume,
+    save_arm64_context, terminate_synthetic_process, Emulator, ForkParentResume,
     PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticProcess, MAX_SYNTHETIC_THREADS,
 };
 use crate::UnicornEmulator;
@@ -453,17 +453,14 @@ pub fn install_arm64_process_imports(
                         Ok(rt) => rt,
                         Err(_) => return,
                     };
-                    if runtime.next_thread_id > MAX_SYNTHETIC_THREADS + 1 {
-                        (u64::MAX, 0u64, false)
-                    } else {
-                        let child_tid = runtime.next_thread_id;
-                        runtime.next_thread_id = runtime.next_thread_id.saturating_add(1);
+                    match runtime.reserve_thread_id(MAX_SYNTHETIC_THREADS) {
+                        Ok(child_tid) => {
                         let mut child_ctx = parent_ctx.clone();
                         child_ctx.x[0] = 0;
                         child_ctx.x[1] = 0;
                         child_ctx.x[2] = 0;
                         child_ctx.pc = lr;
-                        runtime.pending_threads.push_front(PendingArm64Thread {
+                        runtime.enqueue_pending_front(PendingArm64Thread {
                             thread_id: child_tid,
                             entry: 0,
                             arg: 0,
@@ -532,6 +529,8 @@ pub fn install_arm64_process_imports(
                             child_tid, parent_tid, child_pid, raw_syscall_resume_pc, raw_syscall_frame
                         );
                         (child_pid, child_tid, true)
+                        }
+                        Err(_) => (u64::MAX, 0u64, false),
                     }
                 };
 
@@ -815,13 +814,12 @@ pub fn install_arm64_process_imports(
                     {
                         runtime.active_thread.take();
                         if let Some(parent_resume) = runtime.fork_parent_resumes.get(&current_tid).cloned() {
-                            runtime.pending_threads.retain(|thread| thread.thread_id != parent_resume.parent_tid);
-                            runtime.current_thread_id = parent_resume.parent_tid;
-                            runtime.active_thread = Some(ActiveArm64Thread {
-                                thread_id: parent_resume.parent_tid,
-                                parent_thread_id: current_tid,
-                                parent: save_arm64_context(emu),
-                            });
+                            runtime.remove_pending_by_id(parent_resume.parent_tid);
+                            runtime.activate_thread(
+                                parent_resume.parent_tid,
+                                current_tid,
+                                save_arm64_context(emu),
+                            );
                             if restore_arm64_context(
                                 emu,
                                 &parent_resume.context,

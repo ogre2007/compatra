@@ -16,10 +16,12 @@ use crate::macos::arm64_runner_support::{
 };
 use crate::macos::{
     block_active_arm64_thread_on_cond, block_current_arm64_thread_on_cond,
-    dispatch_pending_arm64_thread, thread_event, yield_active_arm64_thread, Emulator,
-    PendingArm64Thread, SharedTraceBus, ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
+    dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id_with_exit_action,
+    thread_event, yield_active_arm64_thread, Emulator, SharedTraceBus,
+    ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
 };
 use crate::UnicornEmulator;
+use machina_threading::GuestThreadExitAction;
 
 pub fn install_arm64_pthread_imports(
     emulator: &mut UnicornEmulator,
@@ -669,25 +671,25 @@ pub fn install_arm64_pthread_imports(
                         Ok(rt) => rt,
                         Err(_) => return,
                     };
-                    if runtime.next_thread_id > MAX_SYNTHETIC_THREADS + 1 {
-                        (11u64, 0u64)
-                    } else {
-                        let thread_id = runtime.next_thread_id;
-                        runtime.next_thread_id = runtime.next_thread_id.saturating_add(1);
-                        let stack_base = runtime.next_stack_base;
-                        runtime.next_stack_base = runtime
-                            .next_stack_base
-                            .saturating_add(ARM64_SYNTHETIC_THREAD_STACK_SIZE);
-                        let _ = emu.map_data_memory(stack_base, ARM64_SYNTHETIC_THREAD_STACK_SIZE);
-                        runtime.pending_threads.push_back(PendingArm64Thread {
-                            thread_id,
-                            entry: start_routine,
-                            arg,
-                            stack_top: stack_base + ARM64_SYNTHETIC_THREAD_STACK_SIZE - 0x100,
-                            exit_pc: thread_exit_stub,
-                            resume: None,
-                        });
-                        (0u64, thread_id)
+                    match runtime.reserve_guest_thread(
+                        ARM64_SYNTHETIC_THREAD_STACK_SIZE,
+                        MAX_SYNTHETIC_THREADS,
+                    ) {
+                        Ok(reservation) => {
+                            let _ = emu.map_data_memory(
+                                reservation.stack_base,
+                                ARM64_SYNTHETIC_THREAD_STACK_SIZE,
+                            );
+                            let thread_id = reservation.thread_id;
+                            runtime.enqueue_thread_start(
+                                reservation,
+                                start_routine,
+                                arg,
+                                thread_exit_stub,
+                            );
+                            (0u64, thread_id)
+                        }
+                        Err(_) => (11u64, 0u64),
                     }
                 };
                 if result == 0 {
@@ -724,6 +726,171 @@ pub fn install_arm64_pthread_imports(
                 .arg("Arg", format!("0x{:X}", arg))
                 .arg("Result", result.to_string())
                 .arg("ChildTid", thread_id.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_pthread_join") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let target_thread = emu.read_reg("x0").unwrap_or(0);
+                let retval_ptr = emu.read_reg("x1").unwrap_or(0);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let completed_result;
+                let mut dispatched = false;
+                {
+                    let mut runtime = match thread_runtime.lock() {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    completed_result = runtime.take_thread_completion(target_thread);
+                    if completed_result.is_none() {
+                        if let Ok(did_dispatch) =
+                            dispatch_pending_arm64_thread_by_id_with_exit_action(
+                                emu,
+                                &mut runtime,
+                                target_thread,
+                                GuestThreadExitAction::StoreResultAndReturn {
+                                    result_addr: retval_ptr,
+                                    return_value: 0,
+                                },
+                            )
+                        {
+                            dispatched = did_dispatch;
+                        }
+                    }
+                }
+
+                if dispatched {
+                    record_arm64_import(
+                        &import_tracker,
+                        format!(
+                            "_pthread_join(thread={}, retval=0x{:X}, tid={}) -> dispatched",
+                            target_thread, retval_ptr, current_tid
+                        ),
+                    );
+                    let event = thread_event(
+                        &arm64_metadata(None, current_tid),
+                        "pthread-join",
+                        "pthread_join",
+                    )
+                    .arg("Thread", target_thread.to_string())
+                    .arg("RetvalPtr", format!("0x{:X}", retval_ptr))
+                    .arg("Dispatched", "true");
+                    emit_arm64_event(&trace_bus_for_hook, event);
+                    return;
+                }
+
+                if let Some(result) = completed_result {
+                    if retval_ptr != 0 {
+                        let _ = emu.write_memory(retval_ptr, &result.to_le_bytes());
+                    }
+                }
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_join(thread={}, retval=0x{:X}, tid={}, completed={}) -> 0",
+                        target_thread,
+                        retval_ptr,
+                        current_tid,
+                        completed_result.is_some()
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, current_tid),
+                    "pthread-join",
+                    "pthread_join",
+                )
+                .arg("Thread", target_thread.to_string())
+                .arg("RetvalPtr", format!("0x{:X}", retval_ptr))
+                .arg("Dispatched", "false")
+                .arg("Completed", completed_result.is_some().to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_pthread_detach") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let target_thread = emu.read_reg("x0").unwrap_or(0);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|mut rt| {
+                        rt.take_thread_completion(target_thread);
+                        rt.current_thread_id.max(1)
+                    })
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_detach(thread={}, tid={}) -> 0",
+                        target_thread, current_tid
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, current_tid),
+                    "pthread-detach",
+                    "pthread_detach",
+                )
+                .arg("Thread", target_thread.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_pthread_exit") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let retval = emu.read_reg("x0").unwrap_or(0);
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let _ = emu.write_reg("x0", retval);
+                let _ = emu.write_reg("pc", thread_exit_stub);
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_pthread_exit(retval=0x{:X}, tid={})", retval, thread_id),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "pthread-exit",
+                    "pthread_exit",
+                )
+                .arg("Retval", format!("0x{:X}", retval));
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
@@ -892,7 +1059,7 @@ pub fn install_arm64_pthread_imports(
                 let mutex = emu.read_reg("x1").unwrap_or(0);
                 let mut dispatched = false;
                 let mut synthetic_wake = false;
-                let mut consumed_signal = false;
+                let consumed_signal;
                 let mut blocked_to = None;
                 let mut blocked_current = false;
                 let thread_id = thread_runtime
@@ -905,13 +1072,7 @@ pub fn install_arm64_pthread_imports(
                         Ok(rt) => rt,
                         Err(_) => return,
                     };
-                    if let Some(count) = runtime.cond_signal_counts.get_mut(&cond) {
-                        if *count > 0 {
-                            *count -= 1;
-                            consumed_signal = true;
-                            runtime.mutex_owners.insert(mutex, thread_id);
-                        }
-                    }
+                    consumed_signal = runtime.consume_cond_signal(cond, mutex, thread_id);
                     if consumed_signal {
                         runtime.cond_wait_streaks.remove(&(cond, mutex));
                     } else {
@@ -1032,21 +1193,7 @@ pub fn install_arm64_pthread_imports(
                     .ok()
                     .map(|mut rt| {
                         let tid = rt.current_thread_id.max(1);
-                        let signaled = rt
-                            .cond_signal_counts
-                            .get_mut(&cond)
-                            .map(|count| {
-                                if *count > 0 {
-                                    *count -= 1;
-                                    true
-                                } else {
-                                    false
-                                }
-                            })
-                            .unwrap_or(false);
-                        if signaled {
-                            rt.mutex_owners.insert(mutex, tid);
-                        }
+                        rt.consume_cond_signal(cond, mutex, tid);
                         tid
                     })
                     .unwrap_or(1);
@@ -1079,33 +1226,14 @@ pub fn install_arm64_pthread_imports(
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let cond = emu.read_reg("x0").unwrap_or(0);
-                let (thread_id, pending_signals) = {
+                let (thread_id, pending_signals, woken_thread_id) = {
                     let mut runtime = match thread_runtime.lock() {
                         Ok(rt) => rt,
                         Err(_) => return,
                     };
                     let tid = runtime.current_thread_id.max(1);
-                    let waiter = {
-                        let waiters = runtime.cond_waiters.get_mut(&cond);
-                        waiters.and_then(|queue| queue.pop_front())
-                    };
-                    let pending = if let Some(waiter) = waiter {
-                        runtime.mutex_owners.insert(waiter.mutex, waiter.thread_id);
-                        runtime.pending_threads.push_front(waiter.pending);
-                        runtime
-                            .cond_waiters
-                            .get(&cond)
-                            .map(|queue| queue.len() as u32)
-                            .unwrap_or(0)
-                    } else {
-                        let signals = runtime
-                            .cond_signal_counts
-                            .entry(cond)
-                            .and_modify(|count| *count = count.saturating_add(1))
-                            .or_insert(1);
-                        *signals
-                    };
-                    (tid, pending)
+                    let signal = runtime.signal_cond(cond);
+                    (tid, signal.pending_signals, signal.woken_thread_id)
                 };
                 let mut yielded_to = None;
                 {
@@ -1139,8 +1267,8 @@ pub fn install_arm64_pthread_imports(
                 record_arm64_import(
                     &import_tracker,
                     format!(
-                        "_pthread_cond_signal(cond=0x{:X}, tid={}, pending_signals={}) -> 0",
-                        cond, thread_id, pending_signals
+                        "_pthread_cond_signal(cond=0x{:X}, tid={}, pending_signals={}, woken={:?}) -> 0",
+                        cond, thread_id, pending_signals, woken_thread_id
                     ),
                 );
                 println!(
@@ -1152,8 +1280,84 @@ pub fn install_arm64_pthread_imports(
                     "pthread-cond-signal",
                     "pthread_cond_signal",
                 )
-                    .arg("Cond", format!("0x{:X}", cond))
-                    .arg("PendingSignals", pending_signals.to_string());
+                .arg("Cond", format!("0x{:X}", cond))
+                .arg("PendingSignals", pending_signals.to_string())
+                .arg(
+                    "WokenThread",
+                    woken_thread_id
+                        .map(|tid| tid.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                );
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_pthread_cond_broadcast") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let cond = emu.read_reg("x0").unwrap_or(0);
+                let (thread_id, woken_count) = {
+                    let mut runtime = match thread_runtime.lock() {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    let tid = runtime.current_thread_id.max(1);
+                    let woken = runtime.broadcast_cond(cond);
+                    (tid, woken.len())
+                };
+                let mut yielded_to = None;
+                {
+                    let mut runtime = match thread_runtime.lock() {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    if runtime.active_thread.is_some() && !runtime.pending_threads.is_empty() {
+                        if let Ok(result) = yield_active_arm64_thread(
+                            emu,
+                            &mut runtime,
+                            0,
+                            emu.read_reg("lr").unwrap_or(0),
+                        ) {
+                            yielded_to = result;
+                        }
+                    }
+                }
+                if let Some((from_tid, to_tid)) = yielded_to {
+                    println!(
+                        "[THREAD][arm64] broadcast yield tid={} -> tid={} cond=0x{:X}",
+                        from_tid, to_tid, cond
+                    );
+                    return;
+                }
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_cond_broadcast(cond=0x{:X}, tid={}, woken={}) -> 0",
+                        cond, thread_id, woken_count
+                    ),
+                );
+                println!(
+                    "[IMPORT][arm64] _pthread_cond_broadcast cond=0x{:X} tid={} woken={} -> 0",
+                    cond, thread_id, woken_count
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "pthread-cond-broadcast",
+                    "pthread_cond_broadcast",
+                )
+                .arg("Cond", format!("0x{:X}", cond))
+                .arg("Woken", woken_count.to_string());
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
