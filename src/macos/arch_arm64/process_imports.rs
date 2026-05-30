@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::macos::arm64_io_imports::allocate_arm64_heap;
+use crate::macos::arm64_compat_memory::allocate_arm64_heap;
 use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
     Arm64SharedState,

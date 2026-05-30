@@ -322,6 +322,12 @@ pub fn emulate_macos_arm64_binary_with_mode(
         );
     }
 
+    let shared_state = initialize_shared_state_with_mode(
+        default_guest_fs_base(std::path::Path::new(binary_path), "arm64_ios"),
+        process_bootstrap.clone(),
+        runtime_mode,
+    );
+
     let import_tracker = initialize_import_tracker();
     let (mut stub_map, stub_name_map, next_dynamic_stub_addr) = install_return_stubs(
         &mut emulator,
@@ -331,6 +337,8 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &trace_bus,
         &process_name,
         runtime_mode,
+        &shared_state,
+        errno_ptr,
     )?;
     for (name, addr) in stub_map.clone() {
         let normalized = crate::macos::imports::normalize_import_symbol(name);
@@ -491,11 +499,6 @@ pub fn emulate_macos_arm64_binary_with_mode(
     let import_count = import_tracker.import_count.clone();
     let recent_imports = import_tracker.recent_imports.clone();
 
-    let shared_state = initialize_shared_state_with_mode(
-        default_guest_fs_base(std::path::Path::new(binary_path), "arm64_ios"),
-        process_bootstrap,
-        runtime_mode,
-    );
     let usleep_streaks = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         (u64, u64),
         u32,

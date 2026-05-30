@@ -16,6 +16,7 @@ use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
     Arm64SharedState,
 };
+use crate::macos::compat::CompatibilityServices;
 use crate::macos::{wake_arm64_cond_waiters, yield_active_arm64_thread, SharedTraceBus};
 use crate::{Emulator, UnicornEmulator};
 
@@ -55,15 +56,39 @@ pub fn install_arm64_time_imports(
     let os_runtime = shared_state.os_runtime.clone();
     let synthetic_stop_reason = shared_state.synthetic_stop_reason.clone();
     let mach_absolute_time = Arc::new(AtomicU64::new(1_000_000));
+    let compat = CompatibilityServices::for_mode(shared_state.runtime_mode);
 
     if let Some(&addr) = stub_map.get("_mach_absolute_time") {
         let mach_absolute_time = mach_absolute_time.clone();
         let import_tracker = import_tracker.clone();
         let thread_runtime = thread_runtime.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.mach_absolute_time() {
+                        let thread_id = thread_runtime
+                            .lock()
+                            .ok()
+                            .map(|rt| rt.current_thread_id.max(1))
+                            .unwrap_or(1);
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_mach_absolute_time(host tid={}) -> {}",
+                                thread_id, result.return_value
+                            ),
+                        );
+                        return;
+                    }
+                }
                 let value =
                     mach_absolute_time.fetch_add(1_000, std::sync::atomic::Ordering::Relaxed);
                 let thread_id = thread_runtime
@@ -96,12 +121,29 @@ pub fn install_arm64_time_imports(
         let trace_bus_for_hook = trace_bus.clone();
         let sleep_streaks = usleep_streaks.clone();
         let mach_absolute_time = mach_absolute_time.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let seconds = emu.read_reg("x0").unwrap_or(0);
                 let lr = emu.read_reg("lr").unwrap_or(0);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.sleep_seconds(seconds) {
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_sleep(host seconds={}) -> {}",
+                                seconds, result.return_value
+                            ),
+                        );
+                        return;
+                    }
+                }
                 let (thread_id, active_thread, pending_threads) = thread_runtime
                     .lock()
                     .ok()
@@ -171,12 +213,29 @@ pub fn install_arm64_time_imports(
         let thread_runtime = thread_runtime.clone();
         let usleep_streaks = usleep_streaks.clone();
         let mach_absolute_time = mach_absolute_time.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let usec = emu.read_reg("x0").unwrap_or(0);
                 let lr = emu.read_reg("lr").unwrap_or(0);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.usleep_usecs(usec) {
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_usleep(host usec={}) -> {} errno={}",
+                                usec, result.return_value, result.errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 let (thread_id, active_thread, pending_threads) = thread_runtime
                     .lock()
                     .ok()
@@ -311,11 +370,29 @@ pub fn install_arm64_time_imports(
 
     if let Some(&addr) = stub_map.get("_mach_timebase_info") {
         let import_tracker = import_tracker.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let info_ptr = emu.read_reg("x0").unwrap_or(0);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.mach_timebase_info(emu, info_ptr) {
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_mach_timebase_info(host info=0x{:X}) -> {} errno={:?}",
+                                info_ptr, result.return_value, result.errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 if info_ptr != 0 {
                     let _ = emu.write_memory(info_ptr, &1u32.to_le_bytes());
                     let _ = emu.write_memory(info_ptr + 4, &1u32.to_le_bytes());
@@ -342,6 +419,7 @@ pub fn install_arm64_time_imports(
 
     if let Some(&addr) = stub_map.get("_sysctl") {
         let import_tracker = import_tracker.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -352,6 +430,30 @@ pub fn install_arm64_time_imports(
                 let oldlenp = emu.read_reg("x3").unwrap_or(0);
                 let newp = emu.read_reg("x4").unwrap_or(0);
                 let newlen = emu.read_reg("x5").unwrap_or(0);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) =
+                        compat.sysctl(emu, name, namelen, oldp, oldlenp, newp, newlen)
+                    {
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_sysctl(host name=0x{:X}, namelen={}, oldp=0x{:X}, oldlenp=0x{:X}) -> {} errno={}",
+                                name,
+                                namelen,
+                                oldp,
+                                oldlenp,
+                                result.return_value,
+                                result.errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 let mib_bytes = if name != 0 && namelen > 0 {
                     emu.read_memory(name, (namelen as usize).saturating_mul(4))
                         .unwrap_or_default()
@@ -407,6 +509,7 @@ pub fn install_arm64_time_imports(
 
     if let Some(&addr) = stub_map.get("_sysctlbyname") {
         let import_tracker = import_tracker.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -414,9 +517,32 @@ pub fn install_arm64_time_imports(
                 let name_ptr = emu.read_reg("x0").unwrap_or(0);
                 let oldp = emu.read_reg("x1").unwrap_or(0);
                 let oldlenp = emu.read_reg("x2").unwrap_or(0);
-                let _newp = emu.read_reg("x3").unwrap_or(0);
-                let _newlen = emu.read_reg("x4").unwrap_or(0);
+                let newp = emu.read_reg("x3").unwrap_or(0);
+                let newlen = emu.read_reg("x4").unwrap_or(0);
                 let name = read_cstring(emu, name_ptr, 128);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) =
+                        compat.sysctlbyname(emu, name_ptr, oldp, oldlenp, newp, newlen)
+                    {
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_sysctlbyname(host name={}, oldp=0x{:X}, oldlenp=0x{:X}) -> {} errno={}",
+                                name,
+                                oldp,
+                                oldlenp,
+                                result.return_value,
+                                result.errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 if matches!(name.as_str(), "hw.pagesize" | "hw.page_size") {
                     if oldlenp != 0 {
                         let _ = emu.write_memory(oldlenp, &8u64.to_le_bytes());

@@ -2,6 +2,7 @@
 
 pub use crate::macos::arm64_binary_setup as binary_setup;
 pub use crate::macos::arm64_bootstrap as bootstrap;
+pub use crate::macos::arm64_compat_memory as compat_memory;
 pub use crate::macos::arm64_diagnostics as diagnostics;
 pub use crate::macos::arm64_dynamic_imports as dynamic_imports;
 pub use crate::macos::arm64_import_stubs as import_stubs;

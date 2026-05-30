@@ -12,6 +12,8 @@ pub mod arch_arm64;
 pub mod arm64_binary_setup;
 #[path = "arch_arm64/bootstrap.rs"]
 pub mod arm64_bootstrap;
+#[path = "arch_arm64/compat_memory.rs"]
+pub mod arm64_compat_memory;
 #[path = "arch_arm64/diagnostics.rs"]
 pub mod arm64_diagnostics;
 #[path = "arch_arm64/dynamic_imports.rs"]

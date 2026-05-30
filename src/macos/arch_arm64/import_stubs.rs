@@ -8,6 +8,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::macos::arm64_compat_memory::Arm64CompatGuestMemory;
+use crate::macos::arm64_state::Arm64SharedState;
 use crate::macos::compat::CompatibilityServices;
 use crate::macos::plugin_events::import_event;
 use crate::macos::{
@@ -51,9 +53,10 @@ fn arm64_stub_bytes(symbol: &str, runtime_mode: RuntimeMode) -> &'static [u8] {
 }
 
 fn arm64_proxy_compat_host_import(
-    emu: &mut dyn Emulator,
+    emu: &mut UnicornEmulator,
     symbol: &str,
-    compat: CompatibilityServices,
+    shared_state: &Arm64SharedState,
+    errno_ptr: u64,
 ) {
     let mut args = [0u64; 8];
     for (idx, arg) in args.iter_mut().enumerate() {
@@ -64,8 +67,20 @@ fn arm64_proxy_compat_host_import(
     }
     let stack_ptr = emu.read_reg("sp").ok();
 
-    if let Some(result) = compat.proxy_arm64_import_with_stack(emu, symbol, &args, stack_ptr) {
+    let mut memory = Arm64CompatGuestMemory {
+        emulator: emu,
+        shared_state,
+    };
+    if let Some(result) = machina_compat::CompatibilityServices.proxy_arm64_import_with_stack(
+        &mut memory,
+        symbol,
+        &args,
+        stack_ptr,
+    ) {
         let _ = emu.write_reg("x0", result.return_value);
+        if let Some(errno) = result.errno {
+            let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+        }
     };
 }
 
@@ -77,6 +92,8 @@ pub fn install_arm64_return_stubs(
     trace_bus: &Option<SharedTraceBus>,
     process_name: &str,
     runtime_mode: RuntimeMode,
+    shared_state: &Arm64SharedState,
+    errno_ptr: u64,
 ) -> Result<
     (
         HashMap<String, u64>,
@@ -122,6 +139,7 @@ pub fn install_arm64_return_stubs(
     let trace_bus_for_hook = trace_bus.clone();
     let process_name_for_hook = process_name.to_string();
     let compat_for_hook = compat;
+    let shared_state_for_hook = shared_state.clone();
     emulator.add_code_hook(
         stub_region.base,
         stub_region.base + stub_region.size,
@@ -149,7 +167,14 @@ pub fn install_arm64_return_stubs(
                 );
                 if address == bucket {
                     if let Some(compat) = compat_for_hook {
-                        arm64_proxy_compat_host_import(emu, &name, compat);
+                        if compat.should_proxy_import(&name) {
+                            arm64_proxy_compat_host_import(
+                                emu,
+                                &name,
+                                &shared_state_for_hook,
+                                errno_ptr,
+                            );
+                        }
                     }
                 }
                 if let Ok(mut slot) = last_stub_for_hook.lock() {

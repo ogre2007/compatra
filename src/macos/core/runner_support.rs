@@ -40,6 +40,8 @@ pub fn install_return_stubs(
     trace_bus: &Option<crate::macos::SharedTraceBus>,
     process_name: &str,
     runtime_mode: crate::macos::RuntimeMode,
+    shared_state: &SharedState,
+    errno_ptr: u64,
 ) -> Result<
     (
         std::collections::HashMap<String, u64>,
@@ -56,5 +58,7 @@ pub fn install_return_stubs(
         trace_bus,
         process_name,
         runtime_mode,
+        shared_state,
+        errno_ptr,
     )
 }

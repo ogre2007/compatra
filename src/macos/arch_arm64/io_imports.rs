@@ -10,8 +10,11 @@ macro_rules! println {
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use crate::macos::arm64_compat_memory::{
+    allocate_arm64_heap, ensure_malloc_range_mapped, Arm64CompatGuestMemory,
+};
 use crate::macos::arm64_runner_support::{
     arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
     record_arm64_import, Arm64ImportTracker, Arm64SharedState,
@@ -28,7 +31,6 @@ use crate::macos::{
 };
 use crate::UnicornEmulator;
 
-const ARM64_MALLOC_CHUNK_SIZE: u64 = 0x10_0000;
 const ARM64_PIPE_IDLE_EOF_READ_LIMIT: u64 = 256;
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
@@ -96,60 +98,6 @@ fn write_guest_memory_resolving_tags(
         return Some(addr);
     }
     None
-}
-
-fn ensure_malloc_range_mapped(
-    emu: &mut UnicornEmulator,
-    mapped_until: &Arc<Mutex<u64>>,
-    addr: u64,
-    size: u64,
-) -> bool {
-    let end = align_up(addr.saturating_add(size), 0x1000);
-    let Ok(mut mapped_until) = mapped_until.lock() else {
-        return false;
-    };
-    while *mapped_until < end {
-        let chunk_start = *mapped_until;
-        let chunk_end = align_up(
-            end.max(chunk_start.saturating_add(ARM64_MALLOC_CHUNK_SIZE)),
-            0x1000,
-        );
-        if emu
-            .map_data_memory(chunk_start, chunk_end.saturating_sub(chunk_start))
-            .is_err()
-        {
-            return false;
-        }
-        *mapped_until = chunk_end;
-    }
-    true
-}
-
-pub(crate) fn allocate_arm64_heap(
-    emu: &mut UnicornEmulator,
-    malloc_next_addr: &Arc<Mutex<u64>>,
-    malloc_mapped_until: &Arc<Mutex<u64>>,
-    malloc_allocations: &Arc<Mutex<HashMap<u64, u64>>>,
-    requested: u64,
-    alignment: u64,
-) -> Option<(u64, u64)> {
-    let alignment = alignment.max(0x10);
-    let alloc_size = align_up(requested.max(1), alignment);
-    let page_size = align_up(alloc_size, 0x1000);
-    let result = {
-        let mut next = malloc_next_addr.lock().ok()?;
-        let addr = align_up(*next, alignment);
-        *next = addr.saturating_add(page_size);
-        if !ensure_malloc_range_mapped(emu, malloc_mapped_until, addr, page_size) {
-            return None;
-        }
-        let _ = emu.write_memory(addr, &vec![0u8; alloc_size as usize]);
-        addr
-    };
-    if let Ok(mut allocations) = malloc_allocations.lock() {
-        allocations.insert(result, alloc_size);
-    }
-    Some((result, alloc_size))
 }
 
 fn find_env_value_ptr(
@@ -642,6 +590,7 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -659,6 +608,32 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.fcntl_fd(fd, cmd, arg) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_fcntl(host fd={}, cmd=0x{:X}, arg=0x{:X}) -> {} errno={}",
+                                fd, cmd, arg, result.return_value, result.errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "fcntl")
+                            .arg("HostProxy", "true")
+                            .arg("Fd", fd.to_string())
+                            .arg("Cmd", format!("0x{:X}", cmd))
+                            .arg("Arg", format!("0x{:X}", arg))
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", result.errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (result, errno) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -1203,11 +1178,35 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let name = emu.read_reg("x0").unwrap_or(0);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.sysconf(name) {
+                        if let Some(errno) = result.errno {
+                            let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                        }
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_sysconf(host name={} {}) -> {} errno={:?}",
+                                name,
+                                sysconf_name(name),
+                                result.return_value,
+                                result.errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 let result = match name {
                     29 | 30 => 4096,
                     57 | 58 => 8,
@@ -1363,12 +1362,60 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let shared_state_for_hook = shared_state.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let name_ptr = emu.read_reg("x0").unwrap_or(0);
                 let name = read_cstring(emu, name_ptr, 128);
+                if compat_for_hook.is_some() {
+                    let mut args = [0u64; 8];
+                    args[0] = name_ptr;
+                    let mut memory = Arm64CompatGuestMemory {
+                        emulator: emu,
+                        shared_state: &shared_state_for_hook,
+                    };
+                    if let Some(result) = machina_compat::CompatibilityServices.proxy_arm64_import(
+                        &mut memory,
+                        "_getenv",
+                        &args,
+                    ) {
+                        let errno = result.errno.unwrap_or(0);
+                        let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                        let current_tid = thread_runtime
+                            .lock()
+                            .ok()
+                            .map(|rt| rt.current_thread_id.max(1))
+                            .unwrap_or(1);
+                        let current_pid = os_runtime
+                            .lock()
+                            .ok()
+                            .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                            .unwrap_or(1);
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_getenv(host name={:?}) -> 0x{:X} errno={}",
+                                name, result.return_value, errno
+                            ),
+                        );
+                        let event =
+                            arm64_process_event(current_pid, current_tid, "getenv", "getenv")
+                                .arg("HostProxy", "true")
+                                .arg("Name", name)
+                                .arg("Result", format!("0x{:X}", result.return_value))
+                                .arg("Errno", errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let result = find_env_value_ptr(emu, process_bootstrap.envp_addr, &name, 64);
                 let current_tid = thread_runtime
                     .lock()
@@ -1564,6 +1611,8 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let shared_state_for_hook = shared_state.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1580,6 +1629,41 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if compat_for_hook.is_some() {
+                    let mut args = [0u64; 8];
+                    args[0] = path_ptr;
+                    let mut memory = Arm64CompatGuestMemory {
+                        emulator: emu,
+                        shared_state: &shared_state_for_hook,
+                    };
+                    if let Some(result) = machina_compat::CompatibilityServices.proxy_arm64_import(
+                        &mut memory,
+                        "_opendir",
+                        &args,
+                    ) {
+                        let errno = result.errno.unwrap_or(0);
+                        let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_opendir(host path={:?}) -> 0x{:X} errno={}",
+                                path, result.return_value, errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "opendir")
+                            .arg("HostProxy", "true")
+                            .arg("Path", path)
+                            .arg("Result", format!("0x{:X}", result.return_value))
+                            .arg("Errno", errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (result, errno, resolved) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -1629,6 +1713,8 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let shared_state_for_hook = shared_state.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1644,6 +1730,41 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if compat_for_hook.is_some() {
+                    let mut args = [0u64; 8];
+                    args[0] = fd;
+                    let mut memory = Arm64CompatGuestMemory {
+                        emulator: emu,
+                        shared_state: &shared_state_for_hook,
+                    };
+                    if let Some(result) = machina_compat::CompatibilityServices.proxy_arm64_import(
+                        &mut memory,
+                        "_fdopendir",
+                        &args,
+                    ) {
+                        let errno = result.errno.unwrap_or(0);
+                        let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_fdopendir(host fd={}) -> 0x{:X} errno={}",
+                                fd, result.return_value, errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "fdopendir")
+                            .arg("HostProxy", "true")
+                            .arg("Fd", fd.to_string())
+                            .arg("Result", format!("0x{:X}", result.return_value))
+                            .arg("Errno", errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (result, errno) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -1787,6 +1908,8 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let shared_state_for_hook = shared_state.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1802,6 +1925,41 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if compat_for_hook.is_some() {
+                    let mut args = [0u64; 8];
+                    args[0] = dirp;
+                    let mut memory = Arm64CompatGuestMemory {
+                        emulator: emu,
+                        shared_state: &shared_state_for_hook,
+                    };
+                    if let Some(result) = machina_compat::CompatibilityServices.proxy_arm64_import(
+                        &mut memory,
+                        "_closedir",
+                        &args,
+                    ) {
+                        let errno = result.errno.unwrap_or(0);
+                        let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_closedir(host dirp=0x{:X}) -> {} errno={}",
+                                dirp, result.return_value, errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "closedir")
+                            .arg("HostProxy", "true")
+                            .arg("Dirp", format!("0x{:X}", dirp))
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (result, errno, fd) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -2037,6 +2195,8 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let shared_state_for_hook = shared_state.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -2054,6 +2214,56 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if compat_for_hook.is_some() {
+                    let mut args = [0u64; 8];
+                    args[0] = dirp;
+                    args[1] = entry_buf;
+                    args[2] = result_ptr;
+                    let mut memory = Arm64CompatGuestMemory {
+                        emulator: emu,
+                        shared_state: &shared_state_for_hook,
+                    };
+                    if let Some(result) =
+                        machina_compat::CompatibilityServices.proxy_arm64_import(
+                            &mut memory,
+                            "_readdir_r",
+                            &args,
+                        )
+                    {
+                        let errno = result.errno.unwrap_or(0);
+                        let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        let hit_ptr = if result_ptr != 0 {
+                            emu.read_memory(result_ptr, 8)
+                                .ok()
+                                .and_then(vec_u64_le)
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_readdir_r(host dirp=0x{:X}, entry=0x{:X}, result=0x{:X}) -> {} result_ptr=0x{:X}",
+                                dirp, entry_buf, result_ptr, result.return_value, hit_ptr
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "readdir_r")
+                            .arg("HostProxy", "true")
+                            .arg("Dirp", format!("0x{:X}", dirp))
+                            .arg("EntryBuf", format!("0x{:X}", entry_buf))
+                            .arg("ResultPtr", format!("0x{:X}", result_ptr))
+                            .arg("Result", result.return_value.to_string())
+                            .arg("HitPtr", format!("0x{:X}", hit_ptr))
+                            .arg("Errno", errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (errno, hit_name, hit_is_dir) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -2109,6 +2319,7 @@ pub fn install_arm64_io_imports(
             let import_tracker = import_tracker.clone();
             let trace_bus_for_hook = trace_bus.clone();
             let symbol_name = symbol.to_string();
+            let compat_for_hook = compat;
             emulator.add_code_hook(
                 addr,
                 addr + 4,
@@ -2116,6 +2327,36 @@ pub fn install_arm64_io_imports(
                     let path_ptr = emu.read_reg("x0").unwrap_or(0);
                     let stat_buf = emu.read_reg("x1").unwrap_or(0);
                     let path = read_cstring(emu, path_ptr, 4096);
+                    if let Some(compat) = compat_for_hook {
+                        let result = if symbol_name == "_lstat" {
+                            compat.lstat_path(emu, path_ptr, stat_buf)
+                        } else {
+                            compat.stat_path(emu, path_ptr, stat_buf)
+                        };
+                        if let Some(result) = result {
+                            let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                            let lr = emu.read_reg("lr").unwrap_or(0);
+                            let _ = emu.write_reg("x0", result.return_value);
+                            if lr != 0 {
+                                let _ = emu.write_reg("pc", lr);
+                            }
+                            record_arm64_import(
+                                &import_tracker,
+                                format!(
+                                    "{}(host path={:?}, buf=0x{:X}) -> {} errno={}",
+                                    symbol_name, path, stat_buf, result.return_value, result.errno
+                                ),
+                            );
+                            let event = arm64_io_event(1, 1, symbol_name.clone())
+                                .arg("HostProxy", "true")
+                                .arg("Path", path)
+                                .arg("Buf", format!("0x{:X}", stat_buf))
+                                .arg("Result", result.return_value.to_string())
+                                .arg("Errno", result.errno.to_string());
+                            emit_arm64_event(&trace_bus_for_hook, event);
+                            return;
+                        }
+                    }
                     let (result, errno, size, resolved) =
                         match os_runtime.lock().ok().map(|os| stat_guest_path(&os, &path)) {
                             Some(Ok((size, resolved))) => (0u64, 0u32, size, resolved),
@@ -2160,6 +2401,7 @@ pub fn install_arm64_io_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -2176,6 +2418,31 @@ pub fn install_arm64_io_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.fstat_fd(emu, fd, stat_buf) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_fstat(host fd={}, buf=0x{:X}) -> {} errno={}",
+                                fd, stat_buf, result.return_value, result.errno
+                            ),
+                        );
+                        let event = arm64_io_event(current_pid, current_tid, "fstat")
+                            .arg("HostProxy", "true")
+                            .arg("Fd", fd.to_string())
+                            .arg("Buf", format!("0x{:X}", stat_buf))
+                            .arg("Result", result.return_value.to_string())
+                            .arg("Errno", result.errno.to_string());
+                        emit_arm64_event(&trace_bus_for_hook, event);
+                        return;
+                    }
+                }
                 let (result, errno, size) = {
                     let os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -2215,12 +2482,32 @@ pub fn install_arm64_io_imports(
 
     if let Some(&addr) = stub_map.get("_getcwd") {
         let import_tracker = import_tracker.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let buf = emu.read_reg("x0").unwrap_or(0);
                 let size = emu.read_reg("x1").unwrap_or(0) as usize;
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.getcwd_path(emu, buf, size as u64) {
+                        let errno = result.errno.unwrap_or(0);
+                        let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_getcwd(host buf=0x{:X}, size={}) -> 0x{:X} errno={}",
+                                buf, size, result.return_value, errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 let cwd = b"/Users/analyst\0";
                 let (result, errno) = if buf != 0 && size >= cwd.len() {
                     let _ = emu.write_memory(buf, cwd);
@@ -2244,12 +2531,31 @@ pub fn install_arm64_io_imports(
 
     if let Some(&addr) = stub_map.get("_getrlimit") {
         let import_tracker = import_tracker.clone();
+        let compat_for_hook = compat;
         emulator.add_code_hook(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let resource = emu.read_reg("x0").unwrap_or(0);
                 let rlp = emu.read_reg("x1").unwrap_or(0);
+                if let Some(compat) = compat_for_hook {
+                    if let Some(result) = compat.getrlimit(emu, resource, rlp) {
+                        let _ = emu.write_memory(errno_ptr, &result.errno.to_le_bytes());
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let _ = emu.write_reg("x0", result.return_value);
+                        if lr != 0 {
+                            let _ = emu.write_reg("pc", lr);
+                        }
+                        record_arm64_import(
+                            &import_tracker,
+                            format!(
+                                "_getrlimit(host resource={}, rlp=0x{:X}) -> {} errno={}",
+                                resource, rlp, result.return_value, result.errno
+                            ),
+                        );
+                        return;
+                    }
+                }
                 if rlp != 0 {
                     let lim = u64::MAX / 4;
                     let _ = emu.write_memory(rlp, &lim.to_le_bytes());
