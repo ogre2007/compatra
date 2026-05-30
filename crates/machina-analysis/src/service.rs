@@ -6,6 +6,7 @@ use crate::capture::{
     append_file_write_payload_to_capture, extract_ascii_indicators, fnv1a64_hex,
     lossy_data_preview, shannon_entropy, write_pipe_stdin_capture, write_posix_spawn_argv_capture,
 };
+use crate::guest_artifacts::materialize_synthetic_file_bytes;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AnalysisServices;
@@ -87,6 +88,10 @@ impl AnalysisServices {
             dump_path,
             dumped_bytes: data.len(),
         })
+    }
+
+    pub fn materialize_synthetic_file_bytes(&self, raw_path: &str, size: usize) -> Vec<u8> {
+        materialize_synthetic_file_bytes(raw_path, size)
     }
 
     pub fn complete_pipe_stdin_capture(

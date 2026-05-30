@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::macos::analysis::AnalysisServices;
+use crate::macos::capture::lossy_data_preview;
 use crate::macos::{
-    align_up, lossy_data_preview, materialize_synthetic_file_bytes, read_cstring,
-    resolve_guest_path, syscall_event, RuntimeMode, TraceEvent, TraceMetadata,
+    align_up, read_cstring, resolve_guest_path, syscall_event, RuntimeMode, TraceEvent,
+    TraceMetadata,
 };
 use crate::{Emulator, MacOsError};
 
@@ -203,10 +205,11 @@ pub fn handle_basic_macos_syscall(
             let raw_path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
             let resolved = resolve_guest_path(&runtime.guest_fs_base, &raw_path);
             let fd = runtime.next_fd.fetch_add(1, Ordering::Relaxed);
+            let analysis = AnalysisServices::for_mode(runtime.runtime_mode);
             let entry = match File::open(&resolved) {
                 Ok(file) => SyscallFdEntry::HostFile(file),
                 Err(_) if creating => SyscallFdEntry::SyntheticCursor(Cursor::new(Vec::new())),
-                Err(_) if !runtime.runtime_mode.is_analysis() => {
+                Err(_) if analysis.is_none() => {
                     return_value = u64::MAX;
                     event = event
                         .arg("Path", raw_path)
@@ -220,7 +223,9 @@ pub fn handle_basic_macos_syscall(
                     });
                 }
                 Err(_) => SyscallFdEntry::SyntheticCursor(Cursor::new(
-                    materialize_synthetic_file_bytes(&raw_path, 4096),
+                    analysis
+                        .expect("analysis service checked above")
+                        .materialize_synthetic_file_bytes(&raw_path, 4096),
                 )),
             };
             if let Ok(mut table) = runtime.fd_table.lock() {

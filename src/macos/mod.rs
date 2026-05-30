@@ -117,16 +117,11 @@ pub use arm64_runtime::{
     wake_one_arm64_cond_waiter, Arm64SyntheticOsRuntime, Arm64ThreadContext,
 };
 pub use bootstrap::{setup_arm64_stack_bootstrap, GuestProcessBootstrap};
-pub use capture::{
-    extract_ascii_indicators, fnv1a64_hex, lossy_data_preview, sanitize_capture_label,
-    shannon_entropy, CaptureSummary,
-};
 pub use emulation::{
     collect_targets, cpu_type_name, ensure_macho_cpu, macho_cputype, run_target_batch,
     run_target_batch_with_mode, targets_from_args, BatchSummary, EmulationOptions, EmulationReport,
     EmulationStatus, MacosCpu, MacosEmulator, CPU_TYPE_ARM64, DEFAULT_SAMPLE_PATH,
 };
-pub use guest_analysis_artifacts::materialize_synthetic_file_bytes;
 pub use guest_files::{
     fstat_guest_file as generic_fstat_guest_file, open_guest_path as generic_open_guest_path,
     read_guest_directory_entry as generic_read_guest_directory_entry,
@@ -148,10 +143,8 @@ pub use memory_arena::{setup_guest_memory_arena, GuestMemoryArena, GuestMemoryAr
 pub use mode::RuntimeMode;
 pub use os::{ArchType, Emulator, Heap, LogLevel, MacOsError};
 pub use plugin_events::{
-    capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
-    syscall_event, thread_event, TraceMetadata,
+    io_event, kqueue_event, memory_event, process_event, syscall_event, thread_event, TraceMetadata,
 };
-pub use plugins::{register_analysis_plugins, register_plugins};
 pub use runner::{
     emulate_macos_arm64_binary, emulate_macos_arm64_binary_with_mode, emulate_macos_binary,
     emulate_macos_binary_with_mode,

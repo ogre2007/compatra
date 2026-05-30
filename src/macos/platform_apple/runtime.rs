@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::macos::capture::lossy_data_preview;
 use crate::macos::Emulator;
 
 #[derive(Clone, Debug)]
@@ -248,12 +249,12 @@ impl AppleRuntime {
                 "CFString(len={}, enc=0x{:X}, preview={})",
                 data.len(),
                 encoding,
-                crate::macos::lossy_data_preview(data, 64)
+                lossy_data_preview(data, 64)
             ),
             Some(AppleObject::Data { data }) => format!(
                 "CFData(len={}, preview={})",
                 data.len(),
-                crate::macos::lossy_data_preview(data, 64)
+                lossy_data_preview(data, 64)
             ),
             Some(AppleObject::Array { values }) => format!("CFArray(count={})", values.len()),
             Some(AppleObject::Dictionary { entries }) => {

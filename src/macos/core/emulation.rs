@@ -4,11 +4,10 @@
 
 use std::path::PathBuf;
 
+use crate::macos::analysis::register_trace_plugins_for_mode;
 use crate::macos::plugin_events::{
-    capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
-    syscall_event, thread_event, TraceMetadata,
+    io_event, kqueue_event, memory_event, process_event, syscall_event, thread_event, TraceMetadata,
 };
-use crate::macos::plugins::register_analysis_plugins;
 use crate::macos::trace::{
     PluginRegistry, StdoutTraceSink, TraceConfig, TraceEvent, TraceSink, Tracer,
 };
@@ -43,7 +42,6 @@ pub struct EmulationOptions {
     pub trace: TraceConfig,
     pub max_threads: usize,
     pub max_instructions: Option<u64>,
-    pub capture_dir: PathBuf,
 }
 
 impl Default for EmulationOptions {
@@ -53,7 +51,6 @@ impl Default for EmulationOptions {
             trace: TraceConfig::jsonl(),
             max_threads: 6,
             max_instructions: None,
-            capture_dir: PathBuf::from("target/machina-captures"),
         }
     }
 }
@@ -276,9 +273,7 @@ impl MacosEmulator<StdoutTraceSink> {
 impl<S: TraceSink> MacosEmulator<S> {
     pub fn new(options: EmulationOptions, tracer: Tracer<S>) -> Self {
         let mut plugins = PluginRegistry::new();
-        if options.mode.is_analysis() {
-            register_analysis_plugins(&mut plugins);
-        }
+        register_trace_plugins_for_mode(&mut plugins, options.mode);
         Self {
             options,
             tracer,
@@ -328,20 +323,6 @@ impl<S: TraceSink> MacosEmulator<S> {
 
     pub fn emit_kqueue_event(&mut self, metadata: &TraceMetadata, call: impl Into<String>) {
         self.emit_trace(kqueue_event(metadata, call));
-    }
-
-    pub fn emit_capture_event(&mut self, metadata: &TraceMetadata, name: impl Into<String>) {
-        if !self.options.mode.is_analysis() {
-            return;
-        }
-        self.emit_trace(capture_event(metadata, name));
-    }
-
-    pub fn emit_detect_event(&mut self, metadata: &TraceMetadata, name: impl Into<String>) {
-        if !self.options.mode.is_analysis() {
-            return;
-        }
-        self.emit_trace(detect_event(metadata, name));
     }
 
     pub fn into_tracer(self) -> Tracer<S> {
@@ -448,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn compat_mode_does_not_register_analysis_plugins_or_emit_detections() {
+    fn compat_mode_does_not_register_analysis_plugins() {
         let options = EmulationOptions {
             mode: RuntimeMode::Compat,
             trace: TraceConfig::full_jsonl(),
@@ -463,7 +444,6 @@ mod tests {
             .running_process("sample");
 
         emulator.emit_syscall_event(&meta, "write");
-        emulator.emit_detect_event(&meta, "process_execution");
 
         let output = String::from_utf8(emulator.into_tracer().into_sink().into_inner()).unwrap();
         assert!(output.is_empty());

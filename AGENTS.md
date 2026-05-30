@@ -17,7 +17,8 @@ repo. The intent is to keep direction stable across short, automated sessions.
     predicates.
   - `crates/machina-analysis` — analysis-only services: capture artifact
     writing, payload summaries, synthetic analyst fixtures such as log-stream
-    output, and synthetic guest artifact/bait data.
+    output, synthetic guest artifact/bait data, and built-in analysis plugin
+    preset specifications.
   - `crates/machina-compat` — compatibility-only host proxy services behind a
     guest-memory trait; it must not depend on analysis services or the main
     `machina` crate.

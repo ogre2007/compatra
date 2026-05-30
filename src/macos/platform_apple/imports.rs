@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::macos::capture::lossy_data_preview;
 use crate::macos::runner_support::{
     emit_arm64_event, record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
@@ -97,7 +98,7 @@ pub fn install_apple_imports(
                     .arg("Len", len.to_string())
                     .arg("Encoding", format!("0x{:X}", encoding))
                     .arg("Result", format!("0x{:X}", string_ref))
-                    .arg("Preview", crate::macos::lossy_data_preview(&data, 128)),
+                    .arg("Preview", lossy_data_preview(&data, 128)),
             );
             string_ref
         })?;
@@ -170,7 +171,7 @@ pub fn install_apple_imports(
                     .arg("Bytes", format!("0x{:X}", bytes_ptr))
                     .arg("Len", len.to_string())
                     .arg("Result", format!("0x{:X}", data_ref))
-                    .arg("Preview", crate::macos::lossy_data_preview(&data, 128)),
+                    .arg("Preview", lossy_data_preview(&data, 128)),
             );
             data_ref
         })?;

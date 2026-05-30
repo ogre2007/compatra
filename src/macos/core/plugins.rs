@@ -1,77 +1,38 @@
-//! Built-in architecture-independent trace plugin presets.
-//!
-//! These presets are the bridge from low-level intercepted events to
-//! DRAKVUF-like operator-facing streams such as `procmon`, `syscalls`,
-//! `filemon`, and `memmon`.
+//! Trace plugin adapters for analysis presets owned by `machina-analysis`.
 
 use crate::macos::trace::{CallTracePlugin, PluginRegistry, TraceCategory};
+use machina_analysis::{analysis_plugin_specs, AnalysisEventCategory, AnalysisPluginSpec};
+
+fn trace_category(category: AnalysisEventCategory) -> TraceCategory {
+    match category {
+        AnalysisEventCategory::Process => TraceCategory::Process,
+        AnalysisEventCategory::Thread => TraceCategory::Thread,
+        AnalysisEventCategory::Syscall => TraceCategory::Syscall,
+        AnalysisEventCategory::Io => TraceCategory::Io,
+        AnalysisEventCategory::Memory => TraceCategory::Memory,
+        AnalysisEventCategory::Kqueue => TraceCategory::Kqueue,
+        AnalysisEventCategory::Detect => TraceCategory::Detect,
+        AnalysisEventCategory::Capture => TraceCategory::Capture,
+        AnalysisEventCategory::Loader => TraceCategory::Loader,
+        AnalysisEventCategory::Import => TraceCategory::Import,
+    }
+}
+
+fn plugin_from_spec(spec: AnalysisPluginSpec) -> CallTracePlugin {
+    let mut plugin = CallTracePlugin::new(spec.name);
+    for category in spec.categories {
+        plugin = plugin.category(trace_category(*category));
+    }
+    for call in spec.calls {
+        plugin = plugin.call(*call);
+    }
+    plugin
+}
 
 pub fn register_analysis_plugins(registry: &mut PluginRegistry) {
-    registry.register(
-        CallTracePlugin::new("procmon")
-            .category(TraceCategory::Process)
-            .category(TraceCategory::Thread)
-            .call("execve")
-            .call("fork")
-            .call("wait4")
-            .call("exit")
-            .call("__exit"),
-    );
-    registry.register(
-        CallTracePlugin::new("syscalls")
-            .category(TraceCategory::Syscall)
-            .call("open")
-            .call("read")
-            .call("write")
-            .call("close")
-            .call("mmap")
-            .call("munmap")
-            .call("mprotect")
-            .call("sysctl"),
-    );
-    registry.register(
-        CallTracePlugin::new("filemon")
-            .category(TraceCategory::Io)
-            .call("open")
-            .call("close")
-            .call("read")
-            .call("write")
-            .call("dup2")
-            .call("pipe")
-            .call("fcntl"),
-    );
-    registry.register(
-        CallTracePlugin::new("memmon")
-            .category(TraceCategory::Memory)
-            .call("mmap")
-            .call("munmap")
-            .call("mprotect")
-            .call("brk"),
-    );
-    registry.register(
-        CallTracePlugin::new("kqueuemon")
-            .category(TraceCategory::Kqueue)
-            .call("kqueue")
-            .call("kevent"),
-    );
-    registry.register(CallTracePlugin::new("detect").category(TraceCategory::Detect));
-    registry.register(CallTracePlugin::new("capture").category(TraceCategory::Capture));
-    registry.register(
-        CallTracePlugin::new("loader")
-            .category(TraceCategory::Loader)
-            .call("dyld")
-            .call("stub_patch"),
-    );
-    registry.register(
-        CallTracePlugin::new("imports")
-            .category(TraceCategory::Import)
-            .call("ptrace")
-            .call("execve")
-            .call("fork")
-            .call("kevent")
-            .call("kqueue")
-            .call("import-hit"),
-    );
+    for spec in analysis_plugin_specs() {
+        registry.register(plugin_from_spec(*spec));
+    }
 }
 
 pub fn register_plugins(registry: &mut PluginRegistry) {
@@ -83,8 +44,9 @@ mod tests {
     use crate::macos::trace::{PluginRegistry, TraceCategory, TraceEvent};
 
     use super::*;
+
     #[test]
-    fn malware_preset_claims_detection_and_import_events() {
+    fn analysis_preset_claims_detection_and_import_events() {
         let mut plugins = PluginRegistry::new();
         register_plugins(&mut plugins);
 

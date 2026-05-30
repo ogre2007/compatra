@@ -364,7 +364,7 @@ fn proxy_host_open_arg0<M: GuestMemory + ?Sized>(
         libc::open(
             host_path.as_ptr(),
             flags as libc::c_int,
-            mode as libc::mode_t,
+            mode as libc::mode_t as libc::c_uint,
         )
     };
     Some(HostOpenResult {

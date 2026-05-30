@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::macos::capture::lossy_data_preview;
 use crate::macos::{
-    emit_runner_trace_event, lossy_data_preview, process_event, runtime_process_metadata,
-    SharedTraceBus,
+    emit_runner_trace_event, process_event, runtime_process_metadata, SharedTraceBus,
 };
 use crate::{Emulator, MachoBinary, UnicornEmulator};
 

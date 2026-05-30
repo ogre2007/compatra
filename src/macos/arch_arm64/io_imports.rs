@@ -17,15 +17,15 @@ use crate::macos::arm64_runner_support::{
     arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
     record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
+use crate::macos::capture::lossy_data_preview;
 use crate::macos::compat::CompatibilityServices;
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
-    duplicate_synthetic_fd, fstat_guest_file, lossy_data_preview, open_directory_stream,
-    open_guest_file, open_guest_file_with_flags, read_guest_directory_entry, read_guest_file,
-    register_process_fd, resolve_directory_stream_fd, resolve_guest_path,
-    resolve_process_fd_target, stat_guest_path, terminate_synthetic_process, Emulator,
-    PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticKeventRegistration,
-    SyntheticPipe,
+    duplicate_synthetic_fd, fstat_guest_file, open_directory_stream, open_guest_file,
+    open_guest_file_with_flags, read_guest_directory_entry, read_guest_file, register_process_fd,
+    resolve_directory_stream_fd, resolve_guest_path, resolve_process_fd_target, stat_guest_path,
+    terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
+    SyntheticKeventRegistration, SyntheticPipe,
 };
 use crate::UnicornEmulator;
 

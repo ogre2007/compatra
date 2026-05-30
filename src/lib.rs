@@ -8,10 +8,6 @@ pub use macos::arm64_runtime::{
     Arm64SyntheticOsRuntime, Arm64ThreadContext,
 };
 pub use macos::bootstrap::{setup_arm64_stack_bootstrap, GuestProcessBootstrap};
-pub use macos::capture::{
-    extract_ascii_indicators, fnv1a64_hex, lossy_data_preview, sanitize_capture_label,
-    shannon_entropy, CaptureSummary,
-};
 pub use macos::emulation::{
     collect_targets, cpu_type_name, ensure_macho_cpu, macho_cputype, run_target_batch,
     run_target_batch_with_mode, targets_from_args, BatchSummary, EmulationOptions, EmulationReport,
@@ -33,14 +29,11 @@ pub use macos::macho_utils::{
     patch_section64_u64_slots, reload_file_backed_range, section32_indirect_symbol_name,
     section_indirect_symbol_name, symbol_name_by_index, trim_name,
 };
-pub use macos::materialize_synthetic_file_bytes;
 pub use macos::memory_arena::{setup_guest_memory_arena, GuestMemoryArena, GuestMemoryArenaConfig};
 pub use macos::mode::RuntimeMode;
 pub use macos::plugin_events::{
-    capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
-    syscall_event, thread_event, TraceMetadata,
+    io_event, kqueue_event, memory_event, process_event, syscall_event, thread_event, TraceMetadata,
 };
-pub use macos::plugins::{register_analysis_plugins, register_plugins};
 pub use macos::policy::MacOsPolicyManager;
 pub use macos::runner::{
     emulate_macos_arm64_binary, emulate_macos_arm64_binary_with_mode, emulate_macos_binary,
