@@ -1,11 +1,10 @@
 //! Shared setup helpers for the legacy arm64 no-dyld runner.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::macos::compat::CompatibilityServices;
 use crate::macos::plugin_events::import_event;
 use crate::macos::{
     emit_runner_trace_event, io_event, kqueue_event, memory_event, process_event,
@@ -163,50 +162,18 @@ pub fn initialize_arm64_shared_state_with_mode(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn normalized_import_name(symbol: &str) -> &str {
-    symbol.strip_prefix('_').unwrap_or(symbol)
-}
-
-fn is_host_proxy_import(symbol: &str, runtime_mode: RuntimeMode) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        runtime_mode == RuntimeMode::Compat && normalized_import_name(symbol) == "puts"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (symbol, runtime_mode);
-        false
-    }
-}
-
-fn proxy_compat_host_import(emu: &mut dyn Emulator, symbol: &str, runtime_mode: RuntimeMode) {
-    if !is_host_proxy_import(symbol, runtime_mode) {
-        return;
-    }
-
-    proxy_host_puts(emu);
-}
-
-#[cfg(target_os = "macos")]
-fn proxy_host_puts(emu: &mut dyn Emulator) {
-    let Ok(ptr) = emu.read_reg("x0") else {
+fn arm64_proxy_compat_host_import(
+    emu: &mut dyn Emulator,
+    symbol: &str,
+    compat: CompatibilityServices,
+) {
+    let Ok(arg0_ptr) = emu.read_reg("x0") else {
         return;
     };
-    let Ok(text) = crate::macos::read_cstring(emu, ptr, 4096) else {
-        return;
-    };
-    let Ok(host_text) = CString::new(text) else {
-        return;
-    };
-    let ret = unsafe { libc::puts(host_text.as_ptr()) };
-    let _ = emu.write_reg("x0", ret as u32 as u64);
-}
 
-#[cfg(not(target_os = "macos"))]
-fn proxy_host_puts(_emu: &mut dyn Emulator) {
-    // Compat-mode host libc proxying is Darwin-only; non-macOS builds keep
-    // the target compiled for CI and local analysis work.
+    if let Some(result) = compat.proxy_cstring_arg0_import(emu, symbol, arg0_ptr) {
+        let _ = emu.write_reg("x0", result.return_value);
+    };
 }
 
 pub fn install_arm64_return_stubs(
@@ -220,6 +187,7 @@ pub fn install_arm64_return_stubs(
 ) -> Result<(HashMap<String, u64>, Arc<HashMap<u64, String>>), Box<dyn std::error::Error>> {
     let arm64_ret0_stub = [0x00, 0x00, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6];
     let arm64_ret_stub = [0xC0, 0x03, 0x5F, 0xD6];
+    let compat = CompatibilityServices::for_mode(runtime_mode);
     let mut stub_addr = stub_region.base;
     let mut stub_map = HashMap::new();
     for (name, _) in undefs {
@@ -227,7 +195,7 @@ pub fn install_arm64_return_stubs(
         {
             stub_addr += 0x100;
         }
-        let stub_code = if is_host_proxy_import(name, runtime_mode) {
+        let stub_code = if compat.is_some_and(|compat| compat.should_proxy_import(name)) {
             &arm64_ret_stub[..]
         } else {
             &arm64_ret0_stub[..]
@@ -259,6 +227,7 @@ pub fn install_arm64_return_stubs(
     let stub_name_map_for_hook = stub_name_map.clone();
     let trace_bus_for_hook = trace_bus.clone();
     let process_name_for_hook = process_name.to_string();
+    let compat_for_hook = compat;
     emulator.add_code_hook(
         stub_region.base,
         stub_region.base + stub_region.size,
@@ -281,7 +250,9 @@ pub fn install_arm64_return_stubs(
                     .arg("lr", format!("0x{:X}", emu.read_reg("lr").unwrap())),
                 );
                 if address == bucket {
-                    proxy_compat_host_import(emu, name, runtime_mode);
+                    if let Some(compat) = compat_for_hook {
+                        arm64_proxy_compat_host_import(emu, name, compat);
+                    }
                 }
                 //println!("IMPORT HIT");
                 if let Ok(mut slot) = last_stub_for_hook.lock() {

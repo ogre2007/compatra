@@ -3,6 +3,7 @@ pub mod binary_bootstrap;
 pub mod binary_setup;
 pub mod bootstrap;
 pub mod capture;
+pub use crate::macos::compat;
 pub mod diagnostics;
 pub mod emulation;
 pub mod io_imports;

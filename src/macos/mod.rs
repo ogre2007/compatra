@@ -37,6 +37,8 @@ pub mod binary_setup;
 pub mod bootstrap;
 #[path = "core/capture.rs"]
 pub mod capture;
+#[path = "core/compat.rs"]
+pub mod compat;
 pub mod core;
 #[path = "core/diagnostics.rs"]
 pub mod diagnostics;

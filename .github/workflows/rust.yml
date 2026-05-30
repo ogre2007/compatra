@@ -31,7 +31,24 @@ jobs:
         test "$(uname -s)" = "Darwin"
         test "$(uname -m)" = "x86_64"
         sw_vers
-    - name: Build machina
-      run: cargo build --bin machina --verbose
-    - name: Run compat-mode smoke test
-      run: cargo test --test compat_mode_macos --verbose
+    - name: Build release machina
+      run: cargo build --bin machina --release --verbose
+    - name: Run compat-mode smoke test with proof output
+      run: cargo test --test compat_mode_macos --verbose -- --nocapture
+    - name: Package Intel macOS compatibility utility
+      run: |
+        mkdir -p dist
+        cp target/release/machina dist/machina
+        chmod +x dist/machina
+        tar -czf dist/machina-macos-intel-x86_64.tar.gz -C dist machina
+        shasum -a 256 dist/machina-macos-intel-x86_64.tar.gz > dist/machina-macos-intel-x86_64.tar.gz.sha256
+        ls -lh dist
+    - name: Upload Intel macOS compatibility utility
+      uses: actions/upload-artifact@v4
+      with:
+        name: machina-macos-intel-x86_64
+        path: |
+          dist/machina-macos-intel-x86_64.tar.gz
+          dist/machina-macos-intel-x86_64.tar.gz.sha256
+        if-no-files-found: error
+        retention-days: 14

@@ -56,7 +56,8 @@ fn compat_mode_executes_arm64_hello_without_analysis_trace_plugins() {
         return;
     }
 
-    let output = Command::new(machina_binary())
+    let machina = machina_binary();
+    let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
         .arg(&fixture)
@@ -73,14 +74,54 @@ fn compat_mode_executes_arm64_hello_without_analysis_trace_plugins() {
         .output()
         .expect("failed to launch machina binary");
 
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let startup_marker = stdout
+        .lines()
+        .find(|line| line.contains("[STARTUP][arm64 #00] pc="))
+        .unwrap_or("<missing startup marker>");
+    let done_marker = stdout
+        .lines()
+        .find(|line| {
+            line.contains("[THREAD][arm64] reached done_addr")
+                || line.contains("[STARTUP][arm64] reached done_addr")
+        })
+        .unwrap_or("<missing done marker>");
+
+    eprintln!(
+        "compat proof: host={} arch={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    eprintln!(
+        "compat proof: command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof: status={status}");
+    eprintln!("compat proof: guest stdout={guest_stdout:?}");
+    eprintln!("compat proof: startup marker={startup_marker}");
+    eprintln!("compat proof: done marker={done_marker}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof: stderr:\n{stderr}");
+    }
+
     assert!(
-        output.status.success(),
+        status.success(),
         "machina exited with non-zero status {:?}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+        status,
+        stderr
     );
 
-    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
     assert!(
         stdout.contains("Hello World"),
         "compat smoke did not proxy guest stdout from the arm64 fixture; stdout:\n{stdout}"
