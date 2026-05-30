@@ -68,7 +68,9 @@ impl CompatibilityServices {
             #[cfg(target_os = "macos")]
             HostImportKind::Puts => proxy_host_puts(memory, arg0_ptr),
             #[cfg(target_os = "macos")]
-            HostImportKind::Printf => proxy_host_printf(memory, &[arg0_ptr, 0, 0, 0, 0, 0, 0, 0]),
+            HostImportKind::Printf => {
+                proxy_host_printf(memory, &[arg0_ptr, 0, 0, 0, 0, 0, 0, 0], None)
+            }
             #[cfg(target_os = "macos")]
             HostImportKind::Putchar => proxy_host_putchar(arg0_ptr),
         }
@@ -80,14 +82,27 @@ impl CompatibilityServices {
         symbol: &str,
         args: &[u64; 8],
     ) -> Option<HostCallResult> {
+        self.proxy_arm64_import_with_stack(memory, symbol, args, None)
+    }
+
+    pub fn proxy_arm64_import_with_stack<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        symbol: &str,
+        args: &[u64; 8],
+        stack_ptr: Option<u64>,
+    ) -> Option<HostCallResult> {
         #[cfg(not(target_os = "macos"))]
-        let _ = (&mut *memory, args);
+        let _ = (&mut *memory, args, stack_ptr);
 
         match host_import_kind(symbol)? {
             #[cfg(target_os = "macos")]
             HostImportKind::Puts => proxy_host_puts(memory, args[0]),
             #[cfg(target_os = "macos")]
-            HostImportKind::Printf => proxy_host_printf(memory, args),
+            HostImportKind::Printf => {
+                let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 16));
+                proxy_host_printf(memory, args, stack_args.as_deref())
+            }
             #[cfg(target_os = "macos")]
             HostImportKind::Putchar => proxy_host_putchar(args[0]),
         }
@@ -204,6 +219,26 @@ fn read_cstring<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn read_stack_u64_args<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    stack_ptr: u64,
+    max_args: usize,
+) -> Vec<u64> {
+    let mut args = Vec::new();
+    for idx in 0..max_args {
+        let addr = stack_ptr.saturating_add((idx * 8) as u64);
+        let Ok(bytes) = memory.read_memory(addr, 8) else {
+            break;
+        };
+        let Ok(raw) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+            break;
+        };
+        args.push(u64::from_le_bytes(raw));
+    }
+    args
+}
+
+#[cfg(target_os = "macos")]
 fn clear_errno() {
     unsafe {
         *libc::__error() = 0;
@@ -257,9 +292,10 @@ fn proxy_host_putchar(ch: u64) -> Option<HostCallResult> {
 fn proxy_host_printf<M: GuestMemory + ?Sized>(
     memory: &mut M,
     args: &[u64; 8],
+    stack_args: Option<&[u64]>,
 ) -> Option<HostCallResult> {
     let format = read_cstring(memory, args[0], 4096).ok()?;
-    let rendered = render_arm64_printf(memory, &format, &args[1..]);
+    let rendered = render_arm64_printf(memory, &format, &args[1..], stack_args);
     let host_text = CString::new(rendered).ok()?;
     clear_errno();
     let ret = unsafe { libc::printf(b"%s\0".as_ptr().cast(), host_text.as_ptr()) };
@@ -272,7 +308,8 @@ fn proxy_host_printf<M: GuestMemory + ?Sized>(
 fn render_arm64_printf<M: GuestMemory + ?Sized>(
     memory: &mut M,
     format: &str,
-    args: &[u64],
+    register_args: &[u64],
+    stack_args: Option<&[u64]>,
 ) -> String {
     let mut out = String::new();
     let mut chars = format.chars().peekable();
@@ -306,16 +343,30 @@ fn render_arm64_printf<M: GuestMemory + ?Sized>(
             long_count += 1;
         }
         let spec = chars.next().unwrap_or('%');
-        let arg = args.get(arg_index).copied().unwrap_or(0);
+        let stack_arg = stack_args.and_then(|args| args.get(arg_index).copied());
+        let register_arg = register_args.get(arg_index).copied();
+        let arg = stack_arg.or(register_arg).unwrap_or(0);
         if !matches!(spec, '%') {
             arg_index = arg_index.saturating_add(1);
         }
         match spec {
             's' => {
-                if arg == 0 {
-                    out.push_str("(null)");
-                } else if let Ok(value) = read_cstring(memory, arg, 4096) {
-                    out.push_str(&value);
+                let mut rendered = false;
+                for candidate in stack_arg.into_iter().chain(register_arg) {
+                    if candidate == 0 {
+                        out.push_str("(null)");
+                        rendered = true;
+                        break;
+                    }
+                    if let Ok(value) = read_cstring(memory, candidate, 4096) {
+                        out.push_str(&value);
+                        rendered = true;
+                        break;
+                    }
+                }
+                if !rendered {
+                    // Leave unreadable string arguments empty, matching the
+                    // previous permissive renderer behavior.
                 }
             }
             'c' => out.push(char::from_u32((arg as u8) as u32).unwrap_or('\u{FFFD}')),
@@ -466,5 +517,56 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert!(!compat.should_proxy_import("_puts"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn printf_renderer_prefers_darwin_stack_varargs() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"dlsym\0");
+        memory.write_guest(0x2000, &0x1000u64.to_le_bytes());
+        memory.write_guest(0x3000, b"register\0");
+
+        let stack_args = read_stack_u64_args(&mut memory, 0x2000, 1);
+        assert_eq!(
+            render_arm64_printf(
+                &mut memory,
+                "compat %s path\n",
+                &[0x3000],
+                Some(&stack_args)
+            ),
+            "compat dlsym path\n"
+        );
     }
 }

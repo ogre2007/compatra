@@ -62,8 +62,9 @@ fn arm64_proxy_compat_host_import(
         };
         *arg = value;
     }
+    let stack_ptr = emu.read_reg("sp").ok();
 
-    if let Some(result) = compat.proxy_arm64_import(emu, symbol, &args) {
+    if let Some(result) = compat.proxy_arm64_import_with_stack(emu, symbol, &args, stack_ptr) {
         let _ = emu.write_reg("x0", result.return_value);
     };
 }

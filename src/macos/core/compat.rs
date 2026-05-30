@@ -70,6 +70,22 @@ impl CompatibilityServices {
         machina_compat::CompatibilityServices.proxy_arm64_import(&mut memory, symbol, args)
     }
 
+    pub fn proxy_arm64_import_with_stack(
+        &self,
+        emu: &mut dyn Emulator,
+        symbol: &str,
+        args: &[u64; 8],
+        stack_ptr: Option<u64>,
+    ) -> Option<HostCallResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.proxy_arm64_import_with_stack(
+            &mut memory,
+            symbol,
+            args,
+            stack_ptr,
+        )
+    }
+
     pub fn open_path_arg0(
         &self,
         emu: &mut dyn Emulator,
