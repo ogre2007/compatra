@@ -5,6 +5,7 @@ pub mod capture;
 pub mod diagnostics;
 pub mod emulation;
 pub mod io_imports;
+pub mod mode;
 pub mod plugin_events;
 pub mod plugins;
 pub mod process_imports;

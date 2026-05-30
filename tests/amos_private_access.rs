@@ -92,9 +92,9 @@ fn amos_reaches_private_file_access_paths() {
         "sample did not attempt to open Binance wallet data"
     );
 
-    let any_read_seen = trace.lines().any(|line| {
-        line.contains("\"plugin\":\"filemon\"") && line.contains("\"Call\":\"read\"")
-    });
+    let any_read_seen = trace
+        .lines()
+        .any(|line| line.contains("\"plugin\":\"filemon\"") && line.contains("\"Call\":\"read\""));
     assert!(any_read_seen, "sample did not perform any file reads");
 
     assert!(

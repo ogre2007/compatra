@@ -7,10 +7,10 @@ pub mod arch_arm64;
 pub mod arm64_binary_setup;
 #[path = "arch_arm64/bootstrap.rs"]
 pub mod arm64_bootstrap;
-#[path = "arch_arm64/diagnostics.rs"]
-pub mod arm64_diagnostics;
 #[path = "arch_arm64/cpp_imports.rs"]
 pub mod arm64_cpp_imports;
+#[path = "arch_arm64/diagnostics.rs"]
+pub mod arm64_diagnostics;
 #[path = "arch_arm64/io_imports.rs"]
 pub mod arm64_io_imports;
 #[path = "arch_arm64/process_imports.rs"]
@@ -52,6 +52,8 @@ pub mod io_imports;
 pub mod loader;
 pub mod macho_utils;
 pub mod memory_arena;
+#[path = "core/mode.rs"]
+pub mod mode;
 pub mod os;
 pub mod platform_apple;
 #[path = "core/plugin_events.rs"]
@@ -109,8 +111,8 @@ pub use capture::{
 };
 pub use emulation::{
     collect_targets, cpu_type_name, ensure_macho_cpu, macho_cputype, run_target_batch,
-    targets_from_args, BatchSummary, EmulationOptions, EmulationReport, EmulationStatus, MacosCpu,
-    MacosEmulator, CPU_TYPE_ARM64, DEFAULT_SAMPLE_PATH,
+    run_target_batch_with_mode, targets_from_args, BatchSummary, EmulationOptions, EmulationReport,
+    EmulationStatus, MacosCpu, MacosEmulator, CPU_TYPE_ARM64, DEFAULT_SAMPLE_PATH,
 };
 pub use guest_files::{
     fstat_guest_file as generic_fstat_guest_file, materialize_synthetic_file_bytes,
@@ -118,7 +120,8 @@ pub use guest_files::{
     read_guest_directory_entry as generic_read_guest_directory_entry,
     read_guest_file as generic_read_guest_file, resolve_guest_path,
     stat_guest_path as generic_stat_guest_path, GuestDirectoryEntry, GuestFileTable,
-    GuestOpenTarget, SyntheticGuestDirectory, SyntheticGuestFile, SyntheticGuestFileKind,
+    GuestOpenTarget, GuestPathPolicy, SyntheticGuestDirectory, SyntheticGuestFile,
+    SyntheticGuestFileKind,
 };
 pub use guest_memory::{
     align_up, alloc_bytes, alloc_cstr, push_recent_trace, read_arm64_argv, read_cstring,
@@ -130,24 +133,28 @@ pub use macho_utils::{
     section_indirect_symbol_name, symbol_name_by_index, trim_name,
 };
 pub use memory_arena::{setup_guest_memory_arena, GuestMemoryArena, GuestMemoryArenaConfig};
+pub use mode::RuntimeMode;
 pub use os::{ArchType, Emulator, Heap, LogLevel, MacOsError};
 pub use plugin_events::{
     capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
     syscall_event, thread_event, TraceMetadata,
 };
 pub use plugins::register_plugins;
-pub use runner::{emulate_macos_arm64_binary, emulate_macos_binary};
+pub use runner::{
+    emulate_macos_arm64_binary, emulate_macos_arm64_binary_with_mode, emulate_macos_binary,
+    emulate_macos_binary_with_mode,
+};
 pub use runner_plugins::{
-    emit_event as emit_runner_trace_event, shared_trace_bus_from_env, SharedTraceBus,
+    emit_event as emit_runner_trace_event, shared_trace_bus_for_mode_from_env,
+    shared_trace_bus_from_env, SharedTraceBus,
 };
 pub use runtime::{
     bind_process_fd_target, block_active_arm64_thread_on_cond, block_current_arm64_thread_on_cond,
     close_directory_stream, close_synthetic_fd, dispatch_pending_arm64_thread,
     dispatch_pending_arm64_thread_by_id, fstat_guest_file, has_pipe_endpoint_ref,
-    open_directory_stream, open_guest_file, open_guest_file_with_flags,
-    read_guest_directory_entry, read_guest_file,
-    register_process_fd, resolve_directory_stream_fd, resolve_process_fd_target, restore_context,
-    save_context, stat_guest_path, terminate_synthetic_process, wake_cond_waiters,
+    open_directory_stream, open_guest_file, open_guest_file_with_flags, read_guest_directory_entry,
+    read_guest_file, register_process_fd, resolve_directory_stream_fd, resolve_process_fd_target,
+    restore_context, save_context, stat_guest_path, terminate_synthetic_process, wake_cond_waiters,
     wake_one_cond_waiter, yield_active_arm64_thread, ActiveArm64Thread, Arm64ThreadRuntime,
     ForkParentResume, PendingArm64Thread, SyntheticFdTarget, SyntheticKeventRegistration,
     SyntheticOsRuntime, SyntheticPipe, SyntheticProcess, ThreadContext, WaitingArm64Thread,

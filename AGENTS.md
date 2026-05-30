@@ -57,6 +57,9 @@ Environment knobs the code currently honors (keep this list in sync if you
 add new ones):
 
 - `MACHINA_PLUGIN_TRACE` — enable/disable the plugin trace bus (default on).
+- `MACHINA_MODE` — `analysis` (default) or `compat`. Analysis mode keeps
+  malware-analysis defaults; compat mode disables analysis-only synthetic
+  artifacts, captures, detections, and built-in trace plugin presets.
 - `MACHINA_TRACE_FORMAT` — `jsonl` (default) or `human`.
 - `MACHINA_TRACE_PROFILE` — `compact` (default), `full`, or `debug`.
 - `MACHINA_TRACE_WINDOW_START` / `_END` / `_HITS` — bounded instruction trace
@@ -71,6 +74,11 @@ add new ones):
 - `MACHINA_TIMEOUT_USECS` / `MACHINA_MAX_INSTRUCTIONS` — explicit emulation
   budgets; always override the active `MACHINA_PROFILE`.
 - `MACHINA_ARGV_APPEND` — extra guest argv tokens appended at bootstrap.
+- `MACHINA_BYPASS_USAGE_CHECK` — analysis helper for selected arm64 call
+  sites; tokens are `0xADDR`, `0xADDR=VAL0,VAL1`, or
+  `0xADDR@0xLR=VAL` to apply a return override only when LR matches.
+- `MACHINA_TRACE_FN_ENTRY` — comma-separated `<label>:<hex addr>` hooks that
+  emit structured `function-entry` trace events without changing execution.
 - `MACHINA_USE_DYLD` — opt-in to dyld load path; default is the no-dyld
   fallback.
 - `MACHINA_DEBUG_STDOUT` — gate legacy human-readable debug prints.

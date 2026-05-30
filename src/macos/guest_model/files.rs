@@ -39,15 +39,31 @@ pub struct GuestDirectoryEntry {
 #[derive(Clone, Debug)]
 pub struct GuestPathPolicy {
     pub materialize_missing_paths: bool,
+    pub create_missing_files: bool,
     pub synthetic_file_size: usize,
+}
+
+impl GuestPathPolicy {
+    pub fn analysis() -> Self {
+        Self {
+            materialize_missing_paths: true,
+            create_missing_files: true,
+            synthetic_file_size: 4096,
+        }
+    }
+
+    pub fn compat() -> Self {
+        Self {
+            materialize_missing_paths: false,
+            create_missing_files: true,
+            synthetic_file_size: 0,
+        }
+    }
 }
 
 impl Default for GuestPathPolicy {
     fn default() -> Self {
-        Self {
-            materialize_missing_paths: true,
-            synthetic_file_size: 4096,
-        }
+        Self::analysis()
     }
 }
 
@@ -65,10 +81,15 @@ pub struct GuestFileTable {
 
 impl GuestFileTable {
     pub fn new(guest_fs_base: PathBuf) -> Self {
+        Self::with_policy(guest_fs_base, GuestPathPolicy::default())
+    }
+
+    pub fn with_policy(guest_fs_base: PathBuf, policy: GuestPathPolicy) -> Self {
         Self {
             next_file_id: 1,
             next_dir_id: 1,
             guest_fs_base,
+            policy,
             ..Default::default()
         }
     }
@@ -292,6 +313,27 @@ fn synthesize_missing_open_target(
     }
 }
 
+fn create_missing_file_target(
+    table: &mut GuestFileTable,
+    pid: u64,
+    fd: u64,
+    raw_path: &str,
+    resolved: &Path,
+) -> (GuestOpenTarget, PathBuf) {
+    let file_id = table.next_file_id.max(1);
+    table.next_file_id = file_id.saturating_add(1);
+    table.files.insert(
+        file_id,
+        SyntheticGuestFile {
+            raw_path: raw_path.to_string(),
+            resolved_path: resolved.to_path_buf(),
+            kind: SyntheticGuestFileKind::HostBytes(Vec::new()),
+        },
+    );
+    table.file_offsets.insert((pid, fd), 0);
+    (GuestOpenTarget::File(file_id), resolved.to_path_buf())
+}
+
 fn read_directory_entries(resolved: &Path) -> Result<Vec<GuestDirectoryEntry>, u32> {
     let mut entries = vec![
         GuestDirectoryEntry {
@@ -363,11 +405,17 @@ pub fn open_guest_path_with_flags(
     }
 
     let creating = (flags & GUEST_OPEN_CREATE) != 0;
-    let allow_synthesize = table.policy.materialize_missing_paths
-        && (creating || should_materialize_missing_path(raw_path));
+    let allow_create = creating && table.policy.create_missing_files;
+    let allow_synthesize =
+        table.policy.materialize_missing_paths && should_materialize_missing_path(raw_path);
 
     let meta = match std::fs::metadata(&resolved) {
         Ok(meta) => meta,
+        Err(_) if allow_create => {
+            return Ok(create_missing_file_target(
+                table, pid, fd, raw_path, &resolved,
+            ));
+        }
         Err(_) if allow_synthesize => {
             return Ok(synthesize_missing_open_target(
                 table, pid, fd, raw_path, &resolved,
@@ -446,6 +494,20 @@ pub fn read_guest_file(
 
 pub fn stat_guest_path(table: &GuestFileTable, raw_path: &str) -> Result<(u64, PathBuf), u32> {
     let resolved = resolve_guest_path(&table.guest_fs_base, raw_path);
+    if let Some(file) = table.files.values().find(|file| file.raw_path == raw_path) {
+        let size = match &file.kind {
+            SyntheticGuestFileKind::HostBytes(data) => data.len() as u64,
+            SyntheticGuestFileKind::Urandom => 0,
+        };
+        return Ok((size, file.resolved_path.clone()));
+    }
+    if let Some(dir) = table
+        .directories
+        .values()
+        .find(|dir| dir.raw_path == raw_path)
+    {
+        return Ok((0, dir.resolved_path.clone()));
+    }
     match raw_path {
         "/dev/urandom" => Ok((0, resolved)),
         _ => match std::fs::metadata(&resolved) {
@@ -534,5 +596,32 @@ mod tests {
             stat_guest_path(&table, "/tmp/com.apple.lock.1721070918"),
             Err(2)
         );
+    }
+
+    #[test]
+    fn compat_policy_does_not_materialize_missing_analysis_artifacts() {
+        let mut table = GuestFileTable::with_policy(
+            std::env::temp_dir().join("machina-guest-files-compat-test"),
+            GuestPathPolicy::compat(),
+        );
+        assert_eq!(
+            stat_guest_path(
+                &table,
+                "/Users/analyst/Library/Application Support/Google/Chrome/Default/Login Data"
+            ),
+            Err(2)
+        );
+        assert_eq!(
+            open_guest_path(&mut table, 1, 3, "/Users/analyst/.electrum/wallets/").map(|_| ()),
+            Err(2)
+        );
+        assert!(open_guest_path_with_flags(
+            &mut table,
+            1,
+            4,
+            "/tmp/new-compat-file",
+            GUEST_OPEN_CREATE
+        )
+        .is_ok());
     }
 }

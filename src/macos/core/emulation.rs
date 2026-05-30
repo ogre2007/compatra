@@ -12,6 +12,7 @@ use crate::macos::plugins::register_plugins;
 use crate::macos::trace::{
     PluginRegistry, StdoutTraceSink, TraceConfig, TraceEvent, TraceSink, Tracer,
 };
+use crate::macos::RuntimeMode;
 use crate::MachoBinary;
 
 pub const DEFAULT_SAMPLE_PATH: &str = r"fixtures\macos\bin\arm64_hello";
@@ -38,6 +39,7 @@ impl MacosCpu {
 
 #[derive(Debug, Clone)]
 pub struct EmulationOptions {
+    pub mode: RuntimeMode,
     pub trace: TraceConfig,
     pub max_threads: usize,
     pub max_instructions: Option<u64>,
@@ -47,6 +49,7 @@ pub struct EmulationOptions {
 impl Default for EmulationOptions {
     fn default() -> Self {
         Self {
+            mode: RuntimeMode::Analysis,
             trace: TraceConfig::jsonl(),
             max_threads: 6,
             max_instructions: None,
@@ -168,11 +171,23 @@ pub fn targets_from_args(args: &[String]) -> Result<Vec<PathBuf>, String> {
     }
 }
 
-pub fn run_target_batch<F>(targets: Vec<PathBuf>, mut runner: F) -> BatchSummary
+pub fn run_target_batch<F>(targets: Vec<PathBuf>, runner: F) -> BatchSummary
 where
     F: FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let trace_bus = crate::macos::shared_trace_bus_from_env();
+    let mode = RuntimeMode::from_env().unwrap_or_default();
+    run_target_batch_with_mode(targets, mode, runner)
+}
+
+pub fn run_target_batch_with_mode<F>(
+    targets: Vec<PathBuf>,
+    mode: RuntimeMode,
+    mut runner: F,
+) -> BatchSummary
+where
+    F: FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let trace_bus = crate::macos::shared_trace_bus_for_mode_from_env(mode);
     let batch_meta = TraceMetadata::new()
         .pid(0)
         .ppid(0)
@@ -182,6 +197,7 @@ where
         &trace_bus,
         &TraceMetadata::new(),
         process_event(&batch_meta, "batch-start", "run_target_batch")
+            .arg("Mode", mode.as_str())
             .arg("Targets", targets.len().to_string()),
     );
     let mut summary = BatchSummary::default();
@@ -260,7 +276,9 @@ impl MacosEmulator<StdoutTraceSink> {
 impl<S: TraceSink> MacosEmulator<S> {
     pub fn new(options: EmulationOptions, tracer: Tracer<S>) -> Self {
         let mut plugins = PluginRegistry::new();
-        register_plugins(&mut plugins);
+        if options.mode.is_analysis() {
+            register_plugins(&mut plugins);
+        }
         Self {
             options,
             tracer,
@@ -313,10 +331,16 @@ impl<S: TraceSink> MacosEmulator<S> {
     }
 
     pub fn emit_capture_event(&mut self, metadata: &TraceMetadata, name: impl Into<String>) {
+        if !self.options.mode.is_analysis() {
+            return;
+        }
         self.emit_trace(capture_event(metadata, name));
     }
 
     pub fn emit_detect_event(&mut self, metadata: &TraceMetadata, name: impl Into<String>) {
+        if !self.options.mode.is_analysis() {
+            return;
+        }
         self.emit_trace(detect_event(metadata, name));
     }
 
@@ -421,5 +445,27 @@ mod tests {
         assert!(!output.contains("\"plugin\":\"syscalls\""));
         assert!(!output.contains("\"Category\":"));
         assert!(!output.contains("\"Message\":"));
+    }
+
+    #[test]
+    fn compat_mode_does_not_register_analysis_plugins_or_emit_detections() {
+        let options = EmulationOptions {
+            mode: RuntimeMode::Compat,
+            trace: TraceConfig::full_jsonl(),
+            ..EmulationOptions::default()
+        };
+        let tracer = Tracer::new(options.trace.clone(), WriterTraceSink::new(Vec::new()));
+        let mut emulator = MacosEmulator::new(options, tracer);
+        let meta = TraceMetadata::new()
+            .pid(2)
+            .ppid(1)
+            .tid(3)
+            .running_process("sample");
+
+        emulator.emit_syscall_event(&meta, "write");
+        emulator.emit_detect_event(&meta, "process_execution");
+
+        let output = String::from_utf8(emulator.into_tracer().into_sink().into_inner()).unwrap();
+        assert!(output.is_empty());
     }
 }

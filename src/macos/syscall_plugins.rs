@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::macos::{
     align_up, lossy_data_preview, materialize_synthetic_file_bytes, read_cstring,
-    resolve_guest_path, syscall_event, TraceEvent, TraceMetadata,
+    resolve_guest_path, syscall_event, RuntimeMode, TraceEvent, TraceMetadata,
 };
 use crate::{Emulator, MacOsError};
 
@@ -24,6 +24,7 @@ pub enum SyscallFdEntry {
 
 #[derive(Clone)]
 pub struct SyscallRuntimeState {
+    pub runtime_mode: RuntimeMode,
     pub done_addr: u64,
     pub heap_base: u64,
     pub mmap_base: u64,
@@ -46,6 +47,7 @@ impl SyscallRuntimeState {
     ) -> Self {
         Self {
             done_addr,
+            runtime_mode: RuntimeMode::Analysis,
             heap_base,
             mmap_base,
             mmap_end,
@@ -196,11 +198,27 @@ pub fn handle_basic_macos_syscall(
         }
         0x2000005 => {
             let path_ptr = invocation.args[0];
+            let flags = invocation.args[1];
+            let creating = (flags & 0x200) != 0;
             let raw_path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
             let resolved = resolve_guest_path(&runtime.guest_fs_base, &raw_path);
             let fd = runtime.next_fd.fetch_add(1, Ordering::Relaxed);
             let entry = match File::open(&resolved) {
                 Ok(file) => SyscallFdEntry::HostFile(file),
+                Err(_) if creating => SyscallFdEntry::SyntheticCursor(Cursor::new(Vec::new())),
+                Err(_) if !runtime.runtime_mode.is_analysis() => {
+                    return_value = u64::MAX;
+                    event = event
+                        .arg("Path", raw_path)
+                        .arg("Resolved", resolved.display().to_string())
+                        .arg("Result", format!("0x{:X}", u64::MAX))
+                        .arg("Errno", "2");
+                    return Ok(SyscallOutcome {
+                        return_value,
+                        stop_addr,
+                        event,
+                    });
+                }
                 Err(_) => SyscallFdEntry::SyntheticCursor(Cursor::new(
                     materialize_synthetic_file_bytes(&raw_path, 4096),
                 )),

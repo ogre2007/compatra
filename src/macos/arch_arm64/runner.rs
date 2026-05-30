@@ -12,14 +12,14 @@ use crate::macos::io_imports::install_io_imports;
 use crate::macos::process_imports::install_process_imports;
 use crate::macos::pthread_imports::install_pthread_imports;
 use crate::macos::runner_support::{
-    initialize_import_tracker, initialize_shared_state, install_return_stubs,
+    initialize_import_tracker, initialize_shared_state_with_mode, install_return_stubs,
 };
 use crate::macos::runtime_hooks::install_runtime_hooks;
 use crate::macos::time_imports::install_time_imports;
 use crate::macos::{
     default_guest_fs_base, ensure_macho_cpu, install_runtime_plugins, process_event,
-    runtime_process_metadata, shared_trace_bus_from_env, MacosCpu, RuntimeContext,
-    SyscallRuntimePlugin, TraceMetadata,
+    runtime_process_metadata, MacosCpu, RuntimeContext, RuntimeMode, SyscallRuntimePlugin,
+    TraceMetadata,
 };
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
@@ -37,17 +37,13 @@ const INDIRECT_BRANCH_MODE_ENV: &str = "MACHINA_INDIRECT_BRANCH_MODE";
 const ARM64_CPP_DATA_REGION_SIZE: u64 = 0x2000;
 
 /// Offsets inside the C++ data region for each kind of fake symbol.
-/// Layout is intentionally simple: a single vtable shared by every
-/// C++ class import, followed by per-instance objects whose
-/// vtable-pointer slot (offset 0) targets that shared vtable. The
-/// shared vtable holds far more entries than any individual class
-/// would ever index into, so virtual calls fall through to the
-/// done_addr return-zero gadget rather than tripping off the end.
-const ARM64_CPP_VTABLE_OFFSET: u64 = 0x100; // 32 fake vfn entries
+/// The region only supplies imported data symbols with stable data-shaped
+/// addresses; libc++ behavior belongs in `cpp_imports.rs` hooks.
+const ARM64_CPP_VTABLE_STORAGE_OFFSET: u64 = 0x100;
+const ARM64_CPP_VTT_OFFSET: u64 = 0x300;
 const ARM64_CPP_CERR_OBJECT_OFFSET: u64 = 0x400;
 const ARM64_CPP_CIN_OBJECT_OFFSET: u64 = 0x500;
 const ARM64_CPP_CTYPE_ID_OFFSET: u64 = 0x600;
-const ARM64_CPP_GENERIC_OBJECT_OFFSET: u64 = 0x700;
 
 /// Build a synthetic trampoline that invokes each
 /// `__mod_init_func` entry in order, then tail-jumps to the real
@@ -246,19 +242,20 @@ fn setup_arm64_cpp_data_region(
     let zeros = vec![0u8; region_size as usize];
     emulator.write_memory(base, &zeros)?;
 
-    // Populate the shared vtable with done_addr entries. C++ code
-    // that reaches a virtual call ends up at done_addr's `ret`
-    // (returning 0 in x0), which is the same convention every
-    // unhandled libc++ stub already uses.
-    let vtable_addr = base + ARM64_CPP_VTABLE_OFFSET;
+    // Populate one ABI-shaped vtable placeholder: offset-to-top,
+    // typeinfo, then a modest run of return-zero entries. Imported
+    // vtable symbols resolve to the address point, matching the value
+    // guest objects normally store in their vptr slot.
+    let vtable_storage_addr = base + ARM64_CPP_VTABLE_STORAGE_OFFSET;
+    let vtable_addr = vtable_storage_addr + 16;
+    emulator.write_memory(vtable_storage_addr, &0u64.to_le_bytes())?;
+    emulator.write_memory(vtable_storage_addr + 8, &0u64.to_le_bytes())?;
     for i in 0..32 {
         emulator.write_memory(vtable_addr + i * 8, &done_addr.to_le_bytes())?;
     }
 
-    // Each fake object stores the shared vtable pointer at offset
-    // 0. The C++ ABI says `[this]` is the vtable for the most
-    // derived class. With every entry pointing at done_addr,
-    // any virtual call through this object harmlessly returns 0.
+    // Minimal iostream global placeholders: just enough object shape
+    // for imports that load `std::cerr`/`std::cin` as data symbols.
     let cerr_addr = base + ARM64_CPP_CERR_OBJECT_OFFSET;
     emulator.write_memory(cerr_addr, &vtable_addr.to_le_bytes())?;
     let cin_addr = base + ARM64_CPP_CIN_OBJECT_OFFSET;
@@ -277,17 +274,9 @@ fn setup_arm64_cpp_data_region(
     data_symbols.insert("__ZNSt3__15wcinE".to_string(), cin_addr);
     data_symbols.insert("__ZNSt3__15ctypeIcE2idE".to_string(), ctype_id_addr);
 
-    // C++ vtable / VTT symbols. The C++ ABI stores typeinfo at
-    // [vtable-8] and offset-to-top at [vtable-16]. Our shared
-    // vtable starts at vtable_addr, but a bind to `__ZTV*` should
-    // resolve to vtable_addr + 16 (i.e., past the metadata slots)
-    // so subsequent `ldr xN, [vtable, #0]` reads the first virtual
-    // function, not the typeinfo. We currently bind to vtable_addr
-    // directly because the metadata slots are already zeros from
-    // the initial map and the obfuscated code we observe reads
-    // `ldur xN, [xN, #-24]` — i.e., it expects valid memory at
-    // (vtable-24) too, which the surrounding zeros provide as long
-    // as the vtable lives well inside the region.
+    // C++ vtable and VTT symbols. These remain placeholders, but
+    // they are ABI-shaped data placeholders rather than per-sample
+    // crash pads.
     let vtable_names = [
         "__ZTVNSt3__18ios_baseE",
         "__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE",
@@ -299,16 +288,23 @@ fn setup_arm64_cpp_data_region(
         "__ZTVNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
         "__ZTVNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
         "__ZTVNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
-        "__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
-        "__ZTTNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
-        "__ZTTNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
-        "__ZTTNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
     ];
     for name in vtable_names {
         data_symbols.insert(name.to_string(), vtable_addr);
     }
 
-    let _ = ARM64_CPP_GENERIC_OBJECT_OFFSET; // reserved for future symbols
+    let vtt_addr = base + ARM64_CPP_VTT_OFFSET;
+    for i in 0..8 {
+        emulator.write_memory(vtt_addr + i * 8, &vtable_addr.to_le_bytes())?;
+    }
+    for name in [
+        "__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE",
+        "__ZTTNSt3__114basic_ofstreamIcNS_11char_traitsIcEEEE",
+        "__ZTTNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+        "__ZTTNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+    ] {
+        data_symbols.insert(name.to_string(), vtt_addr);
+    }
 
     if let Some(bus) = trace_bus {
         let _ = bus.send(
@@ -316,6 +312,7 @@ fn setup_arm64_cpp_data_region(
                 .arg("Base", format!("0x{:X}", base))
                 .arg("Size", format!("0x{:X}", region_size))
                 .arg("VTable", format!("0x{:X}", vtable_addr))
+                .arg("Vtt", format!("0x{:X}", vtt_addr))
                 .arg("Cerr", format!("0x{:X}", cerr_addr)),
         );
     }
@@ -349,10 +346,18 @@ impl IndirectBranchMode {
 }
 
 pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_mode = RuntimeMode::from_env().unwrap_or_default();
+    emulate_macos_arm64_binary_with_mode(binary_path, runtime_mode)
+}
+
+pub fn emulate_macos_arm64_binary_with_mode(
+    binary_path: &str,
+    runtime_mode: RuntimeMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let raw_data = std::fs::read(binary_path)?;
     let binary = MachoBinary::parse(&raw_data)?;
     let process_name = "main";
-    let trace_bus = shared_trace_bus_from_env();
+    let trace_bus = crate::macos::shared_trace_bus_for_mode_from_env(runtime_mode);
     let metadata = TraceMetadata::new()
         .pid(1)
         .ppid(0)
@@ -362,6 +367,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         let _ = bus.send(
             process_event(&metadata, "binary-load", "binary-load")
                 .arg("Path", binary_path.to_string())
+                .arg("Mode", runtime_mode.as_str())
                 .arg("Size", raw_data.len().to_string()),
         );
     }
@@ -435,7 +441,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     }
 
     let import_tracker = initialize_import_tracker();
-    let (stub_map, _stub_name_map) = install_return_stubs(
+    let (mut stub_map, _stub_name_map) = install_return_stubs(
         &mut emulator,
         stub_region,
         &undefs,
@@ -443,6 +449,10 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         &trace_bus,
         &process_name,
     )?;
+    for (name, addr) in stub_map.clone() {
+        let normalized = crate::macos::imports::normalize_import_symbol(name);
+        stub_map.entry(normalized).or_insert(addr);
+    }
 
     // Build a fake C++ data-symbol region so chained-fixups can
     // bind C++ globals (std::cerr, vtables) to a region that won't
@@ -502,7 +512,6 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
             }
         }
     }
-
     // Install C++ ostream stub overrides. Without these, every
     // operator<< call construct/destructs a sentry but never
     // writes — and `basic_ostream::write` silently returns 0
@@ -512,6 +521,8 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     install_arm64_cpp_imports(
         &mut emulator,
         &stub_map,
+        &mmap_next,
+        mmap_end,
         &trace_bus,
         &import_tracker,
         &process_name,
@@ -541,9 +552,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
             let Some((label, addr_str)) = entry.trim().split_once(':') else {
                 continue;
             };
-            let stripped = addr_str
-                .trim_start_matches("0x")
-                .trim_start_matches("0X");
+            let stripped = addr_str.trim_start_matches("0x").trim_start_matches("0X");
             let addr = match u64::from_str_radix(stripped, 16) {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -580,6 +589,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     if let Ok(pcs) = std::env::var("MACHINA_BYPASS_USAGE_CHECK") {
         // Tokens are separated by `;`. Each token is one of:
         //   `0xADDR`                       — return 0 for every call
+        //   `0xADDR@0xLR=VAL`              — return VAL only when LR matches
         //   `0xADDR=VAL`                   — return VAL (hex/dec) for every call
         //   `0xADDR=VAL0,VAL1,VAL2`        — return VALn for the n-th call;
         //                                    after the list is exhausted the
@@ -612,8 +622,21 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
                 Some((a, v)) => (a, v),
                 None => (token, "0"),
             };
+            let (addr_str, lr_filter) = match addr_str.split_once('@') {
+                Some((a, lr)) => {
+                    let stripped = lr.trim().trim_start_matches("0x").trim_start_matches("0X");
+                    let Ok(lr) = u64::from_str_radix(stripped, 16) else {
+                        continue;
+                    };
+                    (a, Some(lr))
+                }
+                None => (addr_str, None),
+            };
             let addr = match u64::from_str_radix(
-                addr_str.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                addr_str
+                    .trim()
+                    .trim_start_matches("0x")
+                    .trim_start_matches("0X"),
                 16,
             ) {
                 Ok(a) => a,
@@ -621,19 +644,13 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
             };
             let parse_val = |s: &str| -> u64 {
                 let s = s.trim();
-                if let Some(hex) = s
-                    .strip_prefix("0x")
-                    .or_else(|| s.strip_prefix("0X"))
-                {
+                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
                     u64::from_str_radix(hex, 16).unwrap_or(0)
                 } else {
                     s.parse::<u64>().unwrap_or(0)
                 }
             };
-            let values: Vec<u64> = values_str
-                .split(',')
-                .map(parse_val)
-                .collect();
+            let values: Vec<u64> = values_str.split(',').map(parse_val).collect();
             let trace_bus_for_hook = trace_bus.clone();
             let proc_name = process_name.to_string();
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -644,6 +661,9 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
                     let x0_in = emu.read_reg("x0").unwrap_or(0);
                     let x1_in = emu.read_reg("x1").unwrap_or(0);
                     let lr = emu.read_reg("lr").unwrap_or(0);
+                    if lr_filter.is_some_and(|expected| expected != lr) {
+                        return;
+                    }
                     let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let value = if values.is_empty() {
                         0
@@ -668,7 +688,13 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
                             .arg("ReturnValue", format!("0x{:X}", value))
                             .arg("X0In", format!("0x{:X}", x0_in))
                             .arg("X1In", format!("0x{:X}", x1_in))
-                            .arg("Lr", format!("0x{:X}", lr)),
+                            .arg("Lr", format!("0x{:X}", lr))
+                            .arg(
+                                "LrFilter",
+                                lr_filter
+                                    .map(|expected| format!("0x{:X}", expected))
+                                    .unwrap_or_else(|| "none".to_string()),
+                            ),
                         );
                     }
                 },
@@ -680,9 +706,10 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     let import_count = import_tracker.import_count.clone();
     let recent_imports = import_tracker.recent_imports.clone();
 
-    let shared_state = initialize_shared_state(
+    let shared_state = initialize_shared_state_with_mode(
         default_guest_fs_base(std::path::Path::new(binary_path), "arm64_ios"),
         process_bootstrap,
+        runtime_mode,
     );
     let usleep_streaks = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         (u64, u64),
@@ -716,6 +743,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     install_time_imports(
         &mut emulator,
         &stub_map,
+        &trace_bus,
         &shared_state,
         &import_tracker,
         &usleep_streaks,
@@ -786,9 +814,10 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         }
     }
 
-    let runtime_context = RuntimeContext::new(
+    let runtime_context = RuntimeContext::new_with_mode(
         process_name,
         binary_path,
+        runtime_mode,
         done_addr,
         heap_base,
         mmap_base,

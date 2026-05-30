@@ -8,9 +8,9 @@ use crate::macos::plugin_events::import_event;
 use crate::macos::{
     emit_runner_trace_event, io_event, kqueue_event, memory_event, process_event,
     push_recent_trace, runtime_process_metadata, thread_event, AppleRuntime,
-    Arm64SyntheticOsRuntime, Arm64ThreadRuntime, Emulator, GuestFileTable, GuestProcessBootstrap,
-    SharedTraceBus, StubRegion, SyntheticProcess, TraceEvent, TraceMetadata,
-    ARM64_SYNTHETIC_THREAD_STACK_BASE,
+    Arm64SyntheticOsRuntime, Arm64ThreadRuntime, Emulator, GuestFileTable, GuestPathPolicy,
+    GuestProcessBootstrap, RuntimeMode, SharedTraceBus, StubRegion, SyntheticProcess, TraceEvent,
+    TraceMetadata, ARM64_SYNTHETIC_THREAD_STACK_BASE,
 };
 use crate::UnicornEmulator;
 
@@ -23,6 +23,7 @@ pub struct Arm64ImportTracker {
 
 #[derive(Clone, Debug)]
 pub struct Arm64SharedState {
+    pub runtime_mode: RuntimeMode,
     pub process_bootstrap: GuestProcessBootstrap,
     pub tls_next_key: Arc<Mutex<u64>>,
     pub tls_values: Arc<Mutex<HashMap<u64, u64>>>,
@@ -100,8 +101,22 @@ pub fn initialize_arm64_shared_state(
     guest_fs_base: std::path::PathBuf,
     process_bootstrap: GuestProcessBootstrap,
 ) -> Arm64SharedState {
-    let guest_files = GuestFileTable::new(guest_fs_base.clone());
+    initialize_arm64_shared_state_with_mode(guest_fs_base, process_bootstrap, RuntimeMode::Analysis)
+}
+
+pub fn initialize_arm64_shared_state_with_mode(
+    guest_fs_base: std::path::PathBuf,
+    process_bootstrap: GuestProcessBootstrap,
+    runtime_mode: RuntimeMode,
+) -> Arm64SharedState {
+    let policy = if runtime_mode.is_analysis() {
+        GuestPathPolicy::analysis()
+    } else {
+        GuestPathPolicy::compat()
+    };
+    let guest_files = GuestFileTable::with_policy(guest_fs_base.clone(), policy);
     Arm64SharedState {
+        runtime_mode,
         process_bootstrap,
         tls_next_key: Arc::new(Mutex::new(1)),
         tls_values: Arc::new(Mutex::new(HashMap::new())),

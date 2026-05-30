@@ -209,6 +209,8 @@ pub fn install_arm64_diagnostic_hooks(
                 let x9 = emu.read_reg("x9").unwrap_or(0);
                 let x10 = emu.read_reg("x10").unwrap_or(0);
                 let x11 = emu.read_reg("x11").unwrap_or(0);
+                let x16 = emu.read_reg("x16").unwrap_or(0);
+                let x17 = emu.read_reg("x17").unwrap_or(0);
                 let bytes = emu.read_memory(address, size as usize).unwrap_or_default();
                 let metadata = runtime_process_metadata(process_name.clone());
                 let mut event = process_event(&metadata, "trace-window", "trace-window")
@@ -223,6 +225,8 @@ pub fn install_arm64_diagnostic_hooks(
                     .arg("X9", format!("0x{:X}", x9))
                     .arg("X10", format!("0x{:X}", x10))
                     .arg("X11", format!("0x{:X}", x11))
+                    .arg("X16", format!("0x{:X}", x16))
+                    .arg("X17", format!("0x{:X}", x17))
                     .arg("Bytes", format!("{:02X?}", bytes));
                 if let Some(preview) = read_byte_preview(emu, x0, 64) {
                     event = event.arg("X0Preview", preview);

@@ -174,9 +174,7 @@ pub fn install_arm64_pthread_imports(
                         // panic-helper at 0x10000AE00.
                         let mut seed = [0u8; 0x1000];
                         if thread_id != 1 {
-                            if let Some(&main_addr) =
-                                storage.get(&(1, descriptor))
-                            {
+                            if let Some(&main_addr) = storage.get(&(1, descriptor)) {
                                 if let Ok(bytes) = emu.read_memory(main_addr, 0x1000) {
                                     let len = bytes.len().min(seed.len());
                                     seed[..len].copy_from_slice(&bytes[..len]);

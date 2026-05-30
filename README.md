@@ -40,6 +40,9 @@ debug output to be removed or gated over time.
 
 Useful knobs:
 
+- `MACHINA_MODE=analysis`: malware-analysis defaults; `compat` disables
+  analysis-only synthetic artifacts, captures, detections, and built-in trace
+  plugin presets
 - `MACHINA_PLUGIN_TRACE=1`: enable plugin trace bus
 - `MACHINA_TRACE_FORMAT=jsonl`: force JSONL output
 - `MACHINA_TRACE_FORMAT=human`: legacy human-readable sink for debugging
@@ -50,6 +53,7 @@ Useful knobs:
 - `MACHINA_PROFILE=long`: 120s / 200M-instruction budget (recommended for RustDoor and other Rust binaries with large startup graphs)
 - `MACHINA_PROFILE=extended`: 300s / 1B-instruction budget (deep analysis runs)
 - `MACHINA_TIMEOUT_USECS` / `MACHINA_MAX_INSTRUCTIONS`: explicit overrides; always win over the active profile
+- `MACHINA_BYPASS_USAGE_CHECK`: sample-analysis helper for forcing selected arm64 call sites to return fixed values; supports `0xADDR=VAL0,VAL1` and optional LR filters such as `0xADDR@0xLR=VAL`
 
 ## Build
 
@@ -61,6 +65,13 @@ cargo build --bin machina
 
 ```powershell
 cargo run --bin machina -- fixtures\macos\bin\arm64_hello
+```
+
+Compatibility mode keeps the same arm64 userland execution path but uses
+non-analysis defaults:
+
+```powershell
+cargo run --bin machina -- --mode compat fixtures\macos\bin\arm64_hello
 ```
 
 ## Local AMOS integration check

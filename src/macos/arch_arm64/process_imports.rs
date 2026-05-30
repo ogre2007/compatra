@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use crate::macos::arm64_io_imports::allocate_arm64_heap;
 use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
     Arm64SharedState,
@@ -378,6 +379,147 @@ pub fn install_arm64_process_imports(
 ) -> Result<(), Box<dyn std::error::Error>> {
     install_posix_spawn_file_action_hooks(emulator, stub_map, shared_state, import_tracker)?;
 
+    if let Some(&addr) = stub_map.get("_popen") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let malloc_next_addr = shared_state.malloc_next_addr.clone();
+        let malloc_mapped_until = shared_state.malloc_mapped_until.clone();
+        let malloc_allocations = shared_state.malloc_allocations.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let command_ptr = emu.read_reg("x0").unwrap_or(0);
+                let mode_ptr = emu.read_reg("x1").unwrap_or(0);
+                let command = read_cstring(emu, command_ptr, 4096).unwrap_or_default();
+                let mode = read_cstring(emu, mode_ptr, 32).unwrap_or_default();
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let result = allocate_arm64_heap(
+                    emu,
+                    &malloc_next_addr,
+                    &malloc_mapped_until,
+                    &malloc_allocations,
+                    0x100,
+                    0x10,
+                )
+                .map(|(addr, _)| addr)
+                .unwrap_or(0);
+                let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_popen(command={:?}, mode={:?}) -> 0x{:X}",
+                        command, mode, result
+                    ),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "popen", "popen")
+                    .arg("CommandPtr", format!("0x{:X}", command_ptr))
+                    .arg("ModePtr", format!("0x{:X}", mode_ptr))
+                    .arg("Command", command)
+                    .arg("Mode", mode)
+                    .arg("Result", format!("0x{:X}", result))
+                    .arg("Errno", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_pclose") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let stream = emu.read_reg("x0").unwrap_or(0);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_pclose(stream=0x{:X}) -> 0", stream),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "pclose", "pclose")
+                    .arg("Stream", format!("0x{:X}", stream))
+                    .arg("Result", "0")
+                    .arg("Errno", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_kill") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let pid = emu.read_reg("x0").unwrap_or(0);
+                let sig = emu.read_reg("x1").unwrap_or(0);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_kill(pid={}, sig={}) -> 0", pid, sig),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "kill", "kill")
+                    .arg("Pid", pid.to_string())
+                    .arg("Sig", sig.to_string())
+                    .arg("Result", "0")
+                    .arg("Errno", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
     if let Some(&addr) = stub_map.get("_fork") {
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
@@ -572,8 +714,7 @@ pub fn install_arm64_process_imports(
         )?;
     }
 
-    for (sym, call_label, has_rusage) in
-        [("_wait4", "wait4", true), ("_waitpid", "waitpid", false)]
+    for (sym, call_label, has_rusage) in [("_wait4", "wait4", true), ("_waitpid", "waitpid", false)]
     {
         let Some(&addr) = stub_map.get(sym) else {
             continue;

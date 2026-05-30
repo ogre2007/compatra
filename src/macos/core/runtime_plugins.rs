@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crate::macos::{
     default_guest_fs_base, default_syscall_name, emit_runner_trace_event,
-    handle_basic_macos_syscall, SharedTraceBus, SyscallInvocation, SyscallRuntimeState,
-    TraceMetadata,
+    handle_basic_macos_syscall, RuntimeMode, SharedTraceBus, SyscallInvocation,
+    SyscallRuntimeState, TraceMetadata,
 };
 use crate::{ArchType, Emulator, MacOsError, UnicornEmulator};
 
@@ -25,6 +25,7 @@ pub fn runtime_process_metadata(process_name: impl Into<String>) -> TraceMetadat
 
 #[derive(Clone)]
 pub struct RuntimeContextCore {
+    pub runtime_mode: RuntimeMode,
     pub process_name: String,
     pub binary_path: PathBuf,
     pub done_addr: u64,
@@ -46,6 +47,7 @@ impl RuntimeContextCore {
     pub fn new_with_runtime(
         process_name: impl Into<String>,
         binary_path: impl Into<PathBuf>,
+        runtime_mode: RuntimeMode,
         done_addr: u64,
         heap_base: u64,
         mmap_base: u64,
@@ -56,6 +58,7 @@ impl RuntimeContextCore {
         Self {
             process_name: process_name.into(),
             binary_path: binary_path.into(),
+            runtime_mode,
             done_addr,
             heap_base,
             mmap_base,
@@ -78,17 +81,45 @@ impl Arm64RuntimeContext {
         saw_exit: Arc<AtomicBool>,
         trace_bus: Option<SharedTraceBus>,
     ) -> Self {
+        Self::new_with_mode(
+            process_name,
+            binary_path,
+            RuntimeMode::Analysis,
+            done_addr,
+            heap_base,
+            mmap_base,
+            mmap_end,
+            mmap_next,
+            saw_exit,
+            trace_bus,
+        )
+    }
+
+    pub fn new_with_mode(
+        process_name: impl Into<String>,
+        binary_path: impl Into<PathBuf>,
+        runtime_mode: RuntimeMode,
+        done_addr: u64,
+        heap_base: u64,
+        mmap_base: u64,
+        mmap_end: u64,
+        mmap_next: Arc<AtomicU64>,
+        saw_exit: Arc<AtomicBool>,
+        trace_bus: Option<SharedTraceBus>,
+    ) -> Self {
         let binary_path = binary_path.into();
         let guest_fs_base = default_guest_fs_base(&binary_path, "arm64_ios");
         Self {
             core: RuntimeContextCore::new_with_runtime(
                 process_name,
                 binary_path,
+                runtime_mode,
                 done_addr,
                 heap_base,
                 mmap_base,
                 mmap_end,
                 SyscallRuntimeState {
+                    runtime_mode,
                     done_addr,
                     heap_base,
                     mmap_base,

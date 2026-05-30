@@ -179,10 +179,7 @@ fn map_tagged_alias_page<'a>(
 /// store can proceed. This is a "ghost" page — reads later return whatever
 /// the program wrote — which is enough to let the emulation move past these
 /// pointer-tagged structs into the malware's interesting behavior.
-fn map_off_canvas_data_page<'a>(
-    uc: &mut Unicorn<'a, ()>,
-    fault_addr: u64,
-) -> Option<u64> {
+fn map_off_canvas_data_page<'a>(uc: &mut Unicorn<'a, ()>, fault_addr: u64) -> Option<u64> {
     // Only kick in for pointers far outside any mapped region; bail early
     // for anything Unicorn would already accept (low-32 or kernel-tag).
     if fault_addr < 0x1_0000_0000 {

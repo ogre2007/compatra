@@ -11,9 +11,22 @@ pub fn initialize_shared_state(
     guest_fs_base: std::path::PathBuf,
     process_bootstrap: crate::macos::GuestProcessBootstrap,
 ) -> SharedState {
-    crate::macos::arm64_runner_support::initialize_arm64_shared_state(
+    initialize_shared_state_with_mode(
         guest_fs_base,
         process_bootstrap,
+        crate::macos::RuntimeMode::Analysis,
+    )
+}
+
+pub fn initialize_shared_state_with_mode(
+    guest_fs_base: std::path::PathBuf,
+    process_bootstrap: crate::macos::GuestProcessBootstrap,
+    runtime_mode: crate::macos::RuntimeMode,
+) -> SharedState {
+    crate::macos::arm64_runner_support::initialize_arm64_shared_state_with_mode(
+        guest_fs_base,
+        process_bootstrap,
+        runtime_mode,
     )
 }
 

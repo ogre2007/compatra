@@ -6,11 +6,16 @@
 
 use crate::macos::plugin_events::TraceMetadata;
 use crate::macos::trace::{StdoutTraceSink, TraceConfig, TraceEvent};
-use crate::macos::{EmulationOptions, MacosEmulator};
+use crate::macos::{EmulationOptions, MacosEmulator, RuntimeMode};
 
 pub type SharedTraceBus = std::sync::mpsc::Sender<TraceEvent>;
 
 pub fn shared_trace_bus_from_env() -> Option<SharedTraceBus> {
+    let mode = RuntimeMode::from_env().unwrap_or_default();
+    shared_trace_bus_for_mode_from_env(mode)
+}
+
+pub fn shared_trace_bus_for_mode_from_env(mode: RuntimeMode) -> Option<SharedTraceBus> {
     let enabled = std::env::var("MACHINA_PLUGIN_TRACE")
         .ok()
         .map(|value| {
@@ -33,6 +38,7 @@ pub fn shared_trace_bus_from_env() -> Option<SharedTraceBus> {
     }
 
     let mut options = EmulationOptions::default();
+    options.mode = mode;
     let format = std::env::var("MACHINA_TRACE_FORMAT")
         .unwrap_or_else(|_| "jsonl".to_string())
         .to_ascii_lowercase();

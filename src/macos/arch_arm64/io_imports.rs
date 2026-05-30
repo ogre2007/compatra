@@ -19,12 +19,11 @@ use crate::macos::arm64_runner_support::{
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
     duplicate_synthetic_fd, extract_ascii_indicators, fnv1a64_hex, fstat_guest_file,
-    lossy_data_preview, open_directory_stream, open_guest_file,
-    open_guest_file_with_flags, read_guest_directory_entry,
-    read_guest_file, register_process_fd, resolve_directory_stream_fd, resolve_guest_path,
-    resolve_process_fd_target, sanitize_capture_label, shannon_entropy, stat_guest_path,
-    terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
-    SyntheticKeventRegistration, SyntheticPipe,
+    lossy_data_preview, open_directory_stream, open_guest_file, open_guest_file_with_flags,
+    read_guest_directory_entry, read_guest_file, register_process_fd, resolve_directory_stream_fd,
+    resolve_guest_path, resolve_process_fd_target, sanitize_capture_label, shannon_entropy,
+    stat_guest_path, terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus,
+    SyntheticFdTarget, SyntheticKeventRegistration, SyntheticPipe,
 };
 use crate::UnicornEmulator;
 
@@ -64,7 +63,11 @@ fn append_file_write_payload_to_capture(
         "file_pid{}_fd{}_{}.bin",
         pid,
         fd,
-        if safe_label.is_empty() { "unknown" } else { safe_label.as_str() }
+        if safe_label.is_empty() {
+            "unknown"
+        } else {
+            safe_label.as_str()
+        }
     ));
     use std::io::Write as _;
     match std::fs::OpenOptions::new()
@@ -170,6 +173,33 @@ fn ensure_malloc_range_mapped(
         *mapped_until = chunk_end;
     }
     true
+}
+
+pub(crate) fn allocate_arm64_heap(
+    emu: &mut UnicornEmulator,
+    malloc_next_addr: &Arc<Mutex<u64>>,
+    malloc_mapped_until: &Arc<Mutex<u64>>,
+    malloc_allocations: &Arc<Mutex<HashMap<u64, u64>>>,
+    requested: u64,
+    alignment: u64,
+) -> Option<(u64, u64)> {
+    let alignment = alignment.max(0x10);
+    let alloc_size = align_up(requested.max(1), alignment);
+    let page_size = align_up(alloc_size, 0x1000);
+    let result = {
+        let mut next = malloc_next_addr.lock().ok()?;
+        let addr = align_up(*next, alignment);
+        *next = addr.saturating_add(page_size);
+        if !ensure_malloc_range_mapped(emu, malloc_mapped_until, addr, page_size) {
+            return None;
+        }
+        let _ = emu.write_memory(addr, &vec![0u8; alloc_size as usize]);
+        addr
+    };
+    if let Ok(mut allocations) = malloc_allocations.lock() {
+        allocations.insert(result, alloc_size);
+    }
+    Some((result, alloc_size))
 }
 
 fn find_env_value_ptr(
@@ -280,6 +310,7 @@ pub fn install_arm64_io_imports(
     let malloc_next_addr = shared_state.malloc_next_addr.clone();
     let synthetic_stop_reason = shared_state.synthetic_stop_reason.clone();
     let process_bootstrap = shared_state.process_bootstrap;
+    let runtime_mode = shared_state.runtime_mode;
 
     if let Some(&addr) = stub_map.get("_kqueue") {
         let os_runtime = shared_state.os_runtime.clone();
@@ -701,15 +732,8 @@ pub fn install_arm64_io_imports(
                             // inline so Tokio's runtime bootstrap doesn't
                             // see -1 and panic at brk #0x1.
                             if os.kqueues.contains_key(&fd) {
-                                let existing = os
-                                    .kqueues
-                                    .get(&fd)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let new_fd = os
-                                    .next_kqueue_fd
-                                    .max(0x20_000)
-                                    .max(min_fd);
+                                let existing = os.kqueues.get(&fd).cloned().unwrap_or_default();
+                                let new_fd = os.next_kqueue_fd.max(0x20_000).max(min_fd);
                                 os.next_kqueue_fd = new_fd.saturating_add(1);
                                 os.kqueues.insert(new_fd, existing);
                                 register_process_fd(&mut os, current_pid, new_fd);
@@ -718,12 +742,7 @@ pub fn install_arm64_io_imports(
                                 }
                                 (new_fd, 0u32)
                             } else {
-                                match duplicate_synthetic_fd(
-                                    &mut os,
-                                    current_pid,
-                                    fd,
-                                    min_fd,
-                                ) {
+                                match duplicate_synthetic_fd(&mut os, current_pid, fd, min_fd) {
                                     Ok(new_fd) => {
                                         if cmd == 67 {
                                             os.fd_flags.insert(new_fd, 1);
@@ -1480,8 +1499,7 @@ pub fn install_arm64_io_imports(
                 // of which message the binary was about to emit.
                 let preview_len = len.min(256) as usize;
                 let bytes = if str_ptr != 0 && preview_len > 0 {
-                    emu.read_memory(str_ptr, preview_len)
-                        .unwrap_or_default()
+                    emu.read_memory(str_ptr, preview_len).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -2367,6 +2385,85 @@ pub fn install_arm64_io_imports(
         )?;
     }
 
+    for symbol in ["__Znwm", "__Znam"] {
+        if let Some(&addr) = stub_map.get(symbol) {
+            let symbol_name = symbol.to_string();
+            let malloc_next_addr = shared_state.malloc_next_addr.clone();
+            let malloc_mapped_until = shared_state.malloc_mapped_until.clone();
+            let malloc_allocations = shared_state.malloc_allocations.clone();
+            let import_tracker = import_tracker.clone();
+            let trace_bus_for_hook = trace_bus.clone();
+            emulator.add_code_hook(
+                addr,
+                addr + 8,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    let requested = emu.read_reg("x0").unwrap_or(0);
+                    let (result, alloc_size) = allocate_arm64_heap(
+                        emu,
+                        &malloc_next_addr,
+                        &malloc_mapped_until,
+                        &malloc_allocations,
+                        requested,
+                        0x10,
+                    )
+                    .unwrap_or((0, 0));
+                    let lr = emu.read_reg("lr").unwrap_or(0);
+                    let _ = emu.write_reg("x0", result);
+                    if lr != 0 {
+                        let _ = emu.write_reg("pc", lr);
+                    }
+                    record_arm64_import(
+                        &import_tracker,
+                        format!("{}(size=0x{:X}) -> 0x{:X}", symbol_name, requested, result),
+                    );
+                    let event = arm64_memory_event("operator-new")
+                        .arg("Symbol", symbol_name.clone())
+                        .arg("Size", format!("0x{:X}", requested))
+                        .arg("AllocatedSize", format!("0x{:X}", alloc_size))
+                        .arg("Result", format!("0x{:X}", result));
+                    emit_arm64_event(&trace_bus_for_hook, event);
+                },
+            )?;
+        }
+    }
+
+    for symbol in ["__ZdlPv", "__ZdaPv", "__ZdlPvm", "__ZdaPvm"] {
+        if let Some(&addr) = stub_map.get(symbol) {
+            let symbol_name = symbol.to_string();
+            let malloc_allocations = shared_state.malloc_allocations.clone();
+            let import_tracker = import_tracker.clone();
+            let trace_bus_for_hook = trace_bus.clone();
+            emulator.add_code_hook(
+                addr,
+                addr + 8,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    let ptr = emu.read_reg("x0").unwrap_or(0);
+                    let size = emu.read_reg("x1").unwrap_or(0);
+                    let removed_size = malloc_allocations
+                        .lock()
+                        .ok()
+                        .and_then(|mut allocations| allocations.remove(&ptr))
+                        .unwrap_or(0);
+                    let lr = emu.read_reg("lr").unwrap_or(0);
+                    let _ = emu.write_reg("x0", 0u64);
+                    if lr != 0 {
+                        let _ = emu.write_reg("pc", lr);
+                    }
+                    record_arm64_import(
+                        &import_tracker,
+                        format!("{}(ptr=0x{:X}, size=0x{:X})", symbol_name, ptr, size),
+                    );
+                    let event = arm64_memory_event("operator-delete")
+                        .arg("Symbol", symbol_name.clone())
+                        .arg("Ptr", format!("0x{:X}", ptr))
+                        .arg("SizeArg", format!("0x{:X}", size))
+                        .arg("RemovedSize", format!("0x{:X}", removed_size));
+                    emit_arm64_event(&trace_bus_for_hook, event);
+                },
+            )?;
+        }
+    }
+
     if let Some(&addr) = stub_map.get("_posix_memalign") {
         // POSIX `int posix_memalign(void **memptr, size_t alignment,
         // size_t size)` — on success it returns 0 and stores the
@@ -2559,7 +2656,8 @@ pub fn install_arm64_io_imports(
                 let mut substituted_recent_read = false;
                 let mut file_payload_dump: Option<(String, std::path::PathBuf, usize)> = None;
                 if !data.is_empty() {
-                    if let Ok(os_guard) = os_runtime.lock() {
+                    if runtime_mode.is_analysis() {
+                        if let Ok(os_guard) = os_runtime.lock() {
                         if let Some(SyntheticFdTarget::File(file_id)) =
                             resolve_process_fd_target(&os_guard, current_pid, fd)
                         {
@@ -2576,6 +2674,7 @@ pub fn install_arm64_io_imports(
                                         Some((raw_path, dump_path, data.len()));
                                 }
                             }
+                        }
                         }
                     }
                     if let Ok(mut os) = os_runtime.lock() {

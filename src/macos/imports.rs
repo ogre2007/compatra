@@ -2943,7 +2943,14 @@ pub fn process_chained_fixups_with_binary(
         )));
     }
 
-    let imports = parse_chained_fixup_imports(blob, imports_offset, symbols_offset, imports_count, imports_format)?;
+    let imports = parse_chained_fixup_imports(
+        blob,
+        imports_offset,
+        symbols_offset,
+        imports_count,
+        imports_format,
+    )?;
+    let defined_symbols = binary.get_defined_symbols();
 
     // Resolve each import once up front so the chain walk is a
     // straight lookup. Look up by the literal symbol name first
@@ -2952,7 +2959,8 @@ pub fn process_chained_fixups_with_binary(
     // form for the synthetic-imports path.
     let resolved: Vec<u64> = imports
         .iter()
-        .map(|(_, _, name)| {
+        .enumerate()
+        .map(|(_, (_, _, name))| {
             // Prefer data-symbol bindings whenever both maps have an
             // entry: install_return_stubs builds a function stub for
             // every undefined symbol regardless of type, including
@@ -2969,10 +2977,16 @@ pub fn process_chained_fixups_with_binary(
                     return addr;
                 }
             }
+            if let Some(&addr) = defined_symbols.get(name) {
+                return addr.wrapping_add(slide);
+            }
+            let normalized = normalize_import_symbol(name.clone());
+            if let Some(&addr) = defined_symbols.get(&normalized) {
+                return addr.wrapping_add(slide);
+            }
             if let Some(&addr) = symbol_stubs.get(name) {
                 return addr;
             }
-            let normalized = normalize_import_symbol(name.clone());
             if let Some(&addr) = symbol_stubs.get(&normalized) {
                 return addr;
             }
@@ -3003,19 +3017,20 @@ pub fn process_chained_fixups_with_binary(
     // resolve through that mirror would otherwise still see raw
     // chain values).
     let mut chain_format: Option<u16> = None;
-    let mut covered_segments: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut covered_segments: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut canonical_chain_starts: Vec<(u16, u64)> = Vec::new();
     for seg_idx in 0..seg_count {
         let v = u32::from_le_bytes(
-            starts[4 + seg_idx * 4..4 + seg_idx * 4 + 4].try_into().unwrap(),
+            starts[4 + seg_idx * 4..4 + seg_idx * 4 + 4]
+                .try_into()
+                .unwrap(),
         );
         if v != 0 {
             covered_segments.insert(seg_idx);
             if chain_format.is_none() {
                 let sio = &blob[starts_offset + v as usize..];
                 if sio.len() >= 8 {
-                    chain_format =
-                        Some(u16::from_le_bytes(sio[6..8].try_into().unwrap()));
+                    chain_format = Some(u16::from_le_bytes(sio[6..8].try_into().unwrap()));
                 }
             }
         }
@@ -3023,7 +3038,9 @@ pub fn process_chained_fixups_with_binary(
 
     for seg_idx in 0..seg_count {
         let seg_info_off = u32::from_le_bytes(
-            starts[4 + seg_idx * 4..4 + seg_idx * 4 + 4].try_into().unwrap(),
+            starts[4 + seg_idx * 4..4 + seg_idx * 4 + 4]
+                .try_into()
+                .unwrap(),
         ) as usize;
         if seg_info_off == 0 {
             continue;
@@ -3057,11 +3074,9 @@ pub fn process_chained_fixups_with_binary(
             if ps & DYLD_CHAINED_PTR_START_MULTI != 0 {
                 continue;
             }
-            let chain_start_va = image_base
-                + segment_offset
-                + page_idx as u64 * page_size
-                + ps as u64
-                + slide;
+            let chain_start_va =
+                image_base + segment_offset + page_idx as u64 * page_size + ps as u64 + slide;
+            canonical_chain_starts.push((pointer_format, chain_start_va));
             walk_chain_64(
                 emulator,
                 chain_start_va,
@@ -3101,15 +3116,19 @@ pub fn process_chained_fixups_with_binary(
             if segname == "__PAGEZERO" || segname == "__TEXT" || segname == "__LINKEDIT" {
                 continue;
             }
-            let probe_va = seg.vmaddr + slide;
-            let probe = match emulator.read_memory(probe_va, 8) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let probe_arr: [u8; 8] = match probe.try_into() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
+            let probe_file_off = seg.fileoff as usize;
+            if probe_file_off
+                .checked_add(8)
+                .map(|end| end > binary.data.len())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let probe_arr: [u8; 8] =
+                match binary.data[probe_file_off..probe_file_off + 8].try_into() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
             let raw = u64::from_le_bytes(probe_arr);
             // Bind sentinel: bit 63 set AND ordinal in range AND
             // next field non-zero. Without all three this is just
@@ -3120,15 +3139,33 @@ pub fn process_chained_fixups_with_binary(
             if !(bind && nxt != 0 && ord < resolved.len()) {
                 continue;
             }
-            walk_chain_64(
-                emulator,
-                probe_va,
-                fmt,
-                image_base + slide,
-                &resolved,
-                fallback_addr,
-                &mut stats,
-            )?;
+            if let Some((_, canonical_start)) = canonical_chain_starts
+                .iter()
+                .find(|(source_fmt, _)| *source_fmt == fmt)
+            {
+                copy_patched_chain_from_canonical(
+                    emulator,
+                    &binary.data,
+                    seg.fileoff,
+                    seg.vmaddr + slide,
+                    *canonical_start,
+                    fmt,
+                    &resolved,
+                    &mut stats,
+                )?;
+            } else {
+                walk_chain_64_from_file_mirror(
+                    emulator,
+                    &binary.data,
+                    seg.fileoff,
+                    seg.vmaddr + slide,
+                    fmt,
+                    image_base + slide,
+                    &resolved,
+                    fallback_addr,
+                    &mut stats,
+                )?;
+            }
         }
     }
 
@@ -3185,6 +3222,126 @@ fn parse_chained_fixup_imports(
         out.push((lib_ord, weak, name));
     }
     Ok(out)
+}
+
+fn copy_patched_chain_from_canonical(
+    emulator: &mut dyn Emulator,
+    raw_file: &[u8],
+    file_start: u64,
+    vm_start: u64,
+    canonical_start: u64,
+    pointer_format: u16,
+    resolved_imports: &[u64],
+    stats: &mut ChainedFixupStats,
+) -> Result<(), MacOsError> {
+    use crate::macos::loader::consts::dyld_chained_fixups::*;
+    if !matches!(
+        pointer_format,
+        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET
+    ) {
+        return Ok(());
+    }
+    let mut chain_off = 0u64;
+    for _ in 0..0x10_0000 {
+        let file_off = file_start.saturating_add(chain_off) as usize;
+        if file_off
+            .checked_add(8)
+            .map(|end| end > raw_file.len())
+            .unwrap_or(true)
+        {
+            break;
+        }
+        let raw_bytes: [u8; 8] = raw_file[file_off..file_off + 8]
+            .try_into()
+            .map_err(|_| MacOsError::LoaderError("short mirror chain read".to_string()))?;
+        let raw = u64::from_le_bytes(raw_bytes);
+        let bind = (raw >> 63) & 1 == 1;
+        let next = ((raw >> 51) & 0xFFF) as u64;
+        if bind {
+            let ordinal = (raw & 0x00FF_FFFF) as usize;
+            if ordinal < resolved_imports.len() {
+                stats.bound += 1;
+            } else {
+                stats.unresolved += 1;
+            }
+        } else {
+            stats.rebased += 1;
+        }
+        let patched = emulator.read_memory(canonical_start + chain_off, 8)?;
+        emulator.write_memory(vm_start + chain_off, &patched)?;
+        if next == 0 {
+            break;
+        }
+        chain_off = chain_off.wrapping_add(next * 4);
+    }
+    Ok(())
+}
+
+/// Walk a duplicate chained-fixup table from the original file bytes
+/// while writing resolved pointers to guest memory. Obfuscated samples
+/// can mirror the real chain into an unregistered segment; using the
+/// raw on-disk entries here keeps `next` and `ordinal` decoding stable
+/// even if guest memory for a previous slot was already patched.
+fn walk_chain_64_from_file_mirror(
+    emulator: &mut dyn Emulator,
+    raw_file: &[u8],
+    file_start: u64,
+    vm_start: u64,
+    pointer_format: u16,
+    image_base_with_slide: u64,
+    resolved_imports: &[u64],
+    fallback_addr: u64,
+    stats: &mut ChainedFixupStats,
+) -> Result<(), MacOsError> {
+    use crate::macos::loader::consts::dyld_chained_fixups::*;
+    if !matches!(
+        pointer_format,
+        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET
+    ) {
+        return Ok(());
+    }
+    let mut chain_off = 0u64;
+    for _ in 0..0x10_0000 {
+        let file_off = file_start.saturating_add(chain_off) as usize;
+        if file_off
+            .checked_add(8)
+            .map(|end| end > raw_file.len())
+            .unwrap_or(true)
+        {
+            break;
+        }
+        let raw_bytes: [u8; 8] = raw_file[file_off..file_off + 8]
+            .try_into()
+            .map_err(|_| MacOsError::LoaderError("short mirror chain read".to_string()))?;
+        let raw = u64::from_le_bytes(raw_bytes);
+        let bind = (raw >> 63) & 1 == 1;
+        let next = ((raw >> 51) & 0xFFF) as u64;
+        let new_value = if bind {
+            let ordinal = (raw & 0x00FF_FFFF) as usize;
+            if ordinal < resolved_imports.len() {
+                stats.bound += 1;
+                resolved_imports[ordinal]
+            } else {
+                stats.unresolved += 1;
+                fallback_addr
+            }
+        } else {
+            let target_off = raw & 0x0000_000F_FFFF_FFFF;
+            let high8 = if pointer_format == DYLD_CHAINED_PTR_64 {
+                (raw >> 56) & 0xFF
+            } else {
+                0
+            };
+            stats.rebased += 1;
+            (high8 << 56) | image_base_with_slide.wrapping_add(target_off)
+        };
+        emulator.write_memory(vm_start + chain_off, &new_value.to_le_bytes())?;
+        if next == 0 {
+            break;
+        }
+        chain_off = chain_off.wrapping_add(next * 4);
+    }
+    Ok(())
 }
 
 /// Walk a single chain starting at `chain_start_va` for one of the
@@ -3301,6 +3458,9 @@ pub fn patch_macho_import_pointer_sections(
 
     let addr_for_symbol = |name: Option<String>| -> (u64, bool, bool, Option<String>) {
         if let Some(sym) = name {
+            if let Some(&addr) = symbol_stubs.get(&sym) {
+                return (addr, false, false, Some(sym));
+            }
             let normalized = normalize_import_symbol(sym.clone());
             if let Some(&addr) = symbol_stubs.get(&normalized) {
                 return (addr, false, false, Some(sym));
@@ -3323,7 +3483,10 @@ pub fn patch_macho_import_pointer_sections(
             let (target, is_sys, is_unresolved, sym_name) = match name.clone() {
                 Some(sym) => {
                     let normalized = normalize_import_symbol(sym.clone());
-                    if let Some(&addr) = data_symbols.get(&normalized) {
+                    if let Some(&addr) = data_symbols
+                        .get(&sym)
+                        .or_else(|| data_symbols.get(&normalized))
+                    {
                         (addr, false, false, Some(sym))
                     } else {
                         addr_for_symbol(Some(sym))
@@ -3385,7 +3548,10 @@ pub fn patch_macho_import_pointer_sections(
             let (target, is_sys, is_unresolved, sym_name) = match name.clone() {
                 Some(sym) => {
                     let normalized = normalize_import_symbol(sym.clone());
-                    if let Some(&addr) = data_symbols.get(&normalized) {
+                    if let Some(&addr) = data_symbols
+                        .get(&sym)
+                        .or_else(|| data_symbols.get(&normalized))
+                    {
                         (addr, false, false, Some(sym))
                     } else {
                         addr_for_symbol(Some(sym))

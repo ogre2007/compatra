@@ -94,70 +94,64 @@ emulator behavior.
   chain in the `.<71` segment.
 - Current observed status:
   - the binary uses `LC_DYLD_CHAINED_FIXUPS` instead of the legacy
-    bind opcodes. Before chained-fixups support was added, any
-    indirect call through `__nl_symbol_ptr` fetched the raw chain
-    entry `0x8010000000000065` for `_time` (ordinal 0x65), the TBI
-    handler stripped the tag, and PC landed inside the Mach-O
-    header at `0x100000065`, exhausting the 50M instruction budget
-    with `Imports=0 / Syscalls=0` and a `tagged-pointer-alias`
-    memmon event as the smoking gun.
-  - the loader now walks the chained-fixups blob at load time and
-    patches every bind slot (150 in the real chain + 132 in the
-    `__DATA_CONST` mirror = 282 binds) and every rebase (3 — two
-    static initializers and one terminator) to the appropriate
-    synthetic stub or canonical address. The fallback walker for
-    unregistered mirror tables is conservative (only triggered for
-    segments whose first 8 bytes match the chain-bind sentinel
-    pattern).
-  - emulation now boots the C++ runtime: `_getpid` / `_srand` /
-    `_strlen` and the libc++ string constructors execute, and
-    control reaches `std::__1::basic_ostream<...>::sentry::sentry`
-    (the first thing `operator<<` does when the binary prints its
-    usage message to `std::cerr`).
-  - the arm64 runner now carves a fake C++ data region out of the
-    mmap arena (a shared zeroed vtable + per-object slots for
-    `__ZNSt3__14cerrE`, `__ZNSt3__14cinE`, the `ios_base`/
-    `basic_ios`/`basic_ostream`/`basic_istream` vtables, the
-    `ostringstream`/`istringstream` VTT tables, and
-    `__ZNSt3__15ctypeIcE2idE`). The chained-fixups walker now
-    prefers data-symbol bindings over function-stub bindings, so
-    `cerr` resolves to a real ostream-shaped object and any
-    `ldr xN, [cerr]` followed by a vtable-relative `ldur` walks
-    through valid memory instead of stub bytes.
-  - the new `src/macos/arch_arm64/cpp_imports.rs` installs custom
-    code hooks at the sentry/write stubs: `basic_ostream::sentry::
-    sentry(ostream&)` writes `1` to `*x0` so the sentry is marked
-    good, and `basic_ostream::write(const char*, streamsize)` reads
-    x1/x2 from guest memory and emits an `ostream-write` JSONL
-    event with both the printable text and the raw hex.
-  - emulation exits cleanly at `done_addr` with `Imports=36` (up
-    from 0 pre-chained-fixups, 14 pre-data-region) and `Status=ok`.
-    Three full sentry construct/destruct cycles fire, matching the
-    three `<<` chunks (`"Usage: "`, argv[0], `" <server_url>\n"`).
-- **Current next blocker:** the obfuscated `operator<<` body does
-  *not* go through the `basic_ostream::write` import; it inlines
-  the `__pad_and_output` / streambuf write path, which reaches the
-  byte sink through virtual `sputn`/`sputc` calls on the fake
-  vtable. With every vtable slot pointing at the return-zero
-  done_addr, the writes silently no-op so no `ostream-write`
-  event fires and the message bytes never surface in the trace.
-  A more faithful implementation would either (a) install a real
-  fake streambuf at `cerr.__rdbuf_` whose virtual `xsputn` writes
-  to host stderr, or (b) intercept the binary's outermost
-  `operator<<(ostream&, const char*)` template instantiation
-  directly. The "usage path" itself runs to completion either way
-  — the missing piece is just routing the bytes out.
+    bind opcodes. The loader walks the chained-fixups blob at load
+    time and patches every bind slot (150 in the real chain + 132
+    in the `__DATA_CONST` mirror = 282 binds) plus the three
+    rebases. Current runs report `Unresolved=0`.
+  - the arm64 runner carves a small C++ data-symbol region out of
+    the mmap arena for imported libc++ globals (`cerr`, `cin`,
+    vtable placeholders, VTT placeholders, and `ctype<char>::id`).
+    Chained fixups prefer these data-symbol bindings over function
+    stubs so data loads do not interpret stub bytes as objects.
+  - `src/macos/arch_arm64/cpp_imports.rs` now covers the libc++
+    surface this sample exercises with standard hooks rather than
+    sample-local object layouts: string init/copy/destroy,
+    `assign`, `compare`, `find`/`rfind`, `append`, `erase`,
+    `push_back`, `operator+`, `std::to_string`, stream sentries,
+    and `ostream::write`.
+  - C++ `operator new` / `operator delete` now use the existing
+    synthetic malloc arena. Browser profile vectors therefore get
+    real guest addresses (for example `0x52014000`) instead of
+    propagating null pointers into `_memmove(dst=0x0, ...)`.
+  - With the LR-filtered usage-check bypass and a synthetic URL
+    argument, the sample reaches the real profiler pipeline:
+    `_gethostname`, repeated `_popen` calls, `TMPDIR`/`HOME`
+    lookups, `post_body_` / `post_resp_` temporary filename
+    construction, and browser-extension enumeration for Chrome,
+    Chrome Beta, Chrome Dev, Chromium, Edge, Brave, Opera,
+    Vivaldi, Firefox, and Safari.
+  - `_popen` is now hooked as a normal process import and emits
+    `popen` JSONL events with the command and mode arguments. The
+    profiler's host inventory commands are visible at that OS-call
+    boundary, including `uname`, `stat`, `sysctl`, `date`,
+    `ifconfig`, and `ps`.
+  - Repeated `_sleep(1)` from the same caller is now treated as an
+    idle daemon/profiler loop after three hits. The current
+    validated run stops cleanly with
+    `Detail=idle_sleep_loop(seconds=1, caller=0x100228950, sleeps=3)`
+    instead of exhausting the instruction budget.
+- **Current next blocker:** the sample's profile collection is now
+  past bootstrap and into malware logic, but many command-derived
+  values are still empty because `_popen` does not yet synthesize
+  command-specific stdout. Browser extension `find ... Extensions`
+  commands are visible in the libc++ string-building trace, but the
+  OS-level `_popen` argument currently materializes as only the
+  trailing ` 2>/dev/null` suffix; the next useful compatibility work
+  is fixing the stack-side command handoff after string construction
+  plus richer `popen`/FILE output modeling and C2/upload fixtures so
+  the generated `post_body_*.txt` / `post_resp_*.txt` flow contains
+  realistic host data and server responses.
 - **The obfuscated usage check** sits at
   `sub_1002280F4 + 0x34 (= 0x10022812C)`: a `tbz w0, #0,
   0x100228378` that consumes the return value of
   `sub_10022AE68 → sub_10022AE90 → sub_10022AEB4 →
   sub_10022AED4: return sub_100232C28() == 0`. The inner
   `sub_100232C58` is the argc probe IDA gave up on
-  (`call analysis failed funcsize=14`). When run with
-  `MACHINA_BYPASS_USAGE_CHECK=0x10022AE68` the binary now reads
-  argv[1] (`_strlen "http://127.0.0.1:8888"`), passes it to
-  `basic_string::compare(0, 7, "http://")`, and proceeds past
-  the URL check.
+  (`call analysis failed funcsize=14`). With the LR-filtered bypass
+  below, the binary reads argv[1] (`_strlen "http://127.0.0.1:8888"`),
+  passes it to `basic_string::compare(0, 7, "http://")`, and proceeds
+  past the URL check without forcing later helper calls to stale
+  values.
 - The arm64 runner now installs a synthetic
   `__mod_init_func` trampoline (mapped R+W+X, passed as
   `RunReport::actual_entry` so `uc_emu_start` actually begins
@@ -169,37 +163,17 @@ emulator behavior.
   no-op code hooks at the given addresses and emits a
   `function-entry` JSONL event whenever execution reaches
   one. Used to pin down which paths the binary actually visits.
-- A `basic_string::compare(pos, n, const char* s)` hook in
-  `src/macos/arch_arm64/cpp_imports.rs` performs the real
-  byte comparison, decoding both the libc++ long-form layout
-  (data ptr at offset 16) and a custom layout the binary
-  appears to use (the "size" slot holds a code address, so
-  the hook ignores it and reads from the data pointer via
-  the `n`-byte window plus a null terminator).
-- **Current next blocker:** even with bypass + mod-init the
-  binary still does not reach `getHostname` / `getTmpDir` /
-  `get_browser_extensions` / `buildPostBody`. None of those
-  symbols has a direct `bl` caller anywhere in `__TEXT` /
-  `.hAv` / `.AR1` — every call to them goes through indirect
-  `br xN` chains whose target is computed from a
-  `movz`/`movk` sequence. Without bypass the binary enters
-  an obfuscation loop that exhausts the 50M instruction
-  budget calling `_time` / `_getpid` / `_srand` and the C++
-  sentry imports ~1786 times each. Reaching the profile
-  pipeline (sysctl / popen / curl) needs either deeper
-  obfuscation work to resolve the indirect call targets, or
-  a direct hook that jumps straight into `buildPostBody` /
-  `getHostname` with a synthesized std::string `argv[1]`.
 - Recommended local invocation:
   - `.\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-trace.jsonl`
-  - `MACHINA_BYPASS_USAGE_CHECK="0x10022AE68" MACHINA_ARGV_APPEND="http://127.0.0.1:8888" .\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-bypass.jsonl` to skip the obfuscated usage check and see the URL-validation path execute
-  - `MACHINA_BYPASS_USAGE_CHECK` now also accepts a comma-separated
-    list of per-call return values (e.g. `0x10022AE68=1,0,0`) so the
-    same wrapper can answer "true" for the usage decision and "false"
-    for the two subsequent prefix-check invocations. The legacy
-    address-only form keeps returning 0 for every call. Each hook hit
-    emits a `CallIndex` field on the existing `bypass-usage-check`
-    JSONL event so the sequence is easy to inspect.
+  - PowerShell validation for the profiler path:
+    `$env:MACHINA_TRACE_FORMAT="jsonl"; $env:MACHINA_BYPASS_USAGE_CHECK="0x10022AE68@0x10022812C=1,0;0x10022AE68@0x100225548=0;0x10022AE68@0x100225ADC=0"; $env:MACHINA_ARGV_APPEND="http://127.0.0.1:8888"; .\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-bypass.jsonl`
+  - `MACHINA_BYPASS_USAGE_CHECK` accepts an optional LR filter
+    (`0xADDR@0xLR=...`) and a comma-separated list of per-call return
+    values. This keeps the first usage decision patched without
+    forcing later calls through the same obfuscated helper to return
+    stale values. Each hook hit emits `CallIndex`, `Lr`, `LrFilter`,
+    and `ReturnValue` on the existing `bypass-usage-check` JSONL
+    event.
 
 ## Corpus hygiene
 

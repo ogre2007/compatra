@@ -13,9 +13,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use crate::macos::arm64_runner_support::{
-    record_arm64_import, Arm64ImportTracker, Arm64SharedState,
+    arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
+    Arm64SharedState,
 };
-use crate::macos::{wake_arm64_cond_waiters, yield_active_arm64_thread};
+use crate::macos::{wake_arm64_cond_waiters, yield_active_arm64_thread, SharedTraceBus};
 use crate::{Emulator, UnicornEmulator};
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
@@ -45,11 +46,14 @@ fn read_cstring(emu: &dyn Emulator, addr: u64, max_len: usize) -> String {
 pub fn install_arm64_time_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
+    trace_bus: &Option<SharedTraceBus>,
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
     usleep_streaks: &Arc<Mutex<HashMap<(u64, u64), u32>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let thread_runtime = shared_state.thread_runtime.clone();
+    let os_runtime = shared_state.os_runtime.clone();
+    let synthetic_stop_reason = shared_state.synthetic_stop_reason.clone();
     let mach_absolute_time = Arc::new(AtomicU64::new(1_000_000));
 
     if let Some(&addr) = stub_map.get("_mach_absolute_time") {
@@ -80,6 +84,84 @@ pub fn install_arm64_time_imports(
                     "[IMPORT][arm64] _mach_absolute_time tid={} lr=0x{:X} -> {}",
                     thread_id, lr, value
                 );
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_sleep") {
+        let import_tracker = import_tracker.clone();
+        let thread_runtime = thread_runtime.clone();
+        let os_runtime = os_runtime.clone();
+        let synthetic_stop_reason = synthetic_stop_reason.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let sleep_streaks = usleep_streaks.clone();
+        let mach_absolute_time = mach_absolute_time.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let seconds = emu.read_reg("x0").unwrap_or(0);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let (thread_id, active_thread, pending_threads) = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| {
+                        (
+                            rt.current_thread_id.max(1),
+                            rt.active_thread.is_some(),
+                            rt.pending_threads.len(),
+                        )
+                    })
+                    .unwrap_or((1, false, 0));
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&thread_id).copied())
+                    .unwrap_or(1);
+                let time_advance = seconds.saturating_mul(1_000_000_000).max(1_000_000);
+                let _ = mach_absolute_time
+                    .fetch_add(time_advance, std::sync::atomic::Ordering::Relaxed);
+                let streak = {
+                    let mut streaks = match sleep_streaks.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                    let slot = streaks.entry((thread_id, lr)).or_insert(0);
+                    *slot = slot.saturating_add(1);
+                    *slot
+                };
+                let _ = emu.write_reg("x0", 0);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_sleep(tid={}, seconds={}, lr=0x{:X}, streak={}, dt_ns={}) -> 0",
+                        thread_id, seconds, lr, streak, time_advance
+                    ),
+                );
+                let event = arm64_process_event(current_pid, thread_id, "sleep", "sleep")
+                    .arg("Seconds", seconds.to_string())
+                    .arg("Lr", format!("0x{:X}", lr))
+                    .arg("Streak", streak.to_string())
+                    .arg("AdvancedNs", time_advance.to_string())
+                    .arg("ActiveThread", active_thread.to_string())
+                    .arg("PendingThreads", pending_threads.to_string())
+                    .arg("Result", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
+
+                if seconds > 0 && pending_threads == 0 && streak >= 3 {
+                    if let Ok(mut stop_reason) = synthetic_stop_reason.lock() {
+                        if stop_reason.is_none() {
+                            *stop_reason = Some(format!(
+                                "idle_sleep_loop(seconds={}, caller=0x{:X}, sleeps={})",
+                                seconds, lr, streak
+                            ));
+                        }
+                    }
+                    let _ = emu.stop_emulation();
+                }
             },
         )?;
     }

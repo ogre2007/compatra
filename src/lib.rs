@@ -14,8 +14,8 @@ pub use macos::capture::{
 };
 pub use macos::emulation::{
     collect_targets, cpu_type_name, ensure_macho_cpu, macho_cputype, run_target_batch,
-    targets_from_args, BatchSummary, EmulationOptions, EmulationReport, EmulationStatus, MacosCpu,
-    MacosEmulator, CPU_TYPE_ARM64, DEFAULT_SAMPLE_PATH,
+    run_target_batch_with_mode, targets_from_args, BatchSummary, EmulationOptions, EmulationReport,
+    EmulationStatus, MacosCpu, MacosEmulator, CPU_TYPE_ARM64, DEFAULT_SAMPLE_PATH,
 };
 pub use macos::events::MacOsEventManager;
 pub use macos::events::MacOsEventType;
@@ -35,15 +35,20 @@ pub use macos::macho_utils::{
 };
 pub use macos::materialize_synthetic_file_bytes;
 pub use macos::memory_arena::{setup_guest_memory_arena, GuestMemoryArena, GuestMemoryArenaConfig};
+pub use macos::mode::RuntimeMode;
 pub use macos::plugin_events::{
     capture_event, detect_event, io_event, kqueue_event, memory_event, process_event,
     syscall_event, thread_event, TraceMetadata,
 };
 pub use macos::plugins::register_plugins;
 pub use macos::policy::MacOsPolicyManager;
-pub use macos::runner::{emulate_macos_arm64_binary, emulate_macos_binary};
+pub use macos::runner::{
+    emulate_macos_arm64_binary, emulate_macos_arm64_binary_with_mode, emulate_macos_binary,
+    emulate_macos_binary_with_mode,
+};
 pub use macos::runner_plugins::{
-    emit_runner_trace_event, shared_trace_bus_from_env, SharedTraceBus,
+    emit_runner_trace_event, shared_trace_bus_for_mode_from_env, shared_trace_bus_from_env,
+    SharedTraceBus,
 };
 pub use macos::runtime::{
     bind_process_fd_target, block_active_arm64_thread_on_cond, block_current_arm64_thread_on_cond,
