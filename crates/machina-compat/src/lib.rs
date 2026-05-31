@@ -159,6 +159,12 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     FAccessAt,
     #[cfg(target_os = "macos")]
+    Chmod,
+    #[cfg(target_os = "macos")]
+    Fchmod,
+    #[cfg(target_os = "macos")]
+    FchmodAt,
+    #[cfg(target_os = "macos")]
     Chdir,
     #[cfg(target_os = "macos")]
     Fchdir,
@@ -177,15 +183,27 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     FStatFs,
     #[cfg(target_os = "macos")]
+    Truncate,
+    #[cfg(target_os = "macos")]
+    Ftruncate,
+    #[cfg(target_os = "macos")]
     Mkdir,
+    #[cfg(target_os = "macos")]
+    MkdirAt,
     #[cfg(target_os = "macos")]
     Rmdir,
     #[cfg(target_os = "macos")]
     Unlink,
     #[cfg(target_os = "macos")]
+    UnlinkAt,
+    #[cfg(target_os = "macos")]
     Rename,
     #[cfg(target_os = "macos")]
+    RenameAt,
+    #[cfg(target_os = "macos")]
     Readlink,
+    #[cfg(target_os = "macos")]
+    ReadlinkAt,
     #[cfg(target_os = "macos")]
     Symlink,
     #[cfg(target_os = "macos")]
@@ -583,6 +601,15 @@ impl CompatibilityServices {
                     .into(),
             ),
             #[cfg(target_os = "macos")]
+            HostImportKind::Chmod => Some(self.chmod_path(memory, args[0], args[1])?.into()),
+            #[cfg(target_os = "macos")]
+            HostImportKind::Fchmod => Some(self.fchmod_fd(args[0], args[1])?.into()),
+            #[cfg(target_os = "macos")]
+            HostImportKind::FchmodAt => Some(
+                self.fchmodat_path(memory, args[0], args[1], args[2], args[3])?
+                    .into(),
+            ),
+            #[cfg(target_os = "macos")]
             HostImportKind::Chdir => Some(self.chdir_path(memory, args[0])?.into()),
             #[cfg(target_os = "macos")]
             HostImportKind::Fchdir => Some(self.fchdir_fd(args[0])?.into()),
@@ -604,16 +631,39 @@ impl CompatibilityServices {
             #[cfg(target_os = "macos")]
             HostImportKind::FStatFs => Some(self.fstatfs_fd(memory, args[0], args[1])?.into()),
             #[cfg(target_os = "macos")]
+            HostImportKind::Truncate => Some(self.truncate_path(memory, args[0], args[1])?.into()),
+            #[cfg(target_os = "macos")]
+            HostImportKind::Ftruncate => Some(self.ftruncate_fd(args[0], args[1])?.into()),
+            #[cfg(target_os = "macos")]
             HostImportKind::Mkdir => Some(self.mkdir_path(memory, args[0], args[1])?.into()),
+            #[cfg(target_os = "macos")]
+            HostImportKind::MkdirAt => {
+                Some(self.mkdirat_path(memory, args[0], args[1], args[2])?.into())
+            }
             #[cfg(target_os = "macos")]
             HostImportKind::Rmdir => Some(self.rmdir_path(memory, args[0])?.into()),
             #[cfg(target_os = "macos")]
             HostImportKind::Unlink => Some(self.unlink_path(memory, args[0])?.into()),
             #[cfg(target_os = "macos")]
+            HostImportKind::UnlinkAt => Some(
+                self.unlinkat_path(memory, args[0], args[1], args[2])?
+                    .into(),
+            ),
+            #[cfg(target_os = "macos")]
             HostImportKind::Rename => Some(self.rename_path(memory, args[0], args[1])?.into()),
+            #[cfg(target_os = "macos")]
+            HostImportKind::RenameAt => Some(
+                self.renameat_path(memory, args[0], args[1], args[2], args[3])?
+                    .into(),
+            ),
             #[cfg(target_os = "macos")]
             HostImportKind::Readlink => Some(
                 self.readlink_path(memory, args[0], args[1], args[2] as usize)?
+                    .into(),
+            ),
+            #[cfg(target_os = "macos")]
+            HostImportKind::ReadlinkAt => Some(
+                self.readlinkat_path(memory, args[0], args[1], args[2], args[3] as usize)?
                     .into(),
             ),
             #[cfg(target_os = "macos")]
@@ -1552,6 +1602,54 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn chmod_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        mode: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_chmod(memory, path_ptr, mode);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, path_ptr, mode);
+            None
+        }
+    }
+
+    pub fn fchmod_fd(&self, fd: u64, mode: u64) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_fchmod(fd, mode);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (fd, mode);
+            None
+        }
+    }
+
+    pub fn fchmodat_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        dirfd: u64,
+        path_ptr: u64,
+        mode: u64,
+        flags: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_fchmodat(memory, dirfd, path_ptr, mode, flags);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, dirfd, path_ptr, mode, flags);
+            None
+        }
+    }
+
     pub fn chdir_path<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1701,6 +1799,35 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn truncate_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        length: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_truncate(memory, path_ptr, length);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, path_ptr, length);
+            None
+        }
+    }
+
+    pub fn ftruncate_fd(&self, fd: u64, length: u64) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_ftruncate(fd, length);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (fd, length);
+            None
+        }
+    }
+
     pub fn mkdir_path<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1714,6 +1841,24 @@ impl CompatibilityServices {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, path_ptr, mode);
+            None
+        }
+    }
+
+    pub fn mkdirat_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        dirfd: u64,
+        path_ptr: u64,
+        mode: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_mkdirat(memory, dirfd, path_ptr, mode);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, dirfd, path_ptr, mode);
             None
         }
     }
@@ -1750,6 +1895,24 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn unlinkat_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        dirfd: u64,
+        path_ptr: u64,
+        flags: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_unlinkat(memory, dirfd, path_ptr, flags);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, dirfd, path_ptr, flags);
+            None
+        }
+    }
+
     pub fn rename_path<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1763,6 +1926,25 @@ impl CompatibilityServices {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, from_ptr, to_ptr);
+            None
+        }
+    }
+
+    pub fn renameat_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        fromfd: u64,
+        from_ptr: u64,
+        tofd: u64,
+        to_ptr: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_renameat(memory, fromfd, from_ptr, tofd, to_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, fromfd, from_ptr, tofd, to_ptr);
             None
         }
     }
@@ -1781,6 +1963,25 @@ impl CompatibilityServices {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, path_ptr, buf_ptr, count);
+            None
+        }
+    }
+
+    pub fn readlinkat_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        dirfd: u64,
+        path_ptr: u64,
+        buf_ptr: u64,
+        count: usize,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_readlinkat(memory, dirfd, path_ptr, buf_ptr, count);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, dirfd, path_ptr, buf_ptr, count);
             None
         }
     }
@@ -3035,6 +3236,9 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "__darwin_check_fd_set_overflow" => Some(HostImportKind::DarwinCheckFdSetOverflow),
             "access" => Some(HostImportKind::Access),
             "faccessat" => Some(HostImportKind::FAccessAt),
+            "chmod" => Some(HostImportKind::Chmod),
+            "fchmod" => Some(HostImportKind::Fchmod),
+            "fchmodat" => Some(HostImportKind::FchmodAt),
             "chdir" => Some(HostImportKind::Chdir),
             "fchdir" => Some(HostImportKind::Fchdir),
             "getcwd" => Some(HostImportKind::GetCwd),
@@ -3044,11 +3248,17 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "fstatat" | "fstatat64" | "fstatat$INODE64" => Some(HostImportKind::FStatAt),
             "statfs" | "statfs64" | "statfs$INODE64" => Some(HostImportKind::StatFs),
             "fstatfs" | "fstatfs64" | "fstatfs$INODE64" => Some(HostImportKind::FStatFs),
+            "truncate" => Some(HostImportKind::Truncate),
+            "ftruncate" => Some(HostImportKind::Ftruncate),
             "mkdir" => Some(HostImportKind::Mkdir),
+            "mkdirat" => Some(HostImportKind::MkdirAt),
             "rmdir" => Some(HostImportKind::Rmdir),
             "unlink" => Some(HostImportKind::Unlink),
+            "unlinkat" => Some(HostImportKind::UnlinkAt),
             "rename" => Some(HostImportKind::Rename),
+            "renameat" => Some(HostImportKind::RenameAt),
             "readlink" => Some(HostImportKind::Readlink),
+            "readlinkat" => Some(HostImportKind::ReadlinkAt),
             "symlink" => Some(HostImportKind::Symlink),
             "realpath" => Some(HostImportKind::Realpath),
             "getaddrinfo" => Some(HostImportKind::GetAddrInfo),
@@ -3879,6 +4089,52 @@ fn proxy_host_faccessat<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_host_chmod<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    mode: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe { libc::chmod(path.as_ptr(), mode as libc::mode_t) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fchmod(fd: u64, mode: u64) -> Option<HostIoResult> {
+    clear_errno();
+    let ret = unsafe { libc::fchmod(fd as libc::c_int, mode as libc::mode_t) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fchmodat<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    dirfd: u64,
+    path_ptr: u64,
+    mode: u64,
+    flags: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe {
+        libc::fchmodat(
+            dirfd as libc::c_int,
+            path.as_ptr(),
+            mode as libc::mode_t,
+            flags as libc::c_int,
+        )
+    };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_chdir<M: GuestMemory + ?Sized>(
     memory: &mut M,
     path_ptr: u64,
@@ -4089,6 +4345,28 @@ fn proxy_host_fstatfs<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_host_truncate<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    length: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe { libc::truncate(path.as_ptr(), length as libc::off_t) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_ftruncate(fd: u64, length: u64) -> Option<HostIoResult> {
+    clear_errno();
+    let ret = unsafe { libc::ftruncate(fd as libc::c_int, length as libc::off_t) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_mkdir<M: GuestMemory + ?Sized>(
     memory: &mut M,
     path_ptr: u64,
@@ -4100,6 +4378,22 @@ fn proxy_host_mkdir<M: GuestMemory + ?Sized>(
     };
     clear_errno();
     let ret = unsafe { libc::mkdir(path.as_ptr(), mode as libc::mode_t) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_mkdirat<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    dirfd: u64,
+    path_ptr: u64,
+    mode: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe { libc::mkdirat(dirfd as libc::c_int, path.as_ptr(), mode as libc::mode_t) };
     Some(host_io_result(ret as isize, Vec::new()))
 }
 
@@ -4132,6 +4426,22 @@ fn proxy_host_unlink<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_host_unlinkat<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    dirfd: u64,
+    path_ptr: u64,
+    flags: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe { libc::unlinkat(dirfd as libc::c_int, path.as_ptr(), flags as libc::c_int) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_rename<M: GuestMemory + ?Sized>(
     memory: &mut M,
     from_ptr: u64,
@@ -4151,6 +4461,34 @@ fn proxy_host_rename<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_host_renameat<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    fromfd: u64,
+    from_ptr: u64,
+    tofd: u64,
+    to_ptr: u64,
+) -> Option<HostIoResult> {
+    let (_, from) = match read_host_path(memory, from_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let (_, to) = match read_host_path(memory, to_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe {
+        libc::renameat(
+            fromfd as libc::c_int,
+            from.as_ptr(),
+            tofd as libc::c_int,
+            to.as_ptr(),
+        )
+    };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_readlink<M: GuestMemory + ?Sized>(
     memory: &mut M,
     path_ptr: u64,
@@ -4164,6 +4502,40 @@ fn proxy_host_readlink<M: GuestMemory + ?Sized>(
     let mut data = vec![0u8; count];
     clear_errno();
     let ret = unsafe { libc::readlink(path.as_ptr(), data.as_mut_ptr().cast(), data.len()) };
+    if ret > 0 {
+        let len = ret as usize;
+        if memory.write_memory(buf_ptr, &data[..len]).is_err() {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
+        data.truncate(len.min(128));
+    } else {
+        data.clear();
+    }
+    Some(host_io_result(ret, data))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_readlinkat<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    dirfd: u64,
+    path_ptr: u64,
+    buf_ptr: u64,
+    count: usize,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let mut data = vec![0u8; count];
+    clear_errno();
+    let ret = unsafe {
+        libc::readlinkat(
+            dirfd as libc::c_int,
+            path.as_ptr(),
+            data.as_mut_ptr().cast(),
+            data.len(),
+        )
+    };
     if ret > 0 {
         let len = ret as usize;
         if memory.write_memory(buf_ptr, &data[..len]).is_err() {
@@ -7510,6 +7882,9 @@ mod tests {
             assert!(compat.should_proxy_import("_access"));
             assert!(compat.should_proxy_import("_access$UNIX2003"));
             assert!(compat.should_proxy_import("_faccessat"));
+            assert!(compat.should_proxy_import("_chmod"));
+            assert!(compat.should_proxy_import("_fchmod"));
+            assert!(compat.should_proxy_import("_fchmodat"));
             assert!(compat.should_proxy_import("_chdir"));
             assert!(compat.should_proxy_import("_fchdir"));
             assert!(compat.should_proxy_import("_getcwd"));
@@ -7519,11 +7894,17 @@ mod tests {
             assert!(compat.should_proxy_import("_fstatat$INODE64"));
             assert!(compat.should_proxy_import("_statfs"));
             assert!(compat.should_proxy_import("_fstatfs64"));
+            assert!(compat.should_proxy_import("_truncate"));
+            assert!(compat.should_proxy_import("_ftruncate"));
             assert!(compat.should_proxy_import("_mkdir"));
+            assert!(compat.should_proxy_import("_mkdirat"));
             assert!(compat.should_proxy_import("_rmdir"));
             assert!(compat.should_proxy_import("_unlink"));
+            assert!(compat.should_proxy_import("_unlinkat"));
             assert!(compat.should_proxy_import("_rename"));
+            assert!(compat.should_proxy_import("_renameat"));
             assert!(compat.should_proxy_import("_readlink"));
+            assert!(compat.should_proxy_import("_readlinkat"));
             assert!(compat.should_proxy_import("_symlink"));
             assert!(compat.should_proxy_import("_realpath"));
             assert!(compat.should_proxy_import("_getenv"));

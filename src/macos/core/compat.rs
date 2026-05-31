@@ -533,6 +533,38 @@ impl CompatibilityServices {
         )
     }
 
+    pub fn chmod_path(
+        &self,
+        emu: &mut dyn Emulator,
+        path_ptr: u64,
+        mode: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.chmod_path(&mut memory, path_ptr, mode)
+    }
+
+    pub fn fchmod_fd(&self, fd: u64, mode: u64) -> Option<HostIoResult> {
+        machina_compat::CompatibilityServices.fchmod_fd(fd, mode)
+    }
+
+    pub fn fchmodat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        dirfd: u64,
+        path_ptr: u64,
+        mode: u64,
+        flags: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.fchmodat_path(
+            &mut memory,
+            dirfd,
+            path_ptr,
+            mode,
+            flags,
+        )
+    }
+
     pub fn chdir_path(&self, emu: &mut dyn Emulator, path_ptr: u64) -> Option<HostIoResult> {
         let mut memory = EmulatorGuestMemory { emulator: emu };
         machina_compat::CompatibilityServices.chdir_path(&mut memory, path_ptr)
@@ -615,6 +647,20 @@ impl CompatibilityServices {
         machina_compat::CompatibilityServices.fstatfs_fd(&mut memory, fd, buf_ptr)
     }
 
+    pub fn truncate_path(
+        &self,
+        emu: &mut dyn Emulator,
+        path_ptr: u64,
+        length: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.truncate_path(&mut memory, path_ptr, length)
+    }
+
+    pub fn ftruncate_fd(&self, fd: u64, length: u64) -> Option<HostIoResult> {
+        machina_compat::CompatibilityServices.ftruncate_fd(fd, length)
+    }
+
     pub fn mkdir_path(
         &self,
         emu: &mut dyn Emulator,
@@ -623,6 +669,17 @@ impl CompatibilityServices {
     ) -> Option<HostIoResult> {
         let mut memory = EmulatorGuestMemory { emulator: emu };
         machina_compat::CompatibilityServices.mkdir_path(&mut memory, path_ptr, mode)
+    }
+
+    pub fn mkdirat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        dirfd: u64,
+        path_ptr: u64,
+        mode: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.mkdirat_path(&mut memory, dirfd, path_ptr, mode)
     }
 
     pub fn rmdir_path(&self, emu: &mut dyn Emulator, path_ptr: u64) -> Option<HostIoResult> {
@@ -635,6 +692,17 @@ impl CompatibilityServices {
         machina_compat::CompatibilityServices.unlink_path(&mut memory, path_ptr)
     }
 
+    pub fn unlinkat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        dirfd: u64,
+        path_ptr: u64,
+        flags: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.unlinkat_path(&mut memory, dirfd, path_ptr, flags)
+    }
+
     pub fn rename_path(
         &self,
         emu: &mut dyn Emulator,
@@ -643,6 +711,24 @@ impl CompatibilityServices {
     ) -> Option<HostIoResult> {
         let mut memory = EmulatorGuestMemory { emulator: emu };
         machina_compat::CompatibilityServices.rename_path(&mut memory, from_ptr, to_ptr)
+    }
+
+    pub fn renameat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        fromfd: u64,
+        from_ptr: u64,
+        tofd: u64,
+        to_ptr: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.renameat_path(
+            &mut memory,
+            fromfd,
+            from_ptr,
+            tofd,
+            to_ptr,
+        )
     }
 
     pub fn readlink_path(
@@ -654,6 +740,24 @@ impl CompatibilityServices {
     ) -> Option<HostIoResult> {
         let mut memory = EmulatorGuestMemory { emulator: emu };
         machina_compat::CompatibilityServices.readlink_path(&mut memory, path_ptr, buf_ptr, count)
+    }
+
+    pub fn readlinkat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        dirfd: u64,
+        path_ptr: u64,
+        buf_ptr: u64,
+        count: usize,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.readlinkat_path(
+            &mut memory,
+            dirfd,
+            path_ptr,
+            buf_ptr,
+            count,
+        )
     }
 
     pub fn symlink_path(

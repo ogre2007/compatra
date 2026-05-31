@@ -1,6 +1,5 @@
 #[path = "core/analysis.rs"]
 pub mod analysis;
-pub mod analysis_arm64;
 #[path = "analysis_arm64/cpp_imports.rs"]
 pub mod analysis_arm64_cpp_imports;
 #[path = "platform_apple/imports.rs"]
@@ -46,8 +45,6 @@ pub mod binary_setup;
 pub mod bootstrap;
 #[path = "core/byte_preview.rs"]
 pub mod byte_preview;
-#[path = "core/capture.rs"]
-pub mod capture;
 #[path = "core/compat.rs"]
 pub mod compat;
 pub mod core;
@@ -56,8 +53,6 @@ pub mod diagnostics;
 #[path = "core/emulation.rs"]
 pub mod emulation;
 pub mod events;
-#[path = "guest_model/analysis_artifacts.rs"]
-pub mod guest_analysis_artifacts;
 #[path = "guest_model/files.rs"]
 pub mod guest_files;
 #[path = "guest_model/memory.rs"]
@@ -75,8 +70,6 @@ pub mod os;
 pub mod platform_apple;
 #[path = "core/plugin_events.rs"]
 pub mod plugin_events;
-#[path = "core/plugins.rs"]
-pub mod plugins;
 pub mod policy;
 #[path = "core/process_imports.rs"]
 pub mod process_imports;

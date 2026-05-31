@@ -9,12 +9,12 @@ use machina_analysis::arm64_cpp_hooks::{
     self, AnalysisTraceCategory, AnalysisTraceRecord, AnalysisTraceSink, Arm64AnalysisEmulator,
     Arm64AnalysisImportTracker,
 };
-use machina_analysis::{FunctionEntryProbeSpec, UsageBypassHookSpec};
+use machina_analysis::{AnalysisRuntimeHooks, FunctionEntryProbeSpec, UsageBypassHookSpec};
 
 use crate::macos::arm64_runner_support::Arm64ImportTracker;
 use crate::macos::{
-    memory_event, process_event, runtime_process_metadata, Emulator, SharedTraceBus, TraceEvent,
-    TraceMetadata,
+    memory_event, process_event, runtime_process_metadata, Emulator, RuntimeMode, SharedTraceBus,
+    TraceEvent, TraceMetadata,
 };
 use crate::UnicornEmulator;
 
@@ -88,6 +88,71 @@ impl Arm64AnalysisImportTracker for Arm64ImportTracker {
             recent.push_back(format!("{} @ 0x{:X}", name, address));
         }
     }
+}
+
+pub struct Arm64AnalysisHookPlan {
+    hooks: AnalysisRuntimeHooks,
+    pub cpp_data_symbols: HashMap<String, u64>,
+}
+
+pub fn prepare_analysis_arm64_hooks(
+    runtime_mode: RuntimeMode,
+    emulator: &mut UnicornEmulator,
+    mmap_next: &Arc<AtomicU64>,
+    mmap_end: u64,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) -> Arm64AnalysisHookPlan {
+    let hooks = AnalysisRuntimeHooks::for_mode(runtime_mode);
+    let cpp_data_symbols = if hooks.is_enabled() {
+        match setup_analysis_arm64_cpp_data_region(
+            emulator, mmap_next, mmap_end, done_addr, trace_bus, metadata,
+        ) {
+            Ok(symbols) => symbols,
+            Err(err) => {
+                eprintln!("[CPP-DATA-REGION] setup failed: {}", err);
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+    Arm64AnalysisHookPlan {
+        hooks,
+        cpp_data_symbols,
+    }
+}
+
+pub fn install_prepared_analysis_arm64_hooks(
+    plan: Arm64AnalysisHookPlan,
+    emulator: &mut UnicornEmulator,
+    stub_map: &HashMap<String, u64>,
+    mmap_next: &Arc<AtomicU64>,
+    mmap_end: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    import_tracker: &Arm64ImportTracker,
+    process_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    if plan.hooks.is_enabled() {
+        install_analysis_arm64_cpp_imports(
+            emulator,
+            stub_map,
+            mmap_next,
+            mmap_end,
+            trace_bus,
+            import_tracker,
+            process_name,
+        )?;
+    }
+
+    install_analysis_arm64_operator_hooks(
+        emulator,
+        plan.hooks.function_entry_specs_from_env(),
+        plan.hooks.usage_bypass_specs_from_env(),
+        trace_bus,
+        process_name,
+    )
 }
 
 pub fn setup_analysis_arm64_cpp_data_region(

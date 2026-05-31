@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::macos::analysis::AnalysisServices;
+use crate::macos::analysis::materialize_missing_file_for_mode;
 use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::compat::CompatibilityServices;
 use crate::macos::{
@@ -29,6 +29,7 @@ const SYSCALL_WAIT4: u64 = 0x2000007;
 const SYSCALL_UNLINK: u64 = 0x200000A;
 const SYSCALL_CHDIR: u64 = 0x200000C;
 const SYSCALL_FCHDIR: u64 = 0x200000D;
+const SYSCALL_CHMOD: u64 = 0x200000F;
 const SYSCALL_GETPID: u64 = 0x2000014;
 const SYSCALL_GETUID: u64 = 0x2000018;
 const SYSCALL_GETEUID: u64 = 0x2000019;
@@ -65,6 +66,7 @@ const SYSCALL_GETRUSAGE: u64 = 0x2000075;
 const SYSCALL_GETSOCKOPT: u64 = 0x2000076;
 const SYSCALL_READV: u64 = 0x2000078;
 const SYSCALL_WRITEV: u64 = 0x2000079;
+const SYSCALL_FCHMOD: u64 = 0x200007C;
 const SYSCALL_RENAME: u64 = 0x2000080;
 const SYSCALL_SENDTO: u64 = 0x2000085;
 const SYSCALL_SHUTDOWN: u64 = 0x2000086;
@@ -83,6 +85,8 @@ const SYSCALL_PREAD: u64 = 0x2000099;
 const SYSCALL_PWRITE: u64 = 0x200009A;
 const SYSCALL_MMAP: u64 = 0x20000C5;
 const SYSCALL_LSEEK: u64 = 0x20000C7;
+const SYSCALL_TRUNCATE: u64 = 0x20000C8;
+const SYSCALL_FTRUNCATE: u64 = 0x20000C9;
 const SYSCALL_SYSCTL: u64 = 0x20000CA;
 const SYSCALL_GETATTRLIST: u64 = 0x20000DC;
 const SYSCALL_GETDIRENTRIESATTR: u64 = 0x20000DE;
@@ -116,8 +120,13 @@ const SYSCALL_PREAD_NOCANCEL: u64 = 0x200019E;
 const SYSCALL_PWRITE_NOCANCEL: u64 = 0x200019F;
 const SYSCALL_POLL_NOCANCEL: u64 = 0x20001A1;
 const SYSCALL_OPENAT: u64 = 0x20001CF;
+const SYSCALL_RENAMEAT: u64 = 0x20001D1;
 const SYSCALL_FACCESSAT: u64 = 0x20001D2;
+const SYSCALL_FCHMODAT: u64 = 0x20001D3;
 const SYSCALL_FSTATAT: u64 = 0x20001D5;
+const SYSCALL_UNLINKAT: u64 = 0x20001D8;
+const SYSCALL_READLINKAT: u64 = 0x20001D9;
+const SYSCALL_MKDIRAT: u64 = 0x20001DB;
 const SYSCALL_GETENTROPY: u64 = 0x20001F4;
 
 const AT_FDCWD: u64 = (-2i64) as u64;
@@ -221,6 +230,7 @@ pub fn default_syscall_name(num: u64) -> &'static str {
         SYSCALL_UNLINK => "unlink",
         SYSCALL_CHDIR => "chdir",
         SYSCALL_FCHDIR => "fchdir",
+        SYSCALL_CHMOD => "chmod",
         SYSCALL_GETPID => "getpid",
         SYSCALL_GETUID => "getuid",
         SYSCALL_GETEUID => "geteuid",
@@ -255,6 +265,7 @@ pub fn default_syscall_name(num: u64) -> &'static str {
         SYSCALL_GETSOCKOPT => "getsockopt",
         SYSCALL_READV => "readv",
         SYSCALL_WRITEV => "writev",
+        SYSCALL_FCHMOD => "fchmod",
         SYSCALL_RENAME => "rename",
         SYSCALL_SENDTO => "sendto",
         SYSCALL_SHUTDOWN => "shutdown",
@@ -273,6 +284,8 @@ pub fn default_syscall_name(num: u64) -> &'static str {
         SYSCALL_PWRITE => "pwrite",
         SYSCALL_MMAP => "mmap",
         SYSCALL_LSEEK => "lseek",
+        SYSCALL_TRUNCATE => "truncate",
+        SYSCALL_FTRUNCATE => "ftruncate",
         SYSCALL_SYSCTL => "sysctl",
         SYSCALL_GETATTRLIST => "getattrlist",
         SYSCALL_GETDIRENTRIESATTR => "getdirentriesattr",
@@ -307,8 +320,13 @@ pub fn default_syscall_name(num: u64) -> &'static str {
         SYSCALL_PWRITE_NOCANCEL => "pwrite_nocancel",
         SYSCALL_POLL_NOCANCEL => "poll_nocancel",
         SYSCALL_OPENAT => "openat",
+        SYSCALL_RENAMEAT => "renameat",
         SYSCALL_FACCESSAT => "faccessat",
+        SYSCALL_FCHMODAT => "fchmodat",
         SYSCALL_FSTATAT => "fstatat",
+        SYSCALL_UNLINKAT => "unlinkat",
+        SYSCALL_READLINKAT => "readlinkat",
+        SYSCALL_MKDIRAT => "mkdirat",
         SYSCALL_GETENTROPY => "getentropy",
         _ => "unknown",
     }
@@ -867,30 +885,29 @@ pub fn handle_basic_macos_syscall(
             let raw_path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
             let resolved = resolve_guest_path(&runtime.guest_fs_base, &raw_path);
             let fd = runtime.next_fd.fetch_add(1, Ordering::Relaxed);
-            let analysis = AnalysisServices::for_mode(runtime.runtime_mode);
             let entry = match File::open(&resolved) {
                 Ok(file) => SyscallFdEntry::HostFile(file),
                 Err(_) if creating => SyscallFdEntry::SyntheticCursor(Cursor::new(Vec::new())),
-                Err(_) if analysis.is_none() => {
-                    return_value = u64::MAX;
-                    event = event
-                        .arg("Path", raw_path)
-                        .arg("DirFd", dirfd_label(dirfd))
-                        .arg("Resolved", resolved.display().to_string())
-                        .arg("Result", format!("0x{:X}", u64::MAX))
-                        .arg("Errno", "2");
-                    return Ok(SyscallOutcome {
-                        return_value,
-                        extra_register_writes,
-                        stop_addr,
-                        event,
-                    });
+                Err(_) => {
+                    match materialize_missing_file_for_mode(runtime.runtime_mode, &raw_path, 4096) {
+                        Some(bytes) => SyscallFdEntry::SyntheticCursor(Cursor::new(bytes)),
+                        None => {
+                            return_value = u64::MAX;
+                            event = event
+                                .arg("Path", raw_path)
+                                .arg("DirFd", dirfd_label(dirfd))
+                                .arg("Resolved", resolved.display().to_string())
+                                .arg("Result", format!("0x{:X}", u64::MAX))
+                                .arg("Errno", "2");
+                            return Ok(SyscallOutcome {
+                                return_value,
+                                extra_register_writes,
+                                stop_addr,
+                                event,
+                            });
+                        }
+                    }
                 }
-                Err(_) => SyscallFdEntry::SyntheticCursor(Cursor::new(
-                    analysis
-                        .expect("analysis service checked above")
-                        .materialize_synthetic_file_bytes(&raw_path, 4096),
-                )),
             };
             if let Ok(mut table) = runtime.fd_table.lock() {
                 table.insert(fd, entry);
@@ -951,6 +968,74 @@ pub fn handle_basic_macos_syscall(
                 event = event
                     .arg("Path", path)
                     .arg("DirFd", dirfd_label(dirfd))
+                    .arg("Result", "0");
+            }
+        }
+        SYSCALL_CHMOD => {
+            let path_ptr = invocation.args[0];
+            let mode = invocation.args[1];
+            let path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
+            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
+                .and_then(|compat| compat.chmod_path(emu, path_ptr, mode))
+            {
+                return_value = result.return_value;
+                event = event
+                    .arg("HostProxy", "true")
+                    .arg("Path", path)
+                    .arg("Mode", format!("0x{:X}", mode))
+                    .arg("Result", return_value.to_string())
+                    .arg("Errno", result.errno.to_string());
+            } else {
+                event = event
+                    .arg("Path", path)
+                    .arg("Mode", format!("0x{:X}", mode))
+                    .arg("Result", "0");
+            }
+        }
+        SYSCALL_FCHMOD => {
+            let fd = invocation.args[0];
+            let mode = invocation.args[1];
+            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
+                .and_then(|compat| compat.fchmod_fd(fd, mode))
+            {
+                return_value = result.return_value;
+                event = event
+                    .arg("HostProxy", "true")
+                    .arg("Fd", fd.to_string())
+                    .arg("Mode", format!("0x{:X}", mode))
+                    .arg("Result", return_value.to_string())
+                    .arg("Errno", result.errno.to_string());
+            } else {
+                event = event
+                    .arg("Fd", fd.to_string())
+                    .arg("Mode", format!("0x{:X}", mode))
+                    .arg("Result", "0");
+            }
+        }
+        SYSCALL_FCHMODAT => {
+            let dirfd = invocation.args[0];
+            let path_ptr = invocation.args[1];
+            let mode = invocation.args[2];
+            let flags = invocation.args[3];
+            let path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
+            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
+                .and_then(|compat| compat.fchmodat_path(emu, dirfd, path_ptr, mode, flags))
+            {
+                return_value = result.return_value;
+                event = event
+                    .arg("HostProxy", "true")
+                    .arg("DirFd", dirfd_label(Some(dirfd)))
+                    .arg("Path", path)
+                    .arg("Mode", format!("0x{:X}", mode))
+                    .arg("Flags", format!("0x{:X}", flags))
+                    .arg("Result", return_value.to_string())
+                    .arg("Errno", result.errno.to_string());
+            } else {
+                event = event
+                    .arg("DirFd", dirfd_label(Some(dirfd)))
+                    .arg("Path", path)
+                    .arg("Mode", format!("0x{:X}", mode))
+                    .arg("Flags", format!("0x{:X}", flags))
                     .arg("Result", "0");
             }
         }
@@ -1107,6 +1192,47 @@ pub fn handle_basic_macos_syscall(
                     .arg("Result", "0");
             }
         }
+        SYSCALL_TRUNCATE => {
+            let path_ptr = invocation.args[0];
+            let length = invocation.args[1];
+            let path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
+            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
+                .and_then(|compat| compat.truncate_path(emu, path_ptr, length))
+            {
+                return_value = result.return_value;
+                event = event
+                    .arg("HostProxy", "true")
+                    .arg("Path", path)
+                    .arg("Length", length.to_string())
+                    .arg("Result", return_value.to_string())
+                    .arg("Errno", result.errno.to_string());
+            } else {
+                event = event
+                    .arg("Path", path)
+                    .arg("Length", length.to_string())
+                    .arg("Result", "0");
+            }
+        }
+        SYSCALL_FTRUNCATE => {
+            let fd = invocation.args[0];
+            let length = invocation.args[1];
+            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
+                .and_then(|compat| compat.ftruncate_fd(fd, length))
+            {
+                return_value = result.return_value;
+                event = event
+                    .arg("HostProxy", "true")
+                    .arg("Fd", fd.to_string())
+                    .arg("Length", length.to_string())
+                    .arg("Result", return_value.to_string())
+                    .arg("Errno", result.errno.to_string());
+            } else {
+                event = event
+                    .arg("Fd", fd.to_string())
+                    .arg("Length", length.to_string())
+                    .arg("Result", "0");
+            }
+        }
         SYSCALL_GETRLIMIT | SYSCALL_SETRLIMIT => {
             let resource = invocation.args[0];
             let rlp_ptr = invocation.args[1];
@@ -1163,22 +1289,41 @@ pub fn handle_basic_macos_syscall(
                     .arg("Result", "0");
             }
         }
-        SYSCALL_MKDIR => {
-            let path_ptr = invocation.args[0];
-            let mode = invocation.args[1];
+        SYSCALL_MKDIR | SYSCALL_MKDIRAT => {
+            let is_mkdirat = invocation.num == SYSCALL_MKDIRAT;
+            let dirfd = is_mkdirat.then_some(invocation.args[0]);
+            let path_ptr = if is_mkdirat {
+                invocation.args[1]
+            } else {
+                invocation.args[0]
+            };
+            let mode = if is_mkdirat {
+                invocation.args[2]
+            } else {
+                invocation.args[1]
+            };
             let path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
-            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
-                .and_then(|compat| compat.mkdir_path(emu, path_ptr, mode))
-            {
+            let result = CompatibilityServices::for_mode(runtime.runtime_mode).and_then(|compat| {
+                if let Some(dirfd) = dirfd {
+                    compat.mkdirat_path(emu, dirfd, path_ptr, mode)
+                } else {
+                    compat.mkdir_path(emu, path_ptr, mode)
+                }
+            });
+            if let Some(result) = result {
                 return_value = result.return_value;
                 event = event
                     .arg("HostProxy", "true")
+                    .arg("DirFd", dirfd_label(dirfd))
                     .arg("Path", path)
                     .arg("Mode", format!("0x{:X}", mode))
                     .arg("Result", return_value.to_string())
                     .arg("Errno", result.errno.to_string());
             } else {
-                event = event.arg("Path", path).arg("Result", "0");
+                event = event
+                    .arg("DirFd", dirfd_label(dirfd))
+                    .arg("Path", path)
+                    .arg("Result", "0");
             }
         }
         SYSCALL_RMDIR => {
@@ -1197,52 +1342,117 @@ pub fn handle_basic_macos_syscall(
                 event = event.arg("Path", path).arg("Result", "0");
             }
         }
-        SYSCALL_UNLINK => {
-            let path_ptr = invocation.args[0];
+        SYSCALL_UNLINK | SYSCALL_UNLINKAT => {
+            let is_unlinkat = invocation.num == SYSCALL_UNLINKAT;
+            let dirfd = is_unlinkat.then_some(invocation.args[0]);
+            let path_ptr = if is_unlinkat {
+                invocation.args[1]
+            } else {
+                invocation.args[0]
+            };
+            let flags = is_unlinkat.then_some(invocation.args[2]);
             let path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
-            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
-                .and_then(|compat| compat.unlink_path(emu, path_ptr))
-            {
+            let result = CompatibilityServices::for_mode(runtime.runtime_mode).and_then(|compat| {
+                if let Some(dirfd) = dirfd {
+                    compat.unlinkat_path(emu, dirfd, path_ptr, flags.unwrap_or(0))
+                } else {
+                    compat.unlink_path(emu, path_ptr)
+                }
+            });
+            if let Some(result) = result {
                 return_value = result.return_value;
                 event = event
                     .arg("HostProxy", "true")
+                    .arg("DirFd", dirfd_label(dirfd))
                     .arg("Path", path)
+                    .arg(
+                        "Flags",
+                        flags
+                            .map(|value| format!("0x{:X}", value))
+                            .unwrap_or_else(|| "-".to_string()),
+                    )
                     .arg("Result", return_value.to_string())
                     .arg("Errno", result.errno.to_string());
             } else {
-                event = event.arg("Path", path).arg("Result", "0");
+                event = event
+                    .arg("DirFd", dirfd_label(dirfd))
+                    .arg("Path", path)
+                    .arg("Result", "0");
             }
         }
-        SYSCALL_RENAME => {
-            let from_ptr = invocation.args[0];
-            let to_ptr = invocation.args[1];
+        SYSCALL_RENAME | SYSCALL_RENAMEAT => {
+            let is_renameat = invocation.num == SYSCALL_RENAMEAT;
+            let fromfd = is_renameat.then_some(invocation.args[0]);
+            let from_ptr = if is_renameat {
+                invocation.args[1]
+            } else {
+                invocation.args[0]
+            };
+            let tofd = is_renameat.then_some(invocation.args[2]);
+            let to_ptr = if is_renameat {
+                invocation.args[3]
+            } else {
+                invocation.args[1]
+            };
             let from = read_cstring(emu, from_ptr, 1024).unwrap_or_default();
             let to = read_cstring(emu, to_ptr, 1024).unwrap_or_default();
-            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
-                .and_then(|compat| compat.rename_path(emu, from_ptr, to_ptr))
-            {
+            let result = CompatibilityServices::for_mode(runtime.runtime_mode).and_then(|compat| {
+                if let (Some(fromfd), Some(tofd)) = (fromfd, tofd) {
+                    compat.renameat_path(emu, fromfd, from_ptr, tofd, to_ptr)
+                } else {
+                    compat.rename_path(emu, from_ptr, to_ptr)
+                }
+            });
+            if let Some(result) = result {
                 return_value = result.return_value;
                 event = event
                     .arg("HostProxy", "true")
+                    .arg("FromDirFd", dirfd_label(fromfd))
                     .arg("From", from)
+                    .arg("ToDirFd", dirfd_label(tofd))
                     .arg("To", to)
                     .arg("Result", return_value.to_string())
                     .arg("Errno", result.errno.to_string());
             } else {
-                event = event.arg("From", from).arg("To", to).arg("Result", "0");
+                event = event
+                    .arg("FromDirFd", dirfd_label(fromfd))
+                    .arg("From", from)
+                    .arg("ToDirFd", dirfd_label(tofd))
+                    .arg("To", to)
+                    .arg("Result", "0");
             }
         }
-        SYSCALL_READLINK => {
-            let path_ptr = invocation.args[0];
-            let buf_ptr = invocation.args[1];
-            let count = invocation.args[2] as usize;
+        SYSCALL_READLINK | SYSCALL_READLINKAT => {
+            let is_readlinkat = invocation.num == SYSCALL_READLINKAT;
+            let dirfd = is_readlinkat.then_some(invocation.args[0]);
+            let path_ptr = if is_readlinkat {
+                invocation.args[1]
+            } else {
+                invocation.args[0]
+            };
+            let buf_ptr = if is_readlinkat {
+                invocation.args[2]
+            } else {
+                invocation.args[1]
+            };
+            let count = if is_readlinkat {
+                invocation.args[3]
+            } else {
+                invocation.args[2]
+            } as usize;
             let path = read_cstring(emu, path_ptr, 1024).unwrap_or_default();
-            if let Some(result) = CompatibilityServices::for_mode(runtime.runtime_mode)
-                .and_then(|compat| compat.readlink_path(emu, path_ptr, buf_ptr, count))
-            {
+            let result = CompatibilityServices::for_mode(runtime.runtime_mode).and_then(|compat| {
+                if let Some(dirfd) = dirfd {
+                    compat.readlinkat_path(emu, dirfd, path_ptr, buf_ptr, count)
+                } else {
+                    compat.readlink_path(emu, path_ptr, buf_ptr, count)
+                }
+            });
+            if let Some(result) = result {
                 return_value = result.return_value;
                 event = event
                     .arg("HostProxy", "true")
+                    .arg("DirFd", dirfd_label(dirfd))
                     .arg("Path", path)
                     .arg("Buf", format!("0x{:X}", buf_ptr))
                     .arg("Count", count.to_string())
@@ -1250,7 +1460,10 @@ pub fn handle_basic_macos_syscall(
                     .arg("Errno", result.errno.to_string())
                     .arg("Preview", lossy_data_preview(&result.preview, 128));
             } else {
-                event = event.arg("Path", path).arg("Result", "0");
+                event = event
+                    .arg("DirFd", dirfd_label(dirfd))
+                    .arg("Path", path)
+                    .arg("Result", "0");
             }
         }
         SYSCALL_SYMLINK => {
@@ -1864,6 +2077,7 @@ mod tests {
         assert_eq!(default_syscall_name(0x200000A), "unlink");
         assert_eq!(default_syscall_name(0x200000C), "chdir");
         assert_eq!(default_syscall_name(0x200000D), "fchdir");
+        assert_eq!(default_syscall_name(0x200000F), "chmod");
         assert_eq!(default_syscall_name(0x2000014), "getpid");
         assert_eq!(default_syscall_name(0x2000018), "getuid");
         assert_eq!(default_syscall_name(0x2000019), "geteuid");
@@ -1890,6 +2104,7 @@ mod tests {
         assert_eq!(default_syscall_name(0x2000075), "getrusage");
         assert_eq!(default_syscall_name(0x2000078), "readv");
         assert_eq!(default_syscall_name(0x2000079), "writev");
+        assert_eq!(default_syscall_name(0x200007C), "fchmod");
         assert_eq!(default_syscall_name(0x2000080), "rename");
         assert_eq!(default_syscall_name(0x2000085), "sendto");
         assert_eq!(default_syscall_name(0x2000087), "socketpair");
@@ -1907,6 +2122,8 @@ mod tests {
         assert_eq!(default_syscall_name(0x200009A), "pwrite");
         assert_eq!(default_syscall_name(0x20000C5), "mmap");
         assert_eq!(default_syscall_name(0x20000C7), "lseek");
+        assert_eq!(default_syscall_name(0x20000C8), "truncate");
+        assert_eq!(default_syscall_name(0x20000C9), "ftruncate");
         assert_eq!(default_syscall_name(0x20000CA), "sysctl");
         assert_eq!(default_syscall_name(0x20000DC), "getattrlist");
         assert_eq!(default_syscall_name(0x20000E6), "poll");
@@ -1931,8 +2148,13 @@ mod tests {
         assert_eq!(default_syscall_name(0x200019B), "readv_nocancel");
         assert_eq!(default_syscall_name(0x20001A1), "poll_nocancel");
         assert_eq!(default_syscall_name(0x20001CF), "openat");
+        assert_eq!(default_syscall_name(0x20001D1), "renameat");
         assert_eq!(default_syscall_name(0x20001D2), "faccessat");
+        assert_eq!(default_syscall_name(0x20001D3), "fchmodat");
         assert_eq!(default_syscall_name(0x20001D5), "fstatat");
+        assert_eq!(default_syscall_name(0x20001D8), "unlinkat");
+        assert_eq!(default_syscall_name(0x20001D9), "readlinkat");
+        assert_eq!(default_syscall_name(0x20001DB), "mkdirat");
         assert_eq!(default_syscall_name(0x20001F4), "getentropy");
         assert_eq!(default_syscall_name(0xDEAD), "unknown");
     }

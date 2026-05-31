@@ -1160,22 +1160,56 @@ fn compile_arm64_path_fixture() -> (PathBuf, PathBuf) {
 #include <unistd.h>
 
 #define BASE_DIR "{base_dir_literal}"
+#define SYS_CHMOD 0x200000F
+#define SYS_FCHMOD 0x200007C
+#define SYS_TRUNCATE 0x20000C8
+#define SYS_FTRUNCATE 0x20000C9
+#define SYS_RENAMEAT 0x20001D1
+#define SYS_FCHMODAT 0x20001D3
+#define SYS_UNLINKAT 0x20001D8
+#define SYS_READLINKAT 0x20001D9
+#define SYS_MKDIRAT 0x20001DB
 
 typedef int (*access_fn)(const char *, int);
+typedef int (*chmod_fn)(const char *, mode_t);
+typedef int (*fchmod_fn)(int, mode_t);
+typedef int (*fchmodat_fn)(int, const char *, mode_t, int);
 typedef int (*chdir_fn)(const char *);
 typedef char *(*getcwd_fn)(char *, size_t);
 typedef int (*stat_fn)(const char *, struct stat *);
 typedef int (*lstat_fn)(const char *, struct stat *);
 typedef int (*fstat_fn)(int, struct stat *);
+typedef int (*truncate_fn)(const char *, off_t);
+typedef int (*ftruncate_fn)(int, off_t);
 typedef int (*mkdir_fn)(const char *, mode_t);
+typedef int (*mkdirat_fn)(int, const char *, mode_t);
 typedef int (*rmdir_fn)(const char *);
 typedef int (*unlink_fn)(const char *);
+typedef int (*unlinkat_fn)(int, const char *, int);
 typedef int (*rename_fn)(const char *, const char *);
+typedef int (*renameat_fn)(int, const char *, int, const char *);
 typedef ssize_t (*readlink_fn)(const char *, char *, size_t);
+typedef ssize_t (*readlinkat_fn)(int, const char *, char *, size_t);
 typedef int (*symlink_fn)(const char *, const char *);
 typedef char *(*realpath_fn)(const char *, char *);
 
 extern char *realpath(const char *, char *);
+
+static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    register long x16 __asm__("x16") = num;
+    asm volatile(
+        "svc #0x80"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+        : "memory", "cc");
+    return x0;
+}}
 
 static int text_is(const char *text, const char *expected) {{
     return strcmp(text, expected) == 0;
@@ -1185,10 +1219,19 @@ static void cleanup_base(void) {{
     unlink(BASE_DIR "/alpha.txt");
     unlink(BASE_DIR "/beta.txt");
     unlink(BASE_DIR "/alpha.link");
+    unlink(BASE_DIR "/raw-at.txt");
+    unlink(BASE_DIR "/raw-new.txt");
+    unlink(BASE_DIR "/raw.link");
     unlink(BASE_DIR "/dyn-old.txt");
     unlink(BASE_DIR "/dyn-new.txt");
     unlink(BASE_DIR "/dyn.link");
+    unlink(BASE_DIR "/dyn-mode.txt");
+    unlink(BASE_DIR "/dyn-at.txt");
+    unlink(BASE_DIR "/dyn-at-new.txt");
+    unlink(BASE_DIR "/dyn-at.link");
+    rmdir(BASE_DIR "/raw-dir");
     rmdir(BASE_DIR "/dyn-dir");
+    rmdir(BASE_DIR "/dyn-at-dir");
     rmdir(BASE_DIR "/empty");
     rmdir(BASE_DIR);
 }}
@@ -1207,6 +1250,10 @@ int main(void) {{
 
     int fd = open("alpha.txt", O_CREAT | O_TRUNC | O_RDWR, 0600);
     write(fd, "hello", 5);
+    int chmod_ret = chmod("alpha.txt", 0644);
+    int fchmod_ret = fchmod(fd, 0600);
+    int truncate_ret = truncate("alpha.txt", 4);
+    int ftruncate_ret = ftruncate(fd, 5);
     struct stat st = {{0}};
     struct stat lst = {{0}};
     struct stat fst = {{0}};
@@ -1239,9 +1286,10 @@ int main(void) {{
         errno
     );
     printf("compat path static stat access=%d stat=%d fstat=%d lstat=%d errno=%d\n", access_ret, stat_ret, fstat_ret, lstat_ret, errno);
+    printf("compat path static mode chmod=%d fchmod=%d truncate=%d ftruncate=%d errno=%d\n", chmod_ret, fchmod_ret, truncate_ret, ftruncate_ret, errno);
     printf("compat path static sizes stat=%lld fstat=%lld link=%lld\n", (long long)st.st_size, (long long)fst.st_size, (long long)lst.st_size);
     printf("compat path static link symlink=%d readlink=%ld target=%s realpath=%p errno=%d\n", symlink_ret, readlink_ret, link_target, (void *)realpath_ret, errno);
-    if (fd < 0 || access_ret != 0 || stat_ret != 0 || st.st_size != 5 || fstat_ret != 0 || fst.st_size != 5 || symlink_ret != 0 || readlink_ret != 9 || !text_is(link_target, "alpha.txt") || lstat_ret != 0 || realpath_ret == 0) {{
+    if (fd < 0 || chmod_ret != 0 || fchmod_ret != 0 || truncate_ret != 0 || ftruncate_ret != 0 || access_ret != 0 || stat_ret != 0 || st.st_size != 5 || fstat_ret != 0 || fst.st_size != 5 || symlink_ret != 0 || readlink_ret != 9 || !text_is(link_target, "alpha.txt") || lstat_ret != 0 || realpath_ret == 0) {{
         failures += 20;
     }}
     close(fd);
@@ -1256,18 +1304,54 @@ int main(void) {{
         failures += 30;
     }}
 
+    int raw_fd = open("raw-at.txt", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    write(raw_fd, "rawbuf", 6);
+    long raw_chmod = machina_syscall6(SYS_CHMOD, (long)"raw-at.txt", 0644, 0, 0, 0, 0);
+    long raw_fchmod = machina_syscall6(SYS_FCHMOD, raw_fd, 0600, 0, 0, 0, 0);
+    long raw_fchmodat = machina_syscall6(SYS_FCHMODAT, AT_FDCWD, (long)"raw-at.txt", 0644, 0, 0, 0);
+    long raw_truncate = machina_syscall6(SYS_TRUNCATE, (long)"raw-at.txt", 3, 0, 0, 0, 0);
+    long raw_ftruncate = machina_syscall6(SYS_FTRUNCATE, raw_fd, 4, 0, 0, 0, 0);
+    struct stat raw_st = {{0}};
+    stat("raw-at.txt", &raw_st);
+    long raw_mkdirat = machina_syscall6(SYS_MKDIRAT, AT_FDCWD, (long)"raw-dir", 0700, 0, 0, 0);
+    long raw_renameat = machina_syscall6(SYS_RENAMEAT, AT_FDCWD, (long)"raw-at.txt", AT_FDCWD, (long)"raw-new.txt", 0, 0);
+    int raw_symlink = symlink("raw-new.txt", "raw.link");
+    char raw_link_target[128] = {{0}};
+    long raw_readlinkat = machina_syscall6(SYS_READLINKAT, AT_FDCWD, (long)"raw.link", (long)raw_link_target, sizeof(raw_link_target) - 1, 0, 0);
+    if (raw_readlinkat >= 0 && raw_readlinkat < (long)sizeof(raw_link_target)) {{
+        raw_link_target[raw_readlinkat] = 0;
+    }}
+    long raw_unlinkat = machina_syscall6(SYS_UNLINKAT, AT_FDCWD, (long)"raw-new.txt", 0, 0, 0, 0);
+    long raw_unlinkat_link = machina_syscall6(SYS_UNLINKAT, AT_FDCWD, (long)"raw.link", 0, 0, 0, 0);
+    int raw_rmdir = rmdir("raw-dir");
+    close(raw_fd);
+    printf("compat path raw syscall mode chmod=%ld fchmod=%ld fchmodat=%ld truncate=%ld ftruncate=%ld size=%lld errno=%d\n", raw_chmod, raw_fchmod, raw_fchmodat, raw_truncate, raw_ftruncate, (long long)raw_st.st_size, errno);
+    printf("compat path raw at mkdirat=%ld renameat=%ld symlink=%d readlinkat=%ld target=%s unlinkat=%ld unlink_link=%ld rmdir=%d errno=%d\n", raw_mkdirat, raw_renameat, raw_symlink, raw_readlinkat, raw_link_target, raw_unlinkat, raw_unlinkat_link, raw_rmdir, errno);
+    if (raw_fd < 0 || raw_chmod != 0 || raw_fchmod != 0 || raw_fchmodat != 0 || raw_truncate != 0 || raw_ftruncate != 0 || raw_st.st_size != 4 || raw_mkdirat != 0 || raw_renameat != 0 || raw_symlink != 0 || raw_readlinkat != 11 || !text_is(raw_link_target, "raw-new.txt") || raw_unlinkat != 0 || raw_unlinkat_link != 0 || raw_rmdir != 0) {{
+        failures += 35;
+    }}
+
     void *self = dlopen(NULL, RTLD_NOW);
     access_fn dyn_access = (access_fn)dlsym(self, "access");
+    chmod_fn dyn_chmod = (chmod_fn)dlsym(self, "chmod");
+    fchmod_fn dyn_fchmod = (fchmod_fn)dlsym(self, "fchmod");
+    fchmodat_fn dyn_fchmodat = (fchmodat_fn)dlsym(self, "fchmodat");
     chdir_fn dyn_chdir = (chdir_fn)dlsym(self, "chdir");
     getcwd_fn dyn_getcwd = (getcwd_fn)dlsym(self, "getcwd");
     stat_fn dyn_stat = (stat_fn)dlsym(self, "stat");
     lstat_fn dyn_lstat = (lstat_fn)dlsym(self, "lstat");
     fstat_fn dyn_fstat = (fstat_fn)dlsym(self, "fstat");
+    truncate_fn dyn_truncate = (truncate_fn)dlsym(self, "truncate");
+    ftruncate_fn dyn_ftruncate = (ftruncate_fn)dlsym(self, "ftruncate");
     mkdir_fn dyn_mkdir = (mkdir_fn)dlsym(self, "mkdir");
+    mkdirat_fn dyn_mkdirat = (mkdirat_fn)dlsym(self, "mkdirat");
     rmdir_fn dyn_rmdir = (rmdir_fn)dlsym(self, "rmdir");
     unlink_fn dyn_unlink = (unlink_fn)dlsym(self, "unlink");
+    unlinkat_fn dyn_unlinkat = (unlinkat_fn)dlsym(self, "unlinkat");
     rename_fn dyn_rename = (rename_fn)dlsym(self, "rename");
+    renameat_fn dyn_renameat = (renameat_fn)dlsym(self, "renameat");
     readlink_fn dyn_readlink = (readlink_fn)dlsym(self, "readlink");
+    readlinkat_fn dyn_readlinkat = (readlinkat_fn)dlsym(self, "readlinkat");
     symlink_fn dyn_symlink = (symlink_fn)dlsym(self, "symlink");
     realpath_fn dyn_realpath = (realpath_fn)dlsym(self, "realpath");
     printf(
@@ -1286,7 +1370,19 @@ int main(void) {{
         (void *)dyn_symlink,
         (void *)dyn_realpath
     );
-    if (!dyn_access || !dyn_chdir || !dyn_getcwd || !dyn_stat || !dyn_lstat || !dyn_fstat || !dyn_mkdir || !dyn_rmdir || !dyn_unlink || !dyn_rename || !dyn_readlink || !dyn_symlink || !dyn_realpath) {{
+    printf(
+        "compat path dlsym at ptrs chmod=%p fchmod=%p fchmodat=%p truncate=%p ftruncate=%p mkdirat=%p unlinkat=%p renameat=%p readlinkat=%p\n",
+        (void *)dyn_chmod,
+        (void *)dyn_fchmod,
+        (void *)dyn_fchmodat,
+        (void *)dyn_truncate,
+        (void *)dyn_ftruncate,
+        (void *)dyn_mkdirat,
+        (void *)dyn_unlinkat,
+        (void *)dyn_renameat,
+        (void *)dyn_readlinkat
+    );
+    if (!dyn_access || !dyn_chmod || !dyn_fchmod || !dyn_fchmodat || !dyn_chdir || !dyn_getcwd || !dyn_stat || !dyn_lstat || !dyn_fstat || !dyn_truncate || !dyn_ftruncate || !dyn_mkdir || !dyn_mkdirat || !dyn_rmdir || !dyn_unlink || !dyn_unlinkat || !dyn_rename || !dyn_renameat || !dyn_readlink || !dyn_readlinkat || !dyn_symlink || !dyn_realpath) {{
         return 40;
     }}
 
@@ -1347,6 +1443,41 @@ int main(void) {{
     printf("compat path dlsym cleanup unlink=%d unlink_link=%d rmdir=%d errno=%d\n", dyn_unlink_file, dyn_unlink_link, dyn_rmdir_dir, errno);
     if (dyn_unlink_file != 0 || dyn_unlink_link != 0 || dyn_rmdir_dir != 0) {{
         failures += 70;
+    }}
+
+    int dyn_mode_fd = open("dyn-mode.txt", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    write(dyn_mode_fd, "dynmode", 7);
+    int dyn_chmod_ret = dyn_chmod("dyn-mode.txt", 0644);
+    int dyn_fchmod_ret = dyn_fchmod(dyn_mode_fd, 0600);
+    int dyn_truncate_ret = dyn_truncate("dyn-mode.txt", 3);
+    int dyn_ftruncate_ret = dyn_ftruncate(dyn_mode_fd, 4);
+    struct stat dyn_mode_st = {{0}};
+    dyn_stat("dyn-mode.txt", &dyn_mode_st);
+    close(dyn_mode_fd);
+    int dyn_mode_unlink = dyn_unlink("dyn-mode.txt");
+    printf("compat path dlsym mode chmod=%d fchmod=%d truncate=%d ftruncate=%d size=%lld unlink=%d errno=%d\n", dyn_chmod_ret, dyn_fchmod_ret, dyn_truncate_ret, dyn_ftruncate_ret, (long long)dyn_mode_st.st_size, dyn_mode_unlink, errno);
+    if (dyn_mode_fd < 0 || dyn_chmod_ret != 0 || dyn_fchmod_ret != 0 || dyn_truncate_ret != 0 || dyn_ftruncate_ret != 0 || dyn_mode_st.st_size != 4 || dyn_mode_unlink != 0) {{
+        failures += 80;
+    }}
+
+    int dyn_at_fd = open("dyn-at.txt", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    write(dyn_at_fd, "dyn-at", 6);
+    int dyn_at_fchmod = dyn_fchmodat(AT_FDCWD, "dyn-at.txt", 0644, 0);
+    int dyn_at_mkdirat = dyn_mkdirat(AT_FDCWD, "dyn-at-dir", 0700);
+    int dyn_at_renameat = dyn_renameat(AT_FDCWD, "dyn-at.txt", AT_FDCWD, "dyn-at-new.txt");
+    int dyn_at_symlink = dyn_symlink("dyn-at-new.txt", "dyn-at.link");
+    char dyn_at_target[128] = {{0}};
+    long dyn_at_readlinkat = (long)dyn_readlinkat(AT_FDCWD, "dyn-at.link", dyn_at_target, sizeof(dyn_at_target) - 1);
+    if (dyn_at_readlinkat >= 0 && dyn_at_readlinkat < (long)sizeof(dyn_at_target)) {{
+        dyn_at_target[dyn_at_readlinkat] = 0;
+    }}
+    int dyn_at_unlinkat = dyn_unlinkat(AT_FDCWD, "dyn-at-new.txt", 0);
+    int dyn_at_unlinkat_link = dyn_unlinkat(AT_FDCWD, "dyn-at.link", 0);
+    int dyn_at_rmdir = dyn_rmdir("dyn-at-dir");
+    close(dyn_at_fd);
+    printf("compat path dlsym at fchmodat=%d mkdirat=%d renameat=%d symlink=%d readlinkat=%ld target=%s unlinkat=%d unlink_link=%d rmdir=%d errno=%d\n", dyn_at_fchmod, dyn_at_mkdirat, dyn_at_renameat, dyn_at_symlink, dyn_at_readlinkat, dyn_at_target, dyn_at_unlinkat, dyn_at_unlinkat_link, dyn_at_rmdir, errno);
+    if (dyn_at_fd < 0 || dyn_at_fchmod != 0 || dyn_at_mkdirat != 0 || dyn_at_renameat != 0 || dyn_at_symlink != 0 || dyn_at_readlinkat != 14 || !text_is(dyn_at_target, "dyn-at-new.txt") || dyn_at_unlinkat != 0 || dyn_at_unlinkat_link != 0 || dyn_at_rmdir != 0) {{
+        failures += 90;
     }}
 
     dyn_chdir("..");
@@ -2545,6 +2676,10 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         "path fixture did not complete static access/stat/fstat; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("compat path static mode chmod=0 fchmod=0 truncate=0 ftruncate=0"),
+        "path fixture did not complete static chmod/truncate imports; stdout:\n{stdout}"
+    );
+    assert!(
         stdout
             .contains("compat path static link symlink=0 readlink=9 target=alpha.txt realpath=0x"),
         "path fixture did not complete static symlink/readlink/lstat; stdout:\n{stdout}"
@@ -2555,8 +2690,20 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         "path fixture did not complete static rename/unlink/rmdir; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains(
+            "compat path raw syscall mode chmod=0 fchmod=0 fchmodat=0 truncate=0 ftruncate=0 size=4"
+        ) && stdout.contains(
+            "compat path raw at mkdirat=0 renameat=0 symlink=0 readlinkat=11 target=raw-new.txt unlinkat=0 unlink_link=0 rmdir=0"
+        ),
+        "path fixture did not complete raw syscall chmod/truncate/*at proof; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("compat path dlsym ptrs 0x"),
         "path fixture did not receive dlsym path trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat path dlsym at ptrs chmod=0x") && stdout.contains("readlinkat=0x"),
+        "path fixture did not receive dlsym chmod/truncate/*at trampolines; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat path dlsym cwd mkdir=0 chdir=0 ret=0x")
@@ -2577,6 +2724,18 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
     assert!(
         stdout.contains("compat path dlsym cleanup unlink=0 unlink_link=0 rmdir=0"),
         "path fixture did not complete dlsym cleanup mutators; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "compat path dlsym mode chmod=0 fchmod=0 truncate=0 ftruncate=0 size=4 unlink=0"
+        ),
+        "path fixture did not complete dlsym chmod/truncate imports; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "compat path dlsym at fchmodat=0 mkdirat=0 renameat=0 symlink=0 readlinkat=14 target=dyn-at-new.txt unlinkat=0 unlink_link=0 rmdir=0"
+        ),
+        "path fixture did not complete dlsym *at imports; stdout:\n{stdout}"
     );
 }
 

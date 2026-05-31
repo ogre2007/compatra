@@ -1,5 +1,4 @@
-//! Grouped view of guest-visible filesystem and memory helpers.
+//! Grouped compatibility view of the analysis-owned guest model.
 
-pub use crate::macos::guest_analysis_artifacts as analysis_artifacts;
 pub use crate::macos::guest_files as files;
 pub use crate::macos::guest_memory as memory;

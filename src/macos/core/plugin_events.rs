@@ -130,7 +130,7 @@ pub fn detect_event(metadata: &TraceMetadata, name: impl Into<String>) -> TraceE
 
 #[cfg(test)]
 mod tests {
-    use crate::macos::plugins::register_plugins;
+    use crate::macos::analysis::register_analysis_plugins;
     use crate::macos::trace::PluginRegistry;
 
     use super::*;
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn drakvuf_plugins_claim_built_events() {
         let mut registry = PluginRegistry::new();
-        register_plugins(&mut registry);
+        register_analysis_plugins(&mut registry);
 
         let meta = TraceMetadata::new().pid(2).tid(9);
         let event = process_event(&meta, "execve", "execve");

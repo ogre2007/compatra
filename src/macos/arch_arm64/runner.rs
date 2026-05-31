@@ -1,9 +1,7 @@
 //! Legacy arm64 Mach-O runner used by the no-dyld binary entrypoint.
 
-use crate::macos::analysis::AnalysisRuntimeHooks;
 use crate::macos::analysis_arm64_cpp_imports::{
-    install_analysis_arm64_cpp_imports, install_analysis_arm64_operator_hooks,
-    setup_analysis_arm64_cpp_data_region,
+    install_prepared_analysis_arm64_hooks, prepare_analysis_arm64_hooks,
 };
 use crate::macos::apple_imports::install_apple_imports;
 use crate::macos::arm64_dynamic_imports::install_arm64_dynamic_imports;
@@ -28,7 +26,6 @@ use crate::macos::{
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
 use crate::macos::{memory_event, SharedTraceBus};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -345,25 +342,15 @@ pub fn emulate_macos_arm64_binary_with_mode(
         stub_map.entry(normalized).or_insert(addr);
     }
 
-    let analysis_hooks = AnalysisRuntimeHooks::for_mode(runtime_mode);
-    let cpp_data_symbols = if analysis_hooks.is_enabled() {
-        match setup_analysis_arm64_cpp_data_region(
-            &mut emulator,
-            &mmap_next,
-            mmap_end,
-            done_addr,
-            &trace_bus,
-            &metadata,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("[CPP-DATA-REGION] setup failed: {}", e);
-                HashMap::new()
-            }
-        }
-    } else {
-        HashMap::new()
-    };
+    let analysis_hook_plan = prepare_analysis_arm64_hooks(
+        runtime_mode,
+        &mut emulator,
+        &mmap_next,
+        mmap_end,
+        done_addr,
+        &trace_bus,
+        &metadata,
+    );
 
     // Apply LC_DYLD_CHAINED_FIXUPS: walk every chain in the data
     // segments and patch each pointer slot in guest memory. Without
@@ -376,7 +363,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &binary,
         0u64,
         &stub_map,
-        Some(&cpp_data_symbols),
+        Some(&analysis_hook_plan.cpp_data_symbols),
         done_addr,
     ) {
         Ok(stats) if stats.bound + stats.rebased + stats.unresolved > 0 => {
@@ -399,23 +386,14 @@ pub fn emulate_macos_arm64_binary_with_mode(
             }
         }
     }
-    if analysis_hooks.is_enabled() {
-        install_analysis_arm64_cpp_imports(
-            &mut emulator,
-            &stub_map,
-            &mmap_next,
-            mmap_end,
-            &trace_bus,
-            &import_tracker,
-            &process_name,
-        )?;
-    }
-
-    install_analysis_arm64_operator_hooks(
+    install_prepared_analysis_arm64_hooks(
+        analysis_hook_plan,
         &mut emulator,
-        analysis_hooks.function_entry_specs_from_env(),
-        analysis_hooks.usage_bypass_specs_from_env(),
+        &stub_map,
+        &mmap_next,
+        mmap_end,
         &trace_bus,
+        &import_tracker,
         &process_name,
     )?;
 
