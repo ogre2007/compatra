@@ -277,6 +277,9 @@ fn handle_arm64_syscall_trap(
         handle_basic_macos_syscall(emu, &invocation, metadata, runtime, "arm64-syscall-runtime")?;
 
     emu.write_reg("x0", outcome.return_value)?;
+    for (reg, value) in outcome.extra_register_writes {
+        emu.write_reg(reg, value)?;
+    }
     if let Some(stop_addr) = outcome.stop_addr {
         emu.write_reg("pc", stop_addr)?;
     } else {

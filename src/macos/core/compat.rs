@@ -6,7 +6,7 @@
 
 use crate::macos::{Emulator, RuntimeMode};
 
-pub use machina_compat::{HostCallResult, HostIoResult, HostOpenResult};
+pub use machina_compat::{HostCallResult, HostIoResult, HostOpenResult, HostPipeResult};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompatibilityServices;
@@ -113,6 +113,18 @@ impl CompatibilityServices {
             register_mode,
             stack_ptr,
         )
+    }
+
+    pub fn openat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        dirfd: u64,
+        path_ptr: u64,
+        flags: u64,
+        mode: u64,
+    ) -> Option<HostOpenResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.openat_path(&mut memory, dirfd, path_ptr, flags, mode)
     }
 
     pub fn read_fd(
@@ -385,6 +397,21 @@ impl CompatibilityServices {
         machina_compat::CompatibilityServices.fcntl_fd(fd, cmd, arg)
     }
 
+    pub fn ioctl_fd(
+        &self,
+        emu: &mut dyn Emulator,
+        fd: u64,
+        request: u64,
+        data_ptr: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.ioctl_fd(&mut memory, fd, request, data_ptr)
+    }
+
+    pub fn fsync_fd(&self, fd: u64) -> Option<HostIoResult> {
+        machina_compat::CompatibilityServices.fsync_fd(fd)
+    }
+
     pub fn poll_fds(
         &self,
         emu: &mut dyn Emulator,
@@ -454,6 +481,10 @@ impl CompatibilityServices {
         machina_compat::CompatibilityServices.dup2_fd(from, to)
     }
 
+    pub fn pipe_pair(&self) -> Option<HostPipeResult> {
+        machina_compat::CompatibilityServices.pipe_pair()
+    }
+
     pub fn select_fds(
         &self,
         emu: &mut dyn Emulator,
@@ -482,6 +513,24 @@ impl CompatibilityServices {
     ) -> Option<HostIoResult> {
         let mut memory = EmulatorGuestMemory { emulator: emu };
         machina_compat::CompatibilityServices.access_path(&mut memory, path_ptr, mode)
+    }
+
+    pub fn faccessat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        dirfd: u64,
+        path_ptr: u64,
+        mode: u64,
+        flags: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.faccessat_path(
+            &mut memory,
+            dirfd,
+            path_ptr,
+            mode,
+            flags,
+        )
     }
 
     pub fn chdir_path(&self, emu: &mut dyn Emulator, path_ptr: u64) -> Option<HostIoResult> {
@@ -526,6 +575,44 @@ impl CompatibilityServices {
     pub fn fstat_fd(&self, emu: &mut dyn Emulator, fd: u64, stat_ptr: u64) -> Option<HostIoResult> {
         let mut memory = EmulatorGuestMemory { emulator: emu };
         machina_compat::CompatibilityServices.fstat_fd(&mut memory, fd, stat_ptr)
+    }
+
+    pub fn fstatat_path(
+        &self,
+        emu: &mut dyn Emulator,
+        dirfd: u64,
+        path_ptr: u64,
+        stat_ptr: u64,
+        flags: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.fstatat_path(
+            &mut memory,
+            dirfd,
+            path_ptr,
+            stat_ptr,
+            flags,
+        )
+    }
+
+    pub fn statfs_path(
+        &self,
+        emu: &mut dyn Emulator,
+        path_ptr: u64,
+        buf_ptr: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.statfs_path(&mut memory, path_ptr, buf_ptr)
+    }
+
+    pub fn fstatfs_fd(
+        &self,
+        emu: &mut dyn Emulator,
+        fd: u64,
+        buf_ptr: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        machina_compat::CompatibilityServices.fstatfs_fd(&mut memory, fd, buf_ptr)
     }
 
     pub fn mkdir_path(

@@ -551,19 +551,41 @@ fn compile_arm64_fd_fixture() -> (PathBuf, PathBuf) {
     let source = out_dir.join("arm64_fd_compat.c");
     let binary = out_dir.join("arm64_fd_compat");
     let data_file = out_dir.join("arm64_fd_compat.tmp");
+    let data_dir_literal = c_string_literal(&out_dir.display().to_string());
     let data_file_literal = c_string_literal(&data_file.display().to_string());
+    let data_name_literal = c_string_literal(
+        data_file
+            .file_name()
+            .expect("generated data file has a file name")
+            .to_string_lossy()
+            .as_ref(),
+    );
     fs::write(
         &source,
         format!(
             r#"#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <stdio.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
+#define SYS_PIPE 0x200002A
+#define SYS_IOCTL 0x2000036
+#define SYS_FSYNC 0x200005F
+#define SYS_STATFS64 0x2000159
+#define SYS_FSTATFS64 0x200015A
+#define SYS_OPENAT 0x20001CF
+#define SYS_FACCESSAT 0x20001D2
+#define SYS_FSTATAT 0x20001D5
+#define DATA_DIR "{data_dir_literal}"
 #define DATA_FILE "{data_file_literal}"
+#define DATA_NAME "{data_name_literal}"
 #define SYS_READ_NOCANCEL 0x200018C
 #define SYS_WRITE_NOCANCEL 0x200018D
 #define SYS_OPEN_NOCANCEL 0x200018E
@@ -614,6 +636,20 @@ static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long 
         : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
         : "memory", "cc");
     return x0;
+}}
+
+static long machina_pipe_syscall(int fds[2]) {{
+    register long x0 __asm__("x0") = 0;
+    register long x1 __asm__("x1") = 0;
+    register long x16 __asm__("x16") = SYS_PIPE;
+    asm volatile(
+        "svc #0x80"
+        : "+r"(x0), "+r"(x1)
+        : "r"(x16)
+        : "memory", "cc");
+    fds[0] = (int)x0;
+    fds[1] = (int)x1;
+    return x0 < 0 ? -1 : 0;
 }}
 
 static int pipe_vec_roundtrip(const char *label, pipe_fn pipe_impl, writev_fn writev_impl, readv_fn readv_impl) {{
@@ -705,6 +741,37 @@ int main(void) {{
         failures += 40;
     }}
 
+    int meta_fds[2] = {{-1, -1}};
+    int meta_pipe = pipe(meta_fds);
+    int meta_available = -1;
+    if (meta_pipe == 0) {{
+        write(meta_fds[1], "IO", 2);
+    }}
+    int ioctl_ret = meta_pipe == 0 ? ioctl(meta_fds[0], FIONREAD, &meta_available) : -1;
+    char meta_buf[4] = {{0}};
+    if (meta_pipe == 0) {{
+        read(meta_fds[0], meta_buf, 2);
+        close(meta_fds[0]);
+        close(meta_fds[1]);
+    }}
+    int fsync_ret = file_fd >= 0 ? fsync(file_fd) : -1;
+    struct statfs path_fs = {{0}};
+    struct statfs fd_fs = {{0}};
+    int statfs_ret = statfs(DATA_FILE, &path_fs);
+    int fstatfs_ret = file_fd >= 0 ? fstatfs(file_fd, &fd_fs) : -1;
+    printf("compat fd metadata fsync=%d ioctl=%d avail=%d statfs=%d bsize=%u fstatfs=%d fbsize=%u errno=%d\n",
+        fsync_ret,
+        ioctl_ret,
+        meta_available,
+        statfs_ret,
+        (unsigned int)path_fs.f_bsize,
+        fstatfs_ret,
+        (unsigned int)fd_fs.f_bsize,
+        errno);
+    if (fsync_ret != 0 || ioctl_ret != 0 || meta_available != 2 || statfs_ret != 0 || path_fs.f_bsize == 0 || fstatfs_ret != 0 || fd_fs.f_bsize == 0) {{
+        failures += 42;
+    }}
+
     long raw_fd = machina_syscall6(SYS_OPEN_NOCANCEL, (long)DATA_FILE, O_RDWR, 0600, 0, 0, 0);
     const char raw_text[] = "nc-ok";
     long raw_write = raw_fd >= 0 ? machina_syscall6(SYS_WRITE_NOCANCEL, raw_fd, (long)raw_text, 5, 0, 0, 0) : -1;
@@ -717,6 +784,67 @@ int main(void) {{
     printf("compat fd nocancel result text=%s fcntl=%ld close=%ld errno=%d\n", raw_buf, raw_fcntl, raw_close, errno);
     if (raw_fd < 0 || raw_write != 5 || raw_seek != 0 || raw_read != 5 || !text_is(raw_buf, "nc-ok", 5) || raw_fcntl < 0 || raw_close != 0) {{
         failures += 45;
+    }}
+
+    int raw_pipe_fds[2] = {{-1, -1}};
+    long raw_pipe = machina_pipe_syscall(raw_pipe_fds);
+    int raw_available = -1;
+    if (raw_pipe == 0) {{
+        write(raw_pipe_fds[1], "RP", 2);
+    }}
+    long raw_ioctl = raw_pipe == 0 ? machina_syscall6(SYS_IOCTL, raw_pipe_fds[0], FIONREAD, (long)&raw_available, 0, 0, 0) : -1;
+    char raw_pipe_buf[4] = {{0}};
+    if (raw_pipe == 0) {{
+        read(raw_pipe_fds[0], raw_pipe_buf, 2);
+        close(raw_pipe_fds[0]);
+        close(raw_pipe_fds[1]);
+    }}
+    long raw_fsync = file_fd >= 0 ? machina_syscall6(SYS_FSYNC, file_fd, 0, 0, 0, 0, 0) : -1;
+    struct statfs raw_path_fs = {{0}};
+    struct statfs raw_fd_fs = {{0}};
+    long raw_statfs = machina_syscall6(SYS_STATFS64, (long)DATA_FILE, (long)&raw_path_fs, 0, 0, 0, 0);
+    long raw_fstatfs = file_fd >= 0 ? machina_syscall6(SYS_FSTATFS64, file_fd, (long)&raw_fd_fs, 0, 0, 0, 0) : -1;
+    printf("compat fd raw syscalls pipe=%ld fds=%d,%d ioctl=%ld avail=%d text=%s fsync=%ld statfs=%ld bsize=%u fstatfs=%ld fbsize=%u errno=%d\n",
+        raw_pipe,
+        raw_pipe_fds[0],
+        raw_pipe_fds[1],
+        raw_ioctl,
+        raw_available,
+        raw_pipe_buf,
+        raw_fsync,
+        raw_statfs,
+        (unsigned int)raw_path_fs.f_bsize,
+        raw_fstatfs,
+        (unsigned int)raw_fd_fs.f_bsize,
+        errno);
+    if (raw_pipe != 0 || raw_pipe_fds[0] < 0 || raw_pipe_fds[1] < 0 || raw_ioctl != 0 || raw_available != 2 || !text_is(raw_pipe_buf, "RP", 2) || raw_fsync != 0 || raw_statfs != 0 || raw_path_fs.f_bsize == 0 || raw_fstatfs != 0 || raw_fd_fs.f_bsize == 0) {{
+        failures += 47;
+    }}
+
+    int dir_fd = open(DATA_DIR, O_RDONLY);
+    long raw_openat = dir_fd >= 0 ? machina_syscall6(SYS_OPENAT, dir_fd, (long)DATA_NAME, O_RDONLY, 0, 0, 0) : -1;
+    long raw_faccessat = dir_fd >= 0 ? machina_syscall6(SYS_FACCESSAT, dir_fd, (long)DATA_NAME, R_OK, 0, 0, 0) : -1;
+    struct stat raw_at_stat = {{0}};
+    long raw_fstatat = dir_fd >= 0 ? machina_syscall6(SYS_FSTATAT, dir_fd, (long)DATA_NAME, (long)&raw_at_stat, 0, 0, 0) : -1;
+    char raw_at_byte = 0;
+    long raw_at_read = raw_openat >= 0 ? (long)read((int)raw_openat, &raw_at_byte, 1) : -1;
+    if (raw_openat >= 0) {{
+        close((int)raw_openat);
+    }}
+    if (dir_fd >= 0) {{
+        close(dir_fd);
+    }}
+    printf("compat fd at syscalls dir=%d openat=%ld read=%ld byte=%c faccessat=%ld fstatat=%ld size=%lld errno=%d\n",
+        dir_fd,
+        raw_openat,
+        raw_at_read,
+        raw_at_byte,
+        raw_faccessat,
+        raw_fstatat,
+        (long long)raw_at_stat.st_size,
+        errno);
+    if (dir_fd < 0 || raw_openat < 0 || raw_at_read != 1 || raw_faccessat != 0 || raw_fstatat != 0 || raw_at_stat.st_size <= 0) {{
+        failures += 48;
     }}
 
     void *self = dlopen(NULL, RTLD_NOW);
@@ -2207,11 +2335,28 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         "fd fixture did not complete positioned file I/O probe; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("compat fd metadata fsync=0 ioctl=0 avail=2 statfs=0")
+            && stdout.contains(" fstatfs=0 "),
+        "fd fixture did not complete imported fsync/ioctl/statfs/fstatfs probes; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("compat fd nocancel io open=")
             && stdout.contains("write=5 seek=0 read=5")
             && stdout.contains("compat fd nocancel result text=nc-ok")
             && stdout.contains("close=0"),
         "fd fixture did not complete raw *_nocancel syscall I/O probe; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat fd raw syscalls pipe=0")
+            && stdout.contains(" ioctl=0 avail=2 text=RP fsync=0 statfs=0")
+            && stdout.contains(" fstatfs=0 "),
+        "fd fixture did not complete raw pipe/ioctl/fsync/statfs syscalls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat fd at syscalls dir=")
+            && stdout.contains(" read=1 ")
+            && stdout.contains(" faccessat=0 fstatat=0 size="),
+        "fd fixture did not complete raw dirfd-based openat/faccessat/fstatat syscalls; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat fd dlsym ptrs open=0x")
