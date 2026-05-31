@@ -417,7 +417,8 @@ impl CompatibilityServices {
             }
             #[cfg(target_os = "macos")]
             HostImportKind::OpenAt => {
-                let result = self.openat_path(memory, args[0], args[1], args[2], args[3])?;
+                let mode = arm64_variadic_open_mode(memory, args[2], args[3], stack_ptr);
+                let result = self.openat_path(memory, args[0], args[1], args[2], mode)?;
                 Some(HostCallResult {
                     return_value: result.return_value,
                     errno: Some(result.errno),
@@ -527,9 +528,15 @@ impl CompatibilityServices {
                     .into(),
             ),
             #[cfg(target_os = "macos")]
-            HostImportKind::Fcntl => Some(self.fcntl_fd(args[0], args[1], args[2])?.into()),
+            HostImportKind::Fcntl => {
+                let arg = arm64_variadic_stack_arg(memory, args[2], stack_ptr, 0);
+                Some(self.fcntl_fd(args[0], args[1], arg)?.into())
+            }
             #[cfg(target_os = "macos")]
-            HostImportKind::Ioctl => Some(self.ioctl_fd(memory, args[0], args[1], args[2])?.into()),
+            HostImportKind::Ioctl => {
+                let data_ptr = arm64_variadic_stack_arg(memory, args[2], stack_ptr, 0);
+                Some(self.ioctl_fd(memory, args[0], args[1], data_ptr)?.into())
+            }
             #[cfg(target_os = "macos")]
             HostImportKind::Fsync => Some(self.fsync_fd(args[0])?.into()),
             #[cfg(target_os = "macos")]
@@ -3192,6 +3199,22 @@ fn read_stack_u64_args<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn arm64_variadic_stack_arg<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    register_arg: u64,
+    stack_ptr: Option<u64>,
+    index: usize,
+) -> u64 {
+    stack_ptr
+        .and_then(|sp| {
+            read_stack_u64_args(memory, sp, index.saturating_add(1))
+                .get(index)
+                .copied()
+        })
+        .unwrap_or(register_arg)
+}
+
+#[cfg(target_os = "macos")]
 fn arm64_variadic_open_mode<M: GuestMemory + ?Sized>(
     memory: &mut M,
     flags: u64,
@@ -3202,9 +3225,7 @@ fn arm64_variadic_open_mode<M: GuestMemory + ?Sized>(
         return register_mode;
     }
 
-    stack_ptr
-        .and_then(|sp| read_stack_u64_args(memory, sp, 1).first().copied())
-        .unwrap_or(register_mode)
+    arm64_variadic_stack_arg(memory, register_mode, stack_ptr, 0)
 }
 
 #[cfg(target_os = "macos")]
