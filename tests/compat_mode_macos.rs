@@ -1759,6 +1759,88 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_pthread_scheduler_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_pthread_scheduler_compat.c");
+    let binary = out_dir.join("arm64_pthread_scheduler_compat");
+    fs::write(
+        &source,
+        r#"#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static pthread_mutex_t lock;
+static pthread_cond_t cond;
+static volatile int ready;
+static volatile unsigned long spin_sink;
+
+static void *sleeper(void *arg) {
+    (void)arg;
+    usleep(20);
+    for (;;) {
+        spin_sink++;
+    }
+    return 0;
+}
+
+static void *signaler(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&lock);
+    ready = 1;
+    pthread_cond_signal(&cond);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+
+int main(void) {
+    pthread_t slow_thread = 0;
+    pthread_t signal_thread = 0;
+    pthread_mutex_init(&lock, 0);
+    pthread_cond_init(&cond, 0);
+    pthread_create(&slow_thread, 0, sleeper, 0);
+    pthread_create(&signal_thread, 0, signaler, 0);
+
+    pthread_mutex_lock(&lock);
+    while (!ready) {
+        pthread_cond_wait(&cond, &lock);
+    }
+    pthread_mutex_unlock(&lock);
+
+    printf("compat pthread scheduler ready=%d\n", ready);
+    return ready == 1 ? 0 : 7;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 pthread scheduler fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg("-pthread")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 pthread scheduler fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 pthread scheduler fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_directory_entropy_fixture() -> (PathBuf, PathBuf) {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -2838,6 +2920,73 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stdout.contains(" rlimit=0 sysconf=")
             && stdout.contains(" sysctl=0 page="),
         "env/time fixture did not complete dynamic env/time/resource/sysctl calls; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_keeps_usleep_cooperative_when_guest_threads_are_runnable() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode pthread scheduler test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_pthread_scheduler_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_MAX_INSTRUCTIONS", "3000000")
+        .env("MACHINA_TIMEOUT_USECS", "5000000")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(pthread scheduler): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(pthread scheduler): status={status}");
+    eprintln!("compat proof(pthread scheduler): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(pthread scheduler): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("[THREAD][arm64] usleep yield"),
+        "pthread scheduler fixture did not yield from _usleep while guest threads were runnable; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat pthread scheduler ready=1"),
+        "pthread scheduler fixture did not reach the signaling worker; stdout:\n{stdout}"
     );
 }
 

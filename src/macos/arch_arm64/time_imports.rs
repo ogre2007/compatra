@@ -17,8 +17,33 @@ use crate::macos::arm64_runner_support::{
     Arm64SharedState,
 };
 use crate::macos::compat::CompatibilityServices;
-use crate::macos::{wake_arm64_cond_waiters, yield_active_arm64_thread, SharedTraceBus};
+use crate::macos::{
+    wake_arm64_cond_waiters, yield_active_arm64_thread, Arm64ThreadRuntime, SharedTraceBus,
+};
 use crate::{Emulator, UnicornEmulator};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Arm64ThreadScheduleState {
+    thread_id: u64,
+    active_thread: bool,
+    pending_threads: usize,
+    waiting_threads: usize,
+}
+
+impl Arm64ThreadScheduleState {
+    fn host_delay_proxy_allowed(self) -> bool {
+        !self.active_thread && self.pending_threads == 0 && self.waiting_threads == 0
+    }
+}
+
+fn arm64_thread_schedule_state(runtime: &Arm64ThreadRuntime) -> Arm64ThreadScheduleState {
+    Arm64ThreadScheduleState {
+        thread_id: runtime.current_thread_id.max(1),
+        active_thread: runtime.active_thread.is_some(),
+        pending_threads: runtime.pending_threads.len(),
+        waiting_threads: runtime.cond_waiters.values().map(|queue| queue.len()).sum(),
+    }
+}
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
@@ -128,33 +153,35 @@ pub fn install_arm64_time_imports(
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let seconds = emu.read_reg("x0").unwrap_or(0);
                 let lr = emu.read_reg("lr").unwrap_or(0);
-                if let Some(compat) = compat_for_hook {
-                    if let Some(result) = compat.sleep_seconds(seconds) {
-                        let _ = emu.write_reg("x0", result.return_value);
-                        if lr != 0 {
-                            let _ = emu.write_reg("pc", lr);
-                        }
-                        record_arm64_import(
-                            &import_tracker,
-                            format!(
-                                "_sleep(host seconds={}) -> {}",
-                                seconds, result.return_value
-                            ),
-                        );
-                        return;
-                    }
-                }
-                let (thread_id, active_thread, pending_threads) = thread_runtime
+                let schedule = thread_runtime
                     .lock()
                     .ok()
-                    .map(|rt| {
-                        (
-                            rt.current_thread_id.max(1),
-                            rt.active_thread.is_some(),
-                            rt.pending_threads.len(),
-                        )
-                    })
-                    .unwrap_or((1, false, 0));
+                    .map(|rt| arm64_thread_schedule_state(&rt))
+                    .unwrap_or(Arm64ThreadScheduleState {
+                        thread_id: 1,
+                        active_thread: false,
+                        pending_threads: 0,
+                        waiting_threads: 0,
+                    });
+                if schedule.host_delay_proxy_allowed() {
+                    if let Some(compat) = compat_for_hook {
+                        if let Some(result) = compat.sleep_seconds(seconds) {
+                            let _ = emu.write_reg("x0", result.return_value);
+                            if lr != 0 {
+                                let _ = emu.write_reg("pc", lr);
+                            }
+                            record_arm64_import(
+                                &import_tracker,
+                                format!(
+                                    "_sleep(host seconds={}) -> {}",
+                                    seconds, result.return_value
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                }
+                let thread_id = schedule.thread_id;
                 let current_pid = os_runtime
                     .lock()
                     .ok()
@@ -172,6 +199,40 @@ pub fn install_arm64_time_imports(
                     *slot = slot.saturating_add(1);
                     *slot
                 };
+
+                let mut yielded_to = None;
+                {
+                    let mut runtime = match thread_runtime.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                    if let Ok(yield_result) = yield_active_arm64_thread(emu, &mut runtime, 0, lr) {
+                        yielded_to = yield_result;
+                    }
+                }
+
+                if let Some((from_tid, to_tid)) = yielded_to {
+                    record_arm64_import(
+                        &import_tracker,
+                        format!(
+                            "_sleep(tid={}, seconds={}, lr=0x{:X}, streak={}) -> yield:{}",
+                            thread_id, seconds, lr, streak, to_tid
+                        ),
+                    );
+                    println!(
+                        "[THREAD][arm64] sleep yield tid={} -> tid={} seconds={} lr=0x{:X} streak={} pending={} waiting={} advanced_ns={}",
+                        from_tid,
+                        to_tid,
+                        seconds,
+                        lr,
+                        streak,
+                        schedule.pending_threads,
+                        schedule.waiting_threads,
+                        time_advance
+                    );
+                    return;
+                }
+
                 let _ = emu.write_reg("x0", 0);
                 if lr != 0 {
                     let _ = emu.write_reg("pc", lr);
@@ -188,12 +249,13 @@ pub fn install_arm64_time_imports(
                     .arg("Lr", format!("0x{:X}", lr))
                     .arg("Streak", streak.to_string())
                     .arg("AdvancedNs", time_advance.to_string())
-                    .arg("ActiveThread", active_thread.to_string())
-                    .arg("PendingThreads", pending_threads.to_string())
+                    .arg("ActiveThread", schedule.active_thread.to_string())
+                    .arg("PendingThreads", schedule.pending_threads.to_string())
+                    .arg("WaitingThreads", schedule.waiting_threads.to_string())
                     .arg("Result", "0");
                 emit_arm64_event(&trace_bus_for_hook, event);
 
-                if seconds > 0 && pending_threads == 0 && streak >= 3 {
+                if seconds > 0 && schedule.pending_threads == 0 && streak >= 3 {
                     if let Ok(mut stop_reason) = synthetic_stop_reason.lock() {
                         if stop_reason.is_none() {
                             *stop_reason = Some(format!(
@@ -220,33 +282,38 @@ pub fn install_arm64_time_imports(
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let usec = emu.read_reg("x0").unwrap_or(0);
                 let lr = emu.read_reg("lr").unwrap_or(0);
-                if let Some(compat) = compat_for_hook {
-                    if let Some(result) = compat.usleep_usecs(usec) {
-                        let _ = emu.write_reg("x0", result.return_value);
-                        if lr != 0 {
-                            let _ = emu.write_reg("pc", lr);
-                        }
-                        record_arm64_import(
-                            &import_tracker,
-                            format!(
-                                "_usleep(host usec={}) -> {} errno={}",
-                                usec, result.return_value, result.errno
-                            ),
-                        );
-                        return;
-                    }
-                }
-                let (thread_id, active_thread, pending_threads) = thread_runtime
+                let schedule = thread_runtime
                     .lock()
                     .ok()
-                    .map(|rt| {
-                        (
-                            rt.current_thread_id.max(1),
-                            rt.active_thread.is_some(),
-                            rt.pending_threads.len(),
-                        )
-                    })
-                    .unwrap_or((1, false, 0));
+                    .map(|rt| arm64_thread_schedule_state(&rt))
+                    .unwrap_or(Arm64ThreadScheduleState {
+                        thread_id: 1,
+                        active_thread: false,
+                        pending_threads: 0,
+                        waiting_threads: 0,
+                    });
+                if schedule.host_delay_proxy_allowed() {
+                    if let Some(compat) = compat_for_hook {
+                        if let Some(result) = compat.usleep_usecs(usec) {
+                            let _ = emu.write_reg("x0", result.return_value);
+                            if lr != 0 {
+                                let _ = emu.write_reg("pc", lr);
+                            }
+                            record_arm64_import(
+                                &import_tracker,
+                                format!(
+                                    "_usleep(host usec={}) -> {} errno={}",
+                                    usec, result.return_value, result.errno
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                }
+                let thread_id = schedule.thread_id;
+                let active_thread = schedule.active_thread;
+                let pending_threads = schedule.pending_threads;
+                let waiting_threads = schedule.waiting_threads;
 
                 let time_advance = usec.saturating_mul(1_000).max(1_000);
                 let _ = mach_absolute_time.fetch_add(
@@ -312,13 +379,22 @@ pub fn install_arm64_time_imports(
                         ),
                     );
                     println!(
-                        "[THREAD][arm64] usleep yield tid={} -> tid={} usec={} caller=0x{:X} streak={} pending={} advanced_ns={}",
-                        from_tid, to_tid, usec, caller_lr, streak, pending_threads, time_advance
+                        "[THREAD][arm64] usleep yield tid={} -> tid={} usec={} caller=0x{:X} streak={} pending={} waiting={} advanced_ns={}",
+                        from_tid,
+                        to_tid,
+                        usec,
+                        caller_lr,
+                        streak,
+                        pending_threads,
+                        waiting_threads,
+                        time_advance
                     );
                     if !idle_wake.is_empty() {
                         let summary = idle_wake
                             .iter()
-                            .map(|(cond, waiter_tid)| format!("cond=0x{:X}/tid={}", cond, waiter_tid))
+                            .map(|(cond, waiter_tid)| {
+                                format!("cond=0x{:X}/tid={}", cond, waiter_tid)
+                            })
                             .collect::<Vec<_>>()
                             .join(", ");
                         println!(
@@ -344,7 +420,7 @@ pub fn install_arm64_time_imports(
 
                 if streak <= 5 || streak % 25 == 0 {
                     println!(
-                        "[IMPORT][arm64] _usleep tid={} usec={} lr=0x{:X} caller=0x{:X} streak={} active={} pending={} dt_ns={} lr_code={:02X?} caller_code={:02X?}",
+                        "[IMPORT][arm64] _usleep tid={} usec={} lr=0x{:X} caller=0x{:X} streak={} active={} pending={} waiting={} dt_ns={} lr_code={:02X?} caller_code={:02X?}",
                         thread_id,
                         usec,
                         lr,
@@ -352,6 +428,7 @@ pub fn install_arm64_time_imports(
                         streak,
                         active_thread,
                         pending_threads,
+                        waiting_threads,
                         time_advance,
                         lr_bytes,
                         caller_bytes
@@ -616,4 +693,43 @@ pub fn install_arm64_time_imports(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Arm64ThreadScheduleState;
+
+    #[test]
+    fn host_delay_proxy_is_only_allowed_when_guest_scheduler_is_idle() {
+        assert!(Arm64ThreadScheduleState {
+            thread_id: 1,
+            active_thread: false,
+            pending_threads: 0,
+            waiting_threads: 0,
+        }
+        .host_delay_proxy_allowed());
+
+        for busy in [
+            Arm64ThreadScheduleState {
+                thread_id: 2,
+                active_thread: true,
+                pending_threads: 0,
+                waiting_threads: 0,
+            },
+            Arm64ThreadScheduleState {
+                thread_id: 1,
+                active_thread: false,
+                pending_threads: 1,
+                waiting_threads: 0,
+            },
+            Arm64ThreadScheduleState {
+                thread_id: 1,
+                active_thread: false,
+                pending_threads: 0,
+                waiting_threads: 1,
+            },
+        ] {
+            assert!(!busy.host_delay_proxy_allowed());
+        }
+    }
 }

@@ -20,6 +20,7 @@ emulator behavior.
   - probes browser profile roots such as Chrome, Brave, Edge, and Firefox
   - attempts to open wallet/private data such as Binance, Electrum, Coinomi, and Exodus paths
   - reads synthetic fallback content from guest filesystem policy
+  - on Darwin compat hosts, `_sleep`/`_usleep` only proxy to host libc when the synthetic guest scheduler is idle; while AMOS bootstrap has active, pending, or condition-waiting guest threads, the delay hooks stay cooperative so `pthread_cond_wait` can hand off to worker threads and receive the matching `pthread_cond_signal`
   - CI regression guard verifies these milestones from JSONL trace output on Ubuntu
 - Important implication:
   - emulator is already past bootstrap/runtime-only execution and into real stealer logic
