@@ -106,6 +106,140 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_printf_varargs_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_printf_varargs.c");
+    let binary = out_dir.join("arm64_printf_varargs");
+    fs::write(
+        &source,
+        r#"#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+
+typedef int (*printf_fn)(const char *, ...);
+
+static void emit_printf(printf_fn fn, const char *label) {
+    fn("compat varargs %s ints=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d str=%s hex=%#x ptr=%p char=%c\n",
+       label,
+       1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+       "stack-ok",
+       0x5a,
+       (void *)(uintptr_t)0x1234,
+       'Z');
+}
+
+int main(void) {
+    emit_printf(printf, "static");
+
+    void *self = dlopen(NULL, RTLD_NOW);
+    printf_fn dyn_printf = (printf_fn)dlsym(self, "printf");
+    if (dyn_printf == 0) {
+        return 7;
+    }
+    emit_printf(dyn_printf, "dlsym");
+    dlclose(self);
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 printf varargs C fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 printf varargs fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 printf varargs fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
+fn compile_arm64_lifecycle_glue_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_lifecycle_glue.c");
+    let binary = out_dir.join("arm64_lifecycle_glue");
+    fs::write(
+        &source,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void mark(const char *text) {
+    const char *p = text;
+    size_t len = 0;
+    while (p[len] != '\0') {
+        len++;
+    }
+    write(1, text, len);
+}
+
+__attribute__((constructor))
+static void before_main(void) {
+    mark("compat lifecycle ctor\n");
+}
+
+static void at_exit_one(void) {
+    mark("compat lifecycle atexit\n");
+}
+
+__attribute__((destructor))
+static void after_main(void) {
+    mark("compat lifecycle dtor\n");
+}
+
+int main(void) {
+    int ret = atexit(at_exit_one);
+    printf("compat lifecycle main atexit_ret=%d\n", ret);
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 lifecycle glue C fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 lifecycle glue fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 lifecycle glue fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_universal_native_preferred_fixture() -> PathBuf {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -2859,6 +2993,12 @@ fn compat_mode_runs_fresh_arm64_write_program() {
     let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
+        .arg("--compat-log")
+        .arg("calls")
+        .arg("--compat-log-filter")
+        .arg("printf,write")
+        .arg("--compat-log-preview-bytes")
+        .arg("96")
         .arg(&fixture)
         .env("MACHINA_PLUGIN_TRACE", "1")
         .env("MACHINA_TRACE_FORMAT", "jsonl")
@@ -2882,7 +3022,7 @@ fn compat_mode_runs_fresh_arm64_write_program() {
         .join(" | ");
 
     eprintln!(
-        "compat proof(write+dlsym): command={} --mode compat {}",
+        "compat proof(write+dlsym): command={} --mode compat --compat-log calls --compat-log-filter printf,write --compat-log-preview-bytes 96 {}",
         machina.display(),
         fixture.display()
     );
@@ -2918,6 +3058,205 @@ fn compat_mode_runs_fresh_arm64_write_program() {
         stdout.contains("[THREAD][arm64] reached done_addr")
             || stdout.contains("[STARTUP][arm64] reached done_addr"),
         "fresh arm64 write fixture did not prove guest execution reached done_addr; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"plugin\":\"compat\""),
+        "compat CLI log option did not emit compat JSONL to stderr; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"printf\""),
+        "compat log did not include normalized printf call; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"Symbol\":\"_printf\"") || stderr.contains("\"Symbol\":\"printf\""),
+        "compat log did not preserve the proxied printf symbol; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"write\""),
+        "compat log did not include host-proxied write call; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("\"Call\":\"dlopen\"") && !stderr.contains("\"Call\":\"dlsym\""),
+        "compat log filter leaked unrequested dynamic loader calls; stderr:\n{stderr}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_preserves_arm64_printf_stack_varargs() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode printf varargs test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_printf_varargs_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("calls")
+        .arg("--compat-log-filter")
+        .arg("printf")
+        .arg("--compat-log-preview-bytes")
+        .arg("128")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(printf-varargs): command={} --mode compat --compat-log calls --compat-log-filter printf --compat-log-preview-bytes 128 {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(printf-varargs): status={status}");
+    eprintln!("compat proof(printf-varargs): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(printf-varargs): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains(
+            "compat varargs static ints=1,2,3,4,5,6,7,8,9,10 str=stack-ok hex=0x5a ptr=0x1234 char=Z"
+        ),
+        "printf varargs fixture did not preserve static import stack arguments; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "compat varargs dlsym ints=1,2,3,4,5,6,7,8,9,10 str=stack-ok hex=0x5a ptr=0x1234 char=Z"
+        ),
+        "printf varargs fixture did not preserve dlsym import stack arguments; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.matches("\"Call\":\"printf\"").count() >= 2,
+        "compat printf varargs run did not emit static and dlsym printf logs; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"sp\":\"0x"),
+        "compat printf varargs log did not include the arm64 stack pointer; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("\"Call\":\"dlopen\"") && !stderr.contains("\"Call\":\"dlsym\""),
+        "compat printf varargs log filter leaked unrequested dynamic-loader calls; stderr:\n{stderr}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_reports_lifecycle_glue_gaps() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode lifecycle glue diagnostic on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_lifecycle_glue_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("calls")
+        .arg("--compat-log-filter")
+        .arg("write,printf")
+        .arg("--compat-log-preview-bytes")
+        .arg("128")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[') && !line.starts_with('{')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let saw_ctor = stdout.contains("compat lifecycle ctor");
+    let saw_main = stdout.contains("compat lifecycle main atexit_ret=");
+    let saw_atexit = stdout.contains("compat lifecycle atexit");
+    let saw_dtor = stdout.contains("compat lifecycle dtor");
+
+    eprintln!(
+        "compat proof(lifecycle-glue): command={} --mode compat --compat-log calls --compat-log-filter write,printf --compat-log-preview-bytes 128 {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(lifecycle-glue): status={status}");
+    eprintln!("compat proof(lifecycle-glue): guest stdout={guest_stdout:?}");
+    eprintln!(
+        "compat proof(lifecycle-glue): observed ctor={} main={} atexit={} dtor={}",
+        saw_ctor as u8, saw_main as u8, saw_atexit as u8, saw_dtor as u8
+    );
+    if !saw_atexit || !saw_dtor {
+        eprintln!(
+            "compat proof(lifecycle-glue): missing lifecycle stages -> atexit_handlers={} mod_term_destructors={}",
+            (!saw_atexit) as u8,
+            (!saw_dtor) as u8
+        );
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(lifecycle-glue): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        saw_ctor,
+        "lifecycle glue fixture did not execute __mod_init_func constructor; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_main,
+        "lifecycle glue fixture did not reach main/atexit registration; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"write\""),
+        "lifecycle glue fixture did not log host-proxied constructor write; stderr:\n{stderr}"
     );
 }
 

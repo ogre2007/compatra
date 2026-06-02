@@ -119,6 +119,13 @@ add new ones):
   linked into the compatibility utility.
 - `MACHINA_TRACE_FORMAT` — `jsonl` (default) or `human`.
 - `MACHINA_TRACE_PROFILE` — `compact` (default), `full`, or `debug`.
+- `MACHINA_COMPAT_LOG` — compat-only JSONL logs to stderr: `off`
+  (default), `summary`, `calls`, or `verbose`. The `machina` and
+  `machina-compat` CLIs also expose this as `--compat-log`.
+- `MACHINA_COMPAT_LOG_FILTER` — comma-separated normalized compat call names
+  such as `write,open,getaddrinfo`; CLI form is `--compat-log-filter`.
+- `MACHINA_COMPAT_LOG_PREVIEW_BYTES` — byte cap for escaped text/hex previews
+  in compat I/O logs; CLI form is `--compat-log-preview-bytes`.
 - `MACHINA_TRACE_WINDOW_START` / `_END` / `_HITS` — bounded instruction trace
   window for arm64 diagnostics.
 - `MACHINA_INDIRECT_BRANCH_MODE` — `fast` (default) or `sanitize`.

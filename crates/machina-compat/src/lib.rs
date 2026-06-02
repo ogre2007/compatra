@@ -1,7 +1,13 @@
 //! Compatibility-mode host service boundary.
 
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::io::Write;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 #[cfg(target_os = "macos")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "macos")]
@@ -15,7 +21,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::ptr;
 #[cfg(target_os = "macos")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 pub use machina_mode::RuntimeMode;
 
@@ -72,6 +78,437 @@ pub struct HostPipeResult {
     pub read_fd: u64,
     pub write_fd: u64,
     pub errno: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CompatLogLevel {
+    #[default]
+    Off,
+    Summary,
+    Calls,
+    Verbose,
+}
+
+impl CompatLogLevel {
+    fn parse(value: Option<&str>) -> Self {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Self::Off;
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" | "none" => Self::Off,
+            "1" | "true" | "yes" | "summary" => Self::Summary,
+            "call" | "calls" | "full" | "jsonl" | "on" => Self::Calls,
+            "verbose" | "debug" => Self::Verbose,
+            _ => Self::Calls,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Summary => "summary",
+            Self::Calls => "calls",
+            Self::Verbose => "verbose",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompatLogConfig {
+    level: CompatLogLevel,
+    filter: HashSet<String>,
+    preview_bytes: usize,
+}
+
+impl CompatLogConfig {
+    fn from_env() -> Self {
+        Self::from_env_values(
+            std::env::var("MACHINA_COMPAT_LOG").ok().as_deref(),
+            std::env::var("MACHINA_COMPAT_LOG_FILTER").ok().as_deref(),
+            std::env::var("MACHINA_COMPAT_LOG_PREVIEW_BYTES")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_env_values(
+        level: Option<&str>,
+        filter: Option<&str>,
+        preview_bytes: Option<&str>,
+    ) -> Self {
+        let filter = filter
+            .unwrap_or("")
+            .split(',')
+            .map(normalize_log_call_name)
+            .filter(|entry| !entry.is_empty())
+            .collect::<HashSet<_>>();
+        let preview_bytes = preview_bytes
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64)
+            .min(4096);
+        Self {
+            level: CompatLogLevel::parse(level),
+            filter,
+            preview_bytes,
+        }
+    }
+
+    fn should_emit(&self, call: &str, error: bool) -> bool {
+        if self.level == CompatLogLevel::Off {
+            return false;
+        }
+        let normalized = normalize_log_call_name(call);
+        if !self.filter.is_empty() && !self.filter.contains(&normalized) {
+            return false;
+        }
+        if self.level == CompatLogLevel::Summary {
+            return error || summary_log_call(&normalized);
+        }
+        true
+    }
+
+    fn include_preview(&self, error: bool) -> bool {
+        matches!(self.level, CompatLogLevel::Calls | CompatLogLevel::Verbose)
+            || (self.level == CompatLogLevel::Summary && error)
+    }
+}
+
+thread_local! {
+    static COMPAT_LOG_DEPTH: Cell<usize> = Cell::new(0);
+}
+
+#[derive(Debug)]
+struct CompatLogScope {
+    outermost: bool,
+}
+
+impl CompatLogScope {
+    fn enter() -> Self {
+        let outermost = COMPAT_LOG_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current.saturating_add(1));
+            current == 0
+        });
+        Self { outermost }
+    }
+
+    fn call_result(
+        &self,
+        kind: &str,
+        call: &str,
+        args: &[(&str, String)],
+        result: &Option<HostCallResult>,
+    ) {
+        let error = result.as_ref().map_or(true, |result| {
+            result.errno.unwrap_or(0) != 0 || result.return_value == u64::MAX
+        });
+        if !self.outermost || !compat_log_config().should_emit(call, error) {
+            return;
+        }
+        let mut fields = vec![
+            (
+                "return",
+                result
+                    .as_ref()
+                    .map(|result| format_return(result.return_value)),
+            ),
+            (
+                "return_hex",
+                result
+                    .as_ref()
+                    .map(|result| format!("0x{:X}", result.return_value)),
+            ),
+            (
+                "errno",
+                result
+                    .as_ref()
+                    .and_then(|result| result.errno)
+                    .map(|errno| errno.to_string()),
+            ),
+            ("status", result.is_none().then(|| "unhandled".to_string())),
+        ];
+        emit_compat_log_line(kind, call, args, &mut fields, None);
+    }
+
+    fn io_result(
+        &self,
+        kind: &str,
+        call: &str,
+        args: &[(&str, String)],
+        result: &Option<HostIoResult>,
+    ) {
+        let error = result.as_ref().map_or(true, |result| {
+            result.errno != 0 || result.return_value == u64::MAX
+        });
+        if !self.outermost || !compat_log_config().should_emit(call, error) {
+            return;
+        }
+        let mut fields = vec![
+            (
+                "return",
+                result
+                    .as_ref()
+                    .map(|result| format_return(result.return_value)),
+            ),
+            (
+                "return_hex",
+                result
+                    .as_ref()
+                    .map(|result| format!("0x{:X}", result.return_value)),
+            ),
+            (
+                "errno",
+                result.as_ref().map(|result| result.errno.to_string()),
+            ),
+            (
+                "transferred",
+                result.as_ref().map(|result| result.transferred.to_string()),
+            ),
+            ("status", result.is_none().then(|| "unhandled".to_string())),
+        ];
+        let preview = result.as_ref().and_then(|result| {
+            compat_log_config()
+                .include_preview(error)
+                .then_some(result.preview.as_slice())
+        });
+        emit_compat_log_line(kind, call, args, &mut fields, preview);
+    }
+
+    fn open_result(
+        &self,
+        kind: &str,
+        call: &str,
+        args: &[(&str, String)],
+        result: &Option<HostOpenResult>,
+    ) {
+        let error = result.as_ref().map_or(true, |result| {
+            result.errno != 0 || result.return_value == u64::MAX
+        });
+        if !self.outermost || !compat_log_config().should_emit(call, error) {
+            return;
+        }
+        let mut fields = vec![
+            (
+                "return",
+                result
+                    .as_ref()
+                    .map(|result| format_return(result.return_value)),
+            ),
+            (
+                "return_hex",
+                result
+                    .as_ref()
+                    .map(|result| format!("0x{:X}", result.return_value)),
+            ),
+            (
+                "errno",
+                result.as_ref().map(|result| result.errno.to_string()),
+            ),
+            ("path", result.as_ref().map(|result| result.path.clone())),
+            ("status", result.is_none().then(|| "unhandled".to_string())),
+        ];
+        emit_compat_log_line(kind, call, args, &mut fields, None);
+    }
+
+    fn pipe_result(
+        &self,
+        kind: &str,
+        call: &str,
+        args: &[(&str, String)],
+        result: &Option<HostPipeResult>,
+    ) {
+        let error = result.as_ref().map_or(true, |result| result.errno != 0);
+        if !self.outermost || !compat_log_config().should_emit(call, error) {
+            return;
+        }
+        let mut fields = vec![
+            (
+                "read_fd",
+                result.as_ref().map(|result| result.read_fd.to_string()),
+            ),
+            (
+                "write_fd",
+                result.as_ref().map(|result| result.write_fd.to_string()),
+            ),
+            (
+                "errno",
+                result.as_ref().map(|result| result.errno.to_string()),
+            ),
+            ("status", result.is_none().then(|| "unhandled".to_string())),
+        ];
+        emit_compat_log_line(kind, call, args, &mut fields, None);
+    }
+}
+
+impl Drop for CompatLogScope {
+    fn drop(&mut self) {
+        COMPAT_LOG_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
+fn compat_log_config() -> &'static CompatLogConfig {
+    static CONFIG: OnceLock<CompatLogConfig> = OnceLock::new();
+    CONFIG.get_or_init(CompatLogConfig::from_env)
+}
+
+fn normalize_log_call_name(call: &str) -> String {
+    let mut normalized = call.trim();
+    while let Some(rest) = normalized.strip_prefix('_') {
+        normalized = rest;
+    }
+    if let Some((base, _suffix)) = normalized.split_once('$') {
+        normalized = base;
+    }
+    normalized.to_ascii_lowercase()
+}
+
+fn summary_log_call(call: &str) -> bool {
+    matches!(
+        call,
+        "open"
+            | "openat"
+            | "read"
+            | "write"
+            | "close"
+            | "socket"
+            | "connect"
+            | "bind"
+            | "listen"
+            | "accept"
+            | "send"
+            | "recv"
+            | "sendto"
+            | "recvfrom"
+            | "sendmsg"
+            | "recvmsg"
+            | "shutdown"
+            | "getaddrinfo"
+            | "getnameinfo"
+            | "stat"
+            | "lstat"
+            | "fstat"
+            | "rename"
+            | "unlink"
+            | "mkdir"
+            | "rmdir"
+            | "symlink"
+            | "readlink"
+            | "getentropy"
+    )
+}
+
+fn format_return(value: u64) -> String {
+    if value == u64::MAX {
+        "-1".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn hex_arg(value: u64) -> String {
+    format!("0x{value:X}")
+}
+
+fn json_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+fn compat_log_timestamp_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn compat_preview_text(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| match *byte {
+            b'\n' => "\\n".to_string(),
+            b'\r' => "\\r".to_string(),
+            b'\t' => "\\t".to_string(),
+            0x20..=0x7e => (*byte as char).to_string(),
+            _ => ".".to_string(),
+        })
+        .collect::<String>()
+}
+
+fn compat_preview_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn push_json_field(out: &mut String, key: &str, value: &str) {
+    out.push(',');
+    out.push('"');
+    out.push_str(&json_escape(key));
+    out.push_str("\":\"");
+    out.push_str(&json_escape(value));
+    out.push('"');
+}
+
+fn emit_compat_log_line(
+    kind: &str,
+    call: &str,
+    args: &[(&str, String)],
+    fields: &mut [(&str, Option<String>)],
+    preview: Option<&[u8]>,
+) {
+    let config = compat_log_config();
+    if config.level == CompatLogLevel::Off {
+        return;
+    }
+
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"plugin\":\"compat\"");
+    push_json_field(
+        &mut out,
+        "TimeStamp",
+        &compat_log_timestamp_us().to_string(),
+    );
+    push_json_field(&mut out, "Level", config.level.as_str());
+    push_json_field(&mut out, "Kind", kind);
+    push_json_field(&mut out, "Call", &normalize_log_call_name(call));
+    push_json_field(&mut out, "Symbol", call);
+    for (name, value) in args {
+        push_json_field(&mut out, name, value);
+    }
+    for (name, value) in fields.iter_mut() {
+        if let Some(value) = value.take() {
+            push_json_field(&mut out, name, &value);
+        }
+    }
+    if let Some(preview) = preview {
+        let preview_len = preview.len().min(config.preview_bytes);
+        let preview = &preview[..preview_len];
+        push_json_field(&mut out, "PreviewText", &compat_preview_text(preview));
+        push_json_field(&mut out, "PreviewHex", &compat_preview_hex(preview));
+        push_json_field(&mut out, "PreviewBytes", &preview_len.to_string());
+    }
+    out.push('}');
+
+    let _ = writeln!(std::io::stderr(), "{out}");
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,20 +820,25 @@ impl CompatibilityServices {
         symbol: &str,
         arg0_ptr: u64,
     ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            let log_scope = CompatLogScope::enter();
+            let result = match host_import_kind(symbol)? {
+                HostImportKind::Puts => proxy_host_puts(memory, arg0_ptr),
+                HostImportKind::Printf => {
+                    proxy_host_printf(memory, &[arg0_ptr, 0, 0, 0, 0, 0, 0, 0], None)
+                }
+                HostImportKind::Putchar => proxy_host_putchar(arg0_ptr),
+                _ => None,
+            };
+            let log_args = [("arg0", hex_arg(arg0_ptr))];
+            log_scope.call_result("import", symbol, &log_args, &result);
+            result
+        }
         #[cfg(not(target_os = "macos"))]
-        let _ = (&mut *memory, arg0_ptr);
-
-        match host_import_kind(symbol)? {
-            #[cfg(target_os = "macos")]
-            HostImportKind::Puts => proxy_host_puts(memory, arg0_ptr),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Printf => {
-                proxy_host_printf(memory, &[arg0_ptr, 0, 0, 0, 0, 0, 0, 0], None)
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Putchar => proxy_host_putchar(arg0_ptr),
-            #[cfg(target_os = "macos")]
-            _ => None,
+        {
+            let _ = (&mut *memory, symbol, arg0_ptr);
+            None
         }
     }
 
@@ -416,464 +858,354 @@ impl CompatibilityServices {
         args: &[u64; 8],
         stack_ptr: Option<u64>,
     ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            let log_scope = CompatLogScope::enter();
+            let result = match host_import_kind(symbol)? {
+                HostImportKind::Puts => proxy_host_puts(memory, args[0]),
+                HostImportKind::Printf => {
+                    let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 64));
+                    proxy_host_printf(memory, args, stack_args.as_deref())
+                }
+                HostImportKind::Putchar => proxy_host_putchar(args[0]),
+                HostImportKind::Open => {
+                    let result =
+                        self.open_path_arm64(memory, args[0], args[1], args[2], stack_ptr)?;
+                    Some(HostCallResult {
+                        return_value: result.return_value,
+                        errno: Some(result.errno),
+                    })
+                }
+                HostImportKind::OpenAt => {
+                    let mode = arm64_variadic_open_mode(memory, args[2], args[3], stack_ptr);
+                    let result = self.openat_path(memory, args[0], args[1], args[2], mode)?;
+                    Some(HostCallResult {
+                        return_value: result.return_value,
+                        errno: Some(result.errno),
+                    })
+                }
+                HostImportKind::Read => Some(
+                    self.read_fd(memory, args[0], args[1], args[2] as usize)?
+                        .into(),
+                ),
+                HostImportKind::Write => Some(
+                    self.write_fd(memory, args[0], args[1], args[2] as usize)?
+                        .into(),
+                ),
+                HostImportKind::Close => Some(self.close_fd(args[0])?.into()),
+                HostImportKind::Socket => Some(self.socket(args[0], args[1], args[2])?.into()),
+                HostImportKind::Connect => Some(
+                    self.connect_socket(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::Bind => {
+                    Some(self.bind_socket(memory, args[0], args[1], args[2])?.into())
+                }
+                HostImportKind::Listen => Some(self.listen_socket(args[0], args[1])?.into()),
+                HostImportKind::Send => Some(
+                    self.send_socket(memory, args[0], args[1], args[2] as usize, args[3])?
+                        .into(),
+                ),
+                HostImportKind::Recv => Some(
+                    self.recv_socket(memory, args[0], args[1], args[2] as usize, args[3])?
+                        .into(),
+                ),
+                HostImportKind::SendTo => Some(
+                    self.sendto_socket(
+                        memory,
+                        args[0],
+                        args[1],
+                        args[2] as usize,
+                        args[3],
+                        args[4],
+                        args[5],
+                    )?
+                    .into(),
+                ),
+                HostImportKind::RecvFrom => Some(
+                    self.recvfrom_socket(
+                        memory,
+                        args[0],
+                        args[1],
+                        args[2] as usize,
+                        args[3],
+                        args[4],
+                        args[5],
+                    )?
+                    .into(),
+                ),
+                HostImportKind::SendMsg => Some(
+                    self.sendmsg_socket(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::RecvMsg => Some(
+                    self.recvmsg_socket(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::Shutdown => Some(self.shutdown_socket(args[0], args[1])?.into()),
+                HostImportKind::SetSockOpt => Some(
+                    self.setsockopt_socket(memory, args[0], args[1], args[2], args[3], args[4])?
+                        .into(),
+                ),
+                HostImportKind::GetSockOpt => Some(
+                    self.getsockopt_socket(memory, args[0], args[1], args[2], args[3], args[4])?
+                        .into(),
+                ),
+                HostImportKind::Accept => Some(
+                    self.accept_socket(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::GetPeerName => Some(
+                    self.getpeername_socket(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::GetSockName => Some(
+                    self.getsockname_socket(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::SocketPair => Some(
+                    self.socketpair(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::Fcntl => {
+                    let arg = arm64_variadic_stack_arg(memory, args[2], stack_ptr, 0);
+                    Some(self.fcntl_fd(args[0], args[1], arg)?.into())
+                }
+                HostImportKind::Ioctl => {
+                    let data_ptr = arm64_variadic_stack_arg(memory, args[2], stack_ptr, 0);
+                    Some(self.ioctl_fd(memory, args[0], args[1], data_ptr)?.into())
+                }
+                HostImportKind::Fsync => Some(self.fsync_fd(args[0])?.into()),
+                HostImportKind::Poll => {
+                    Some(self.poll_fds(memory, args[0], args[1], args[2])?.into())
+                }
+                HostImportKind::Readv => {
+                    Some(self.readv_fd(memory, args[0], args[1], args[2])?.into())
+                }
+                HostImportKind::Writev => {
+                    Some(self.writev_fd(memory, args[0], args[1], args[2])?.into())
+                }
+                HostImportKind::Pread => Some(
+                    self.pread_fd(memory, args[0], args[1], args[2] as usize, args[3])?
+                        .into(),
+                ),
+                HostImportKind::Pwrite => Some(
+                    self.pwrite_fd(memory, args[0], args[1], args[2] as usize, args[3])?
+                        .into(),
+                ),
+                HostImportKind::Lseek => Some(self.lseek_fd(args[0], args[1], args[2])?.into()),
+                HostImportKind::Dup => Some(self.dup_fd(args[0])?.into()),
+                HostImportKind::Dup2 => Some(self.dup2_fd(args[0], args[1])?.into()),
+                HostImportKind::Pipe => Some(self.pipe_fds(memory, args[0])?.into()),
+                HostImportKind::Select => Some(
+                    self.select_fds(memory, args[0], args[1], args[2], args[3], args[4])?
+                        .into(),
+                ),
+                HostImportKind::DarwinCheckFdSetOverflow => Some(HostCallResult {
+                    return_value: 1,
+                    errno: Some(0),
+                }),
+                HostImportKind::Access => Some(self.access_path(memory, args[0], args[1])?.into()),
+                HostImportKind::FAccessAt => Some(
+                    self.faccessat_path(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::Chmod => Some(self.chmod_path(memory, args[0], args[1])?.into()),
+                HostImportKind::Fchmod => Some(self.fchmod_fd(args[0], args[1])?.into()),
+                HostImportKind::FchmodAt => Some(
+                    self.fchmodat_path(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::Chdir => Some(self.chdir_path(memory, args[0])?.into()),
+                HostImportKind::Fchdir => Some(self.fchdir_fd(args[0])?.into()),
+                HostImportKind::GetCwd => Some(self.getcwd_path(memory, args[0], args[1])?),
+                HostImportKind::Stat => Some(self.stat_path(memory, args[0], args[1])?.into()),
+                HostImportKind::LStat => Some(self.lstat_path(memory, args[0], args[1])?.into()),
+                HostImportKind::FStat => Some(self.fstat_fd(memory, args[0], args[1])?.into()),
+                HostImportKind::FStatAt => Some(
+                    self.fstatat_path(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::StatFs => Some(self.statfs_path(memory, args[0], args[1])?.into()),
+                HostImportKind::FStatFs => Some(self.fstatfs_fd(memory, args[0], args[1])?.into()),
+                HostImportKind::Truncate => {
+                    Some(self.truncate_path(memory, args[0], args[1])?.into())
+                }
+                HostImportKind::Ftruncate => Some(self.ftruncate_fd(args[0], args[1])?.into()),
+                HostImportKind::Mkdir => Some(self.mkdir_path(memory, args[0], args[1])?.into()),
+                HostImportKind::MkdirAt => {
+                    Some(self.mkdirat_path(memory, args[0], args[1], args[2])?.into())
+                }
+                HostImportKind::Rmdir => Some(self.rmdir_path(memory, args[0])?.into()),
+                HostImportKind::Unlink => Some(self.unlink_path(memory, args[0])?.into()),
+                HostImportKind::UnlinkAt => Some(
+                    self.unlinkat_path(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::Rename => Some(self.rename_path(memory, args[0], args[1])?.into()),
+                HostImportKind::RenameAt => Some(
+                    self.renameat_path(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::Readlink => Some(
+                    self.readlink_path(memory, args[0], args[1], args[2] as usize)?
+                        .into(),
+                ),
+                HostImportKind::ReadlinkAt => Some(
+                    self.readlinkat_path(memory, args[0], args[1], args[2], args[3] as usize)?
+                        .into(),
+                ),
+                HostImportKind::Symlink => {
+                    Some(self.symlink_path(memory, args[0], args[1])?.into())
+                }
+                HostImportKind::Realpath => Some(self.realpath_path(memory, args[0], args[1])?),
+                HostImportKind::GetAddrInfo => {
+                    Some(self.getaddrinfo(memory, args[0], args[1], args[2], args[3])?)
+                }
+                HostImportKind::FreeAddrInfo => Some(self.freeaddrinfo(memory, args[0])?),
+                HostImportKind::GaiStrError => Some(self.gai_strerror(memory, args[0])?),
+                HostImportKind::GetNameInfo => Some(self.getnameinfo(
+                    memory, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                )?),
+                HostImportKind::InetPton => {
+                    Some(self.inet_pton(memory, args[0], args[1], args[2])?)
+                }
+                HostImportKind::InetNtop => {
+                    Some(self.inet_ntop(memory, args[0], args[1], args[2], args[3])?)
+                }
+                HostImportKind::InetAddr => Some(self.inet_addr(memory, args[0])?),
+                HostImportKind::InetAton => Some(self.inet_aton(memory, args[0], args[1])?),
+                HostImportKind::Htonl => Some(HostCallResult {
+                    return_value: (args[0] as u32).to_be() as u64,
+                    errno: None,
+                }),
+                HostImportKind::Htons => Some(HostCallResult {
+                    return_value: (args[0] as u16).to_be() as u64,
+                    errno: None,
+                }),
+                HostImportKind::Ntohl => Some(HostCallResult {
+                    return_value: u32::from_be(args[0] as u32) as u64,
+                    errno: None,
+                }),
+                HostImportKind::Ntohs => Some(HostCallResult {
+                    return_value: u16::from_be(args[0] as u16) as u64,
+                    errno: None,
+                }),
+                HostImportKind::GetEnv => Some(self.getenv(memory, args[0])?),
+                HostImportKind::SetEnv => {
+                    Some(self.setenv_var(memory, args[0], args[1], args[2])?.into())
+                }
+                HostImportKind::UnsetEnv => Some(self.unsetenv_var(memory, args[0])?.into()),
+                HostImportKind::GetPid => Some(self.getpid()?),
+                HostImportKind::GetPpid => Some(self.getppid()?),
+                HostImportKind::GetUid => Some(self.getuid()?),
+                HostImportKind::GetEuid => Some(self.geteuid()?),
+                HostImportKind::GetGid => Some(self.getgid()?),
+                HostImportKind::GetEgid => Some(self.getegid()?),
+                HostImportKind::SysConf => Some(self.sysconf(args[0])?),
+                HostImportKind::GetPageSize => Some(self.getpagesize()?),
+                HostImportKind::GetHostName => {
+                    Some(self.gethostname(memory, args[0], args[1])?.into())
+                }
+                HostImportKind::Uname => Some(self.uname(memory, args[0])?.into()),
+                HostImportKind::GetTimeOfDay => {
+                    Some(self.gettimeofday(memory, args[0], args[1], args[2])?.into())
+                }
+                HostImportKind::ClockGetTime => {
+                    Some(self.clock_gettime(memory, args[0], args[1])?.into())
+                }
+                HostImportKind::NanoSleep => Some(self.nanosleep(memory, args[0], args[1])?.into()),
+                HostImportKind::Sleep => Some(self.sleep_seconds(args[0])?),
+                HostImportKind::USleep => Some(self.usleep_usecs(args[0])?.into()),
+                HostImportKind::MachAbsoluteTime => Some(self.mach_absolute_time()?),
+                HostImportKind::MachTimebaseInfo => Some(self.mach_timebase_info(memory, args[0])?),
+                HostImportKind::GetRLimit => Some(self.getrlimit(memory, args[0], args[1])?.into()),
+                HostImportKind::SetRLimit => Some(self.setrlimit(memory, args[0], args[1])?.into()),
+                HostImportKind::Sysctl => Some(
+                    self.sysctl(memory, args[0], args[1], args[2], args[3], args[4], args[5])?
+                        .into(),
+                ),
+                HostImportKind::SysctlByName => Some(
+                    self.sysctlbyname(memory, args[0], args[1], args[2], args[3], args[4])?
+                        .into(),
+                ),
+                HostImportKind::Umask => Some(self.umask(args[0])?),
+                HostImportKind::FOpen => Some(self.fopen_path(memory, args[0], args[1])?),
+                HostImportKind::FdOpen => Some(self.fdopen_fd(memory, args[0], args[1])?),
+                HostImportKind::FClose => Some(self.fclose_stream(memory, args[0])?.into()),
+                HostImportKind::FRead => Some(
+                    self.fread_stream(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::FWrite => Some(
+                    self.fwrite_stream(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::FFlush => Some(self.fflush_stream(args[0])?.into()),
+                HostImportKind::FSeek => Some(self.fseek_stream(args[0], args[1], args[2])?.into()),
+                HostImportKind::FTell => Some(self.ftell_stream(args[0])?),
+                HostImportKind::FGetS => {
+                    Some(self.fgets_stream(memory, args[0], args[1], args[2])?)
+                }
+                HostImportKind::FPutS => Some(self.fputs_stream(memory, args[0], args[1])?.into()),
+                HostImportKind::FEOF => Some(self.feof_stream(args[0])?),
+                HostImportKind::FError => Some(self.ferror_stream(args[0])?),
+                HostImportKind::ClearErr => Some(self.clearerr_stream(args[0])?),
+                HostImportKind::Fileno => Some(self.fileno_stream(args[0])?.into()),
+                HostImportKind::Malloc => Some(self.malloc(memory, args[0])?),
+                HostImportKind::Calloc => Some(self.calloc(memory, args[0], args[1])?),
+                HostImportKind::Realloc => Some(self.realloc(memory, args[0], args[1])?),
+                HostImportKind::Free => Some(self.free(memory, args[0])?),
+                HostImportKind::PosixMemalign => {
+                    Some(self.posix_memalign(memory, args[0], args[1], args[2])?)
+                }
+                HostImportKind::Memcpy => Some(self.memcpy(memory, args[0], args[1], args[2])?),
+                HostImportKind::Memmove => Some(self.memmove(memory, args[0], args[1], args[2])?),
+                HostImportKind::Memset => Some(self.memset(memory, args[0], args[1], args[2])?),
+                HostImportKind::Memcmp => Some(self.memcmp(memory, args[0], args[1], args[2])?),
+                HostImportKind::Strlen => Some(self.strlen(memory, args[0])?),
+                HostImportKind::Strcmp => Some(self.strcmp(memory, args[0], args[1])?),
+                HostImportKind::Strncmp => Some(self.strncmp(memory, args[0], args[1], args[2])?),
+                HostImportKind::Strcpy => Some(self.strcpy(memory, args[0], args[1])?),
+                HostImportKind::Strncpy => Some(self.strncpy(memory, args[0], args[1], args[2])?),
+                HostImportKind::Strcat => Some(self.strcat(memory, args[0], args[1])?),
+                HostImportKind::Strchr => Some(self.strchr(memory, args[0], args[1])?),
+                HostImportKind::Strrchr => Some(self.strrchr(memory, args[0], args[1])?),
+                HostImportKind::Strdup => Some(self.strdup(memory, args[0])?),
+                HostImportKind::OpenDir => Some(self.opendir_path(memory, args[0])?),
+                HostImportKind::FdOpenDir => Some(self.fdopendir_fd(memory, args[0])?),
+                HostImportKind::ReadDir => Some(self.readdir_handle(memory, args[0])?),
+                HostImportKind::ReadDirR => {
+                    Some(self.readdir_r_handle(memory, args[0], args[1], args[2])?)
+                }
+                HostImportKind::CloseDir => Some(self.closedir_handle(memory, args[0])?.into()),
+                HostImportKind::DirFd => Some(self.dirfd_handle(args[0])?.into()),
+                HostImportKind::RewindDir => Some(self.rewinddir_handle(args[0])?),
+                HostImportKind::Telldir => Some(self.telldir_handle(args[0])?),
+                HostImportKind::Seekdir => Some(self.seekdir_handle(args[0], args[1])?),
+                HostImportKind::GetEntropy => {
+                    Some(self.getentropy(memory, args[0], args[1] as usize)?.into())
+                }
+            };
+            let mut log_arg_pairs = args
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| (format!("x{idx}"), hex_arg(*value)))
+                .collect::<Vec<_>>();
+            if let Some(stack_ptr) = stack_ptr {
+                log_arg_pairs.push(("sp".to_string(), hex_arg(stack_ptr)));
+            }
+            let log_args = log_arg_pairs
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect::<Vec<_>>();
+            log_scope.call_result("import", symbol, &log_args, &result);
+            result
+        }
         #[cfg(not(target_os = "macos"))]
-        let _ = (&mut *memory, args, stack_ptr);
-
-        match host_import_kind(symbol)? {
-            #[cfg(target_os = "macos")]
-            HostImportKind::Puts => proxy_host_puts(memory, args[0]),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Printf => {
-                let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 64));
-                proxy_host_printf(memory, args, stack_args.as_deref())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Putchar => proxy_host_putchar(args[0]),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Open => {
-                let result = self.open_path_arm64(memory, args[0], args[1], args[2], stack_ptr)?;
-                Some(HostCallResult {
-                    return_value: result.return_value,
-                    errno: Some(result.errno),
-                })
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::OpenAt => {
-                let mode = arm64_variadic_open_mode(memory, args[2], args[3], stack_ptr);
-                let result = self.openat_path(memory, args[0], args[1], args[2], mode)?;
-                Some(HostCallResult {
-                    return_value: result.return_value,
-                    errno: Some(result.errno),
-                })
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Read => Some(
-                self.read_fd(memory, args[0], args[1], args[2] as usize)?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Write => Some(
-                self.write_fd(memory, args[0], args[1], args[2] as usize)?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Close => Some(self.close_fd(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Socket => Some(self.socket(args[0], args[1], args[2])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Connect => Some(
-                self.connect_socket(memory, args[0], args[1], args[2])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Bind => {
-                Some(self.bind_socket(memory, args[0], args[1], args[2])?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Listen => Some(self.listen_socket(args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Send => Some(
-                self.send_socket(memory, args[0], args[1], args[2] as usize, args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Recv => Some(
-                self.recv_socket(memory, args[0], args[1], args[2] as usize, args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SendTo => Some(
-                self.sendto_socket(
-                    memory,
-                    args[0],
-                    args[1],
-                    args[2] as usize,
-                    args[3],
-                    args[4],
-                    args[5],
-                )?
-                .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::RecvFrom => Some(
-                self.recvfrom_socket(
-                    memory,
-                    args[0],
-                    args[1],
-                    args[2] as usize,
-                    args[3],
-                    args[4],
-                    args[5],
-                )?
-                .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SendMsg => Some(
-                self.sendmsg_socket(memory, args[0], args[1], args[2])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::RecvMsg => Some(
-                self.recvmsg_socket(memory, args[0], args[1], args[2])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Shutdown => Some(self.shutdown_socket(args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SetSockOpt => Some(
-                self.setsockopt_socket(memory, args[0], args[1], args[2], args[3], args[4])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetSockOpt => Some(
-                self.getsockopt_socket(memory, args[0], args[1], args[2], args[3], args[4])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Accept => Some(
-                self.accept_socket(memory, args[0], args[1], args[2])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetPeerName => Some(
-                self.getpeername_socket(memory, args[0], args[1], args[2])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetSockName => Some(
-                self.getsockname_socket(memory, args[0], args[1], args[2])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SocketPair => Some(
-                self.socketpair(memory, args[0], args[1], args[2], args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Fcntl => {
-                let arg = arm64_variadic_stack_arg(memory, args[2], stack_ptr, 0);
-                Some(self.fcntl_fd(args[0], args[1], arg)?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Ioctl => {
-                let data_ptr = arm64_variadic_stack_arg(memory, args[2], stack_ptr, 0);
-                Some(self.ioctl_fd(memory, args[0], args[1], data_ptr)?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Fsync => Some(self.fsync_fd(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Poll => Some(self.poll_fds(memory, args[0], args[1], args[2])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Readv => Some(self.readv_fd(memory, args[0], args[1], args[2])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Writev => {
-                Some(self.writev_fd(memory, args[0], args[1], args[2])?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Pread => Some(
-                self.pread_fd(memory, args[0], args[1], args[2] as usize, args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Pwrite => Some(
-                self.pwrite_fd(memory, args[0], args[1], args[2] as usize, args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Lseek => Some(self.lseek_fd(args[0], args[1], args[2])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Dup => Some(self.dup_fd(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Dup2 => Some(self.dup2_fd(args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Pipe => Some(self.pipe_fds(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Select => Some(
-                self.select_fds(memory, args[0], args[1], args[2], args[3], args[4])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::DarwinCheckFdSetOverflow => Some(HostCallResult {
-                return_value: 1,
-                errno: Some(0),
-            }),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Access => Some(self.access_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FAccessAt => Some(
-                self.faccessat_path(memory, args[0], args[1], args[2], args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Chmod => Some(self.chmod_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Fchmod => Some(self.fchmod_fd(args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FchmodAt => Some(
-                self.fchmodat_path(memory, args[0], args[1], args[2], args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Chdir => Some(self.chdir_path(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Fchdir => Some(self.fchdir_fd(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetCwd => Some(self.getcwd_path(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Stat => Some(self.stat_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::LStat => Some(self.lstat_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FStat => Some(self.fstat_fd(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FStatAt => Some(
-                self.fstatat_path(memory, args[0], args[1], args[2], args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::StatFs => Some(self.statfs_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FStatFs => Some(self.fstatfs_fd(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Truncate => Some(self.truncate_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Ftruncate => Some(self.ftruncate_fd(args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Mkdir => Some(self.mkdir_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::MkdirAt => {
-                Some(self.mkdirat_path(memory, args[0], args[1], args[2])?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Rmdir => Some(self.rmdir_path(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Unlink => Some(self.unlink_path(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::UnlinkAt => Some(
-                self.unlinkat_path(memory, args[0], args[1], args[2])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Rename => Some(self.rename_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::RenameAt => Some(
-                self.renameat_path(memory, args[0], args[1], args[2], args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Readlink => Some(
-                self.readlink_path(memory, args[0], args[1], args[2] as usize)?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::ReadlinkAt => Some(
-                self.readlinkat_path(memory, args[0], args[1], args[2], args[3] as usize)?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Symlink => Some(self.symlink_path(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Realpath => Some(self.realpath_path(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetAddrInfo => {
-                Some(self.getaddrinfo(memory, args[0], args[1], args[2], args[3])?)
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::FreeAddrInfo => Some(self.freeaddrinfo(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GaiStrError => Some(self.gai_strerror(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetNameInfo => Some(self.getnameinfo(
-                memory, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
-            )?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::InetPton => Some(self.inet_pton(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::InetNtop => {
-                Some(self.inet_ntop(memory, args[0], args[1], args[2], args[3])?)
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::InetAddr => Some(self.inet_addr(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::InetAton => Some(self.inet_aton(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Htonl => Some(HostCallResult {
-                return_value: (args[0] as u32).to_be() as u64,
-                errno: None,
-            }),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Htons => Some(HostCallResult {
-                return_value: (args[0] as u16).to_be() as u64,
-                errno: None,
-            }),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Ntohl => Some(HostCallResult {
-                return_value: u32::from_be(args[0] as u32) as u64,
-                errno: None,
-            }),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Ntohs => Some(HostCallResult {
-                return_value: u16::from_be(args[0] as u16) as u64,
-                errno: None,
-            }),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetEnv => Some(self.getenv(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SetEnv => {
-                Some(self.setenv_var(memory, args[0], args[1], args[2])?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::UnsetEnv => Some(self.unsetenv_var(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetPid => Some(self.getpid()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetPpid => Some(self.getppid()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetUid => Some(self.getuid()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetEuid => Some(self.geteuid()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetGid => Some(self.getgid()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetEgid => Some(self.getegid()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SysConf => Some(self.sysconf(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetPageSize => Some(self.getpagesize()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetHostName => Some(self.gethostname(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Uname => Some(self.uname(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetTimeOfDay => {
-                Some(self.gettimeofday(memory, args[0], args[1], 0)?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::ClockGetTime => {
-                Some(self.clock_gettime(memory, args[0], args[1])?.into())
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::NanoSleep => Some(self.nanosleep(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Sleep => Some(self.sleep_seconds(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::USleep => Some(self.usleep_usecs(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::MachAbsoluteTime => Some(self.mach_absolute_time()?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::MachTimebaseInfo => Some(self.mach_timebase_info(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetRLimit => Some(self.getrlimit(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SetRLimit => Some(self.setrlimit(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Sysctl => Some(
-                self.sysctl(memory, args[0], args[1], args[2], args[3], args[4], args[5])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::SysctlByName => Some(
-                self.sysctlbyname(memory, args[0], args[1], args[2], args[3], args[4])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Umask => Some(self.umask(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FOpen => Some(self.fopen_path(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FdOpen => Some(self.fdopen_fd(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FClose => Some(self.fclose_stream(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FRead => Some(
-                self.fread_stream(memory, args[0], args[1], args[2], args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FWrite => Some(
-                self.fwrite_stream(memory, args[0], args[1], args[2], args[3])?
-                    .into(),
-            ),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FFlush => Some(self.fflush_stream(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FSeek => Some(self.fseek_stream(args[0], args[1], args[2])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FTell => Some(self.ftell_stream(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FGetS => Some(self.fgets_stream(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FPutS => Some(self.fputs_stream(memory, args[0], args[1])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FEOF => Some(self.feof_stream(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FError => Some(self.ferror_stream(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::ClearErr => Some(self.clearerr_stream(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Fileno => Some(self.fileno_stream(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Malloc => Some(self.malloc(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Calloc => Some(self.calloc(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Realloc => Some(self.realloc(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Free => Some(self.free(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::PosixMemalign => {
-                Some(self.posix_memalign(memory, args[0], args[1], args[2])?)
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::Memcpy => Some(self.memcpy(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Memmove => Some(self.memmove(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Memset => Some(self.memset(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Memcmp => Some(self.memcmp(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strlen => Some(self.strlen(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strcmp => Some(self.strcmp(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strncmp => Some(self.strncmp(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strcpy => Some(self.strcpy(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strncpy => Some(self.strncpy(memory, args[0], args[1], args[2])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strcat => Some(self.strcat(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strchr => Some(self.strchr(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strrchr => Some(self.strrchr(memory, args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Strdup => Some(self.strdup(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::OpenDir => Some(self.opendir_path(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::FdOpenDir => Some(self.fdopendir_fd(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::ReadDir => Some(self.readdir_handle(memory, args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::ReadDirR => {
-                Some(self.readdir_r_handle(memory, args[0], args[1], args[2])?)
-            }
-            #[cfg(target_os = "macos")]
-            HostImportKind::CloseDir => Some(self.closedir_handle(memory, args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::DirFd => Some(self.dirfd_handle(args[0])?.into()),
-            #[cfg(target_os = "macos")]
-            HostImportKind::RewindDir => Some(self.rewinddir_handle(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Telldir => Some(self.telldir_handle(args[0])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::Seekdir => Some(self.seekdir_handle(args[0], args[1])?),
-            #[cfg(target_os = "macos")]
-            HostImportKind::GetEntropy => {
-                Some(self.getentropy(memory, args[0], args[1] as usize)?.into())
-            }
+        {
+            let _ = (&mut *memory, symbol, args, stack_ptr);
+            None
         }
     }
 
@@ -884,14 +1216,29 @@ impl CompatibilityServices {
         flags: u64,
         mode: u64,
     ) -> Option<HostOpenResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_open_arg0(memory, path_ptr, flags, mode);
+            let result = proxy_host_open_arg0(memory, path_ptr, flags, mode);
+            let log_args = [
+                ("path_ptr", hex_arg(path_ptr)),
+                ("flags", hex_arg(flags)),
+                ("mode", format!("{mode:o}")),
+            ];
+            log_scope.open_result("direct", "open", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, path_ptr, flags, mode);
-            None
+            let result = None;
+            let log_args = [
+                ("path_ptr", hex_arg(path_ptr)),
+                ("flags", hex_arg(flags)),
+                ("mode", format!("{mode:o}")),
+            ];
+            log_scope.open_result("direct", "open", &log_args, &result);
+            result
         }
     }
 
@@ -903,15 +1250,37 @@ impl CompatibilityServices {
         register_mode: u64,
         stack_ptr: Option<u64>,
     ) -> Option<HostOpenResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
             let mode = arm64_variadic_open_mode(memory, flags, register_mode, stack_ptr);
-            return proxy_host_open_arg0(memory, path_ptr, flags, mode);
+            let result = proxy_host_open_arg0(memory, path_ptr, flags, mode);
+            let mut log_args = vec![
+                ("path_ptr", hex_arg(path_ptr)),
+                ("flags", hex_arg(flags)),
+                ("mode", format!("{mode:o}")),
+                ("register_mode", hex_arg(register_mode)),
+            ];
+            if let Some(stack_ptr) = stack_ptr {
+                log_args.push(("sp", hex_arg(stack_ptr)));
+            }
+            log_scope.open_result("direct", "open", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, path_ptr, flags, register_mode, stack_ptr);
-            None
+            let result = None;
+            let mut log_args = vec![
+                ("path_ptr", hex_arg(path_ptr)),
+                ("flags", hex_arg(flags)),
+                ("register_mode", hex_arg(register_mode)),
+            ];
+            if let Some(stack_ptr) = stack_ptr {
+                log_args.push(("sp", hex_arg(stack_ptr)));
+            }
+            log_scope.open_result("direct", "open", &log_args, &result);
+            result
         }
     }
 
@@ -923,14 +1292,31 @@ impl CompatibilityServices {
         flags: u64,
         mode: u64,
     ) -> Option<HostOpenResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_openat(memory, dirfd, path_ptr, flags, mode);
+            let result = proxy_host_openat(memory, dirfd, path_ptr, flags, mode);
+            let log_args = [
+                ("dirfd", dirfd.to_string()),
+                ("path_ptr", hex_arg(path_ptr)),
+                ("flags", hex_arg(flags)),
+                ("mode", format!("{mode:o}")),
+            ];
+            log_scope.open_result("direct", "openat", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, dirfd, path_ptr, flags, mode);
-            None
+            let result = None;
+            let log_args = [
+                ("dirfd", dirfd.to_string()),
+                ("path_ptr", hex_arg(path_ptr)),
+                ("flags", hex_arg(flags)),
+                ("mode", format!("{mode:o}")),
+            ];
+            log_scope.open_result("direct", "openat", &log_args, &result);
+            result
         }
     }
 
@@ -941,14 +1327,29 @@ impl CompatibilityServices {
         buf_ptr: u64,
         count: usize,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_read(memory, fd, buf_ptr, count);
+            let result = proxy_host_read(memory, fd, buf_ptr, count);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+            ];
+            log_scope.io_result("direct", "read", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, buf_ptr, count);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+            ];
+            log_scope.io_result("direct", "read", &log_args, &result);
+            result
         }
     }
 
@@ -959,38 +1360,75 @@ impl CompatibilityServices {
         buf_ptr: u64,
         count: usize,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_write(memory, fd, buf_ptr, count);
+            let result = proxy_host_write(memory, fd, buf_ptr, count);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+            ];
+            log_scope.io_result("direct", "write", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, buf_ptr, count);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+            ];
+            log_scope.io_result("direct", "write", &log_args, &result);
+            result
         }
     }
 
     pub fn close_fd(&self, fd: u64) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_close(fd);
+            let result = proxy_host_close(fd);
+            let log_args = [("fd", fd.to_string())];
+            log_scope.io_result("direct", "close", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = fd;
-            None
+            let result = None;
+            let log_args = [("fd", fd.to_string())];
+            log_scope.io_result("direct", "close", &log_args, &result);
+            result
         }
     }
 
     pub fn socket(&self, domain: u64, kind: u64, protocol: u64) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_socket(domain, kind, protocol);
+            let result = proxy_host_socket(domain, kind, protocol);
+            let log_args = [
+                ("domain", domain.to_string()),
+                ("type", kind.to_string()),
+                ("protocol", protocol.to_string()),
+            ];
+            log_scope.io_result("direct", "socket", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (domain, kind, protocol);
-            None
+            let result = None;
+            let log_args = [
+                ("domain", domain.to_string()),
+                ("type", kind.to_string()),
+                ("protocol", protocol.to_string()),
+            ];
+            log_scope.io_result("direct", "socket", &log_args, &result);
+            result
         }
     }
 
@@ -1001,14 +1439,29 @@ impl CompatibilityServices {
         sockaddr_ptr: u64,
         sockaddr_len: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_connect(memory, fd, sockaddr_ptr, sockaddr_len);
+            let result = proxy_host_connect(memory, fd, sockaddr_ptr, sockaddr_len);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+            ];
+            log_scope.io_result("direct", "connect", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, sockaddr_ptr, sockaddr_len);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+            ];
+            log_scope.io_result("direct", "connect", &log_args, &result);
+            result
         }
     }
 
@@ -1019,26 +1472,48 @@ impl CompatibilityServices {
         sockaddr_ptr: u64,
         sockaddr_len: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_bind(memory, fd, sockaddr_ptr, sockaddr_len);
+            let result = proxy_host_bind(memory, fd, sockaddr_ptr, sockaddr_len);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+            ];
+            log_scope.io_result("direct", "bind", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, sockaddr_ptr, sockaddr_len);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+            ];
+            log_scope.io_result("direct", "bind", &log_args, &result);
+            result
         }
     }
 
     pub fn listen_socket(&self, fd: u64, backlog: u64) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_listen(fd, backlog);
+            let result = proxy_host_listen(fd, backlog);
+            let log_args = [("fd", fd.to_string()), ("backlog", backlog.to_string())];
+            log_scope.io_result("direct", "listen", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (fd, backlog);
-            None
+            let result = None;
+            let log_args = [("fd", fd.to_string()), ("backlog", backlog.to_string())];
+            log_scope.io_result("direct", "listen", &log_args, &result);
+            result
         }
     }
 
@@ -1050,14 +1525,31 @@ impl CompatibilityServices {
         count: usize,
         flags: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_send(memory, fd, buf_ptr, count, flags);
+            let result = proxy_host_send(memory, fd, buf_ptr, count, flags);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "send", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, buf_ptr, count, flags);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "send", &log_args, &result);
+            result
         }
     }
 
@@ -1069,14 +1561,31 @@ impl CompatibilityServices {
         count: usize,
         flags: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_recv(memory, fd, buf_ptr, count, flags);
+            let result = proxy_host_recv(memory, fd, buf_ptr, count, flags);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "recv", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, buf_ptr, count, flags);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "recv", &log_args, &result);
+            result
         }
     }
 
@@ -1090,9 +1599,10 @@ impl CompatibilityServices {
         sockaddr_ptr: u64,
         sockaddr_len: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_sendto(
+            let result = proxy_host_sendto(
                 memory,
                 fd,
                 buf_ptr,
@@ -1101,6 +1611,16 @@ impl CompatibilityServices {
                 sockaddr_ptr,
                 sockaddr_len,
             );
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+            ];
+            log_scope.io_result("direct", "sendto", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1113,7 +1633,17 @@ impl CompatibilityServices {
                 sockaddr_ptr,
                 sockaddr_len,
             );
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+            ];
+            log_scope.io_result("direct", "sendto", &log_args, &result);
+            result
         }
     }
 
@@ -1127,9 +1657,10 @@ impl CompatibilityServices {
         sockaddr_ptr: u64,
         sockaddr_len_ptr: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_recvfrom(
+            let result = proxy_host_recvfrom(
                 memory,
                 fd,
                 buf_ptr,
@@ -1138,6 +1669,16 @@ impl CompatibilityServices {
                 sockaddr_ptr,
                 sockaddr_len_ptr,
             );
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "recvfrom", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1150,7 +1691,17 @@ impl CompatibilityServices {
                 sockaddr_ptr,
                 sockaddr_len_ptr,
             );
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("buf", hex_arg(buf_ptr)),
+                ("count", count.to_string()),
+                ("flags", hex_arg(flags)),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "recvfrom", &log_args, &result);
+            result
         }
     }
 
@@ -1161,14 +1712,29 @@ impl CompatibilityServices {
         msg_ptr: u64,
         flags: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_sendmsg(memory, fd, msg_ptr, flags);
+            let result = proxy_host_sendmsg(memory, fd, msg_ptr, flags);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("msg", hex_arg(msg_ptr)),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "sendmsg", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, msg_ptr, flags);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("msg", hex_arg(msg_ptr)),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "sendmsg", &log_args, &result);
+            result
         }
     }
 
@@ -1179,26 +1745,48 @@ impl CompatibilityServices {
         msg_ptr: u64,
         flags: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_recvmsg(memory, fd, msg_ptr, flags);
+            let result = proxy_host_recvmsg(memory, fd, msg_ptr, flags);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("msg", hex_arg(msg_ptr)),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "recvmsg", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, msg_ptr, flags);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("msg", hex_arg(msg_ptr)),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.io_result("direct", "recvmsg", &log_args, &result);
+            result
         }
     }
 
     pub fn shutdown_socket(&self, fd: u64, how: u64) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_shutdown(fd, how);
+            let result = proxy_host_shutdown(fd, how);
+            let log_args = [("fd", fd.to_string()), ("how", how.to_string())];
+            log_scope.io_result("direct", "shutdown", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (fd, how);
-            None
+            let result = None;
+            let log_args = [("fd", fd.to_string()), ("how", how.to_string())];
+            log_scope.io_result("direct", "shutdown", &log_args, &result);
+            result
         }
     }
 
@@ -1211,16 +1799,20 @@ impl CompatibilityServices {
         option_value_ptr: u64,
         option_len: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_setsockopt(
-                memory,
-                fd,
-                level,
-                option_name,
-                option_value_ptr,
-                option_len,
-            );
+            let result =
+                proxy_host_setsockopt(memory, fd, level, option_name, option_value_ptr, option_len);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("level", level.to_string()),
+                ("option", option_name.to_string()),
+                ("value", hex_arg(option_value_ptr)),
+                ("len", option_len.to_string()),
+            ];
+            log_scope.io_result("direct", "setsockopt", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1232,7 +1824,16 @@ impl CompatibilityServices {
                 option_value_ptr,
                 option_len,
             );
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("level", level.to_string()),
+                ("option", option_name.to_string()),
+                ("value", hex_arg(option_value_ptr)),
+                ("len", option_len.to_string()),
+            ];
+            log_scope.io_result("direct", "setsockopt", &log_args, &result);
+            result
         }
     }
 
@@ -1245,9 +1846,10 @@ impl CompatibilityServices {
         option_value_ptr: u64,
         option_len_ptr: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_getsockopt(
+            let result = proxy_host_getsockopt(
                 memory,
                 fd,
                 level,
@@ -1255,6 +1857,15 @@ impl CompatibilityServices {
                 option_value_ptr,
                 option_len_ptr,
             );
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("level", level.to_string()),
+                ("option", option_name.to_string()),
+                ("value", hex_arg(option_value_ptr)),
+                ("len_ptr", hex_arg(option_len_ptr)),
+            ];
+            log_scope.io_result("direct", "getsockopt", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1266,7 +1877,16 @@ impl CompatibilityServices {
                 option_value_ptr,
                 option_len_ptr,
             );
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("level", level.to_string()),
+                ("option", option_name.to_string()),
+                ("value", hex_arg(option_value_ptr)),
+                ("len_ptr", hex_arg(option_len_ptr)),
+            ];
+            log_scope.io_result("direct", "getsockopt", &log_args, &result);
+            result
         }
     }
 
@@ -1277,14 +1897,29 @@ impl CompatibilityServices {
         sockaddr_ptr: u64,
         sockaddr_len_ptr: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_accept(memory, fd, sockaddr_ptr, sockaddr_len_ptr);
+            let result = proxy_host_accept(memory, fd, sockaddr_ptr, sockaddr_len_ptr);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "accept", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, sockaddr_ptr, sockaddr_len_ptr);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "accept", &log_args, &result);
+            result
         }
     }
 
@@ -1295,14 +1930,29 @@ impl CompatibilityServices {
         sockaddr_ptr: u64,
         sockaddr_len_ptr: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_getpeername(memory, fd, sockaddr_ptr, sockaddr_len_ptr);
+            let result = proxy_host_getpeername(memory, fd, sockaddr_ptr, sockaddr_len_ptr);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "getpeername", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, sockaddr_ptr, sockaddr_len_ptr);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "getpeername", &log_args, &result);
+            result
         }
     }
 
@@ -1313,14 +1963,29 @@ impl CompatibilityServices {
         sockaddr_ptr: u64,
         sockaddr_len_ptr: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_getsockname(memory, fd, sockaddr_ptr, sockaddr_len_ptr);
+            let result = proxy_host_getsockname(memory, fd, sockaddr_ptr, sockaddr_len_ptr);
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "getsockname", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fd, sockaddr_ptr, sockaddr_len_ptr);
-            None
+            let result = None;
+            let log_args = [
+                ("fd", fd.to_string()),
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len_ptr", hex_arg(sockaddr_len_ptr)),
+            ];
+            log_scope.io_result("direct", "getsockname", &log_args, &result);
+            result
         }
     }
 
@@ -1332,14 +1997,31 @@ impl CompatibilityServices {
         protocol: u64,
         sv_ptr: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_socketpair(memory, domain, kind, protocol, sv_ptr);
+            let result = proxy_host_socketpair(memory, domain, kind, protocol, sv_ptr);
+            let log_args = [
+                ("domain", domain.to_string()),
+                ("type", kind.to_string()),
+                ("protocol", protocol.to_string()),
+                ("sv", hex_arg(sv_ptr)),
+            ];
+            log_scope.io_result("direct", "socketpair", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, domain, kind, protocol, sv_ptr);
-            None
+            let result = None;
+            let log_args = [
+                ("domain", domain.to_string()),
+                ("type", kind.to_string()),
+                ("protocol", protocol.to_string()),
+                ("sv", hex_arg(sv_ptr)),
+            ];
+            log_scope.io_result("direct", "socketpair", &log_args, &result);
+            result
         }
     }
 
@@ -1518,25 +2200,37 @@ impl CompatibilityServices {
         memory: &mut M,
         fds_ptr: u64,
     ) -> Option<HostIoResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_pipe(memory, fds_ptr);
+            let result = proxy_host_pipe(memory, fds_ptr);
+            let log_args = [("fds_ptr", hex_arg(fds_ptr))];
+            log_scope.io_result("direct", "pipe", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, fds_ptr);
-            None
+            let result = None;
+            let log_args = [("fds_ptr", hex_arg(fds_ptr))];
+            log_scope.io_result("direct", "pipe", &log_args, &result);
+            result
         }
     }
 
     pub fn pipe_pair(&self) -> Option<HostPipeResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_pipe_pair();
+            let result = proxy_host_pipe_pair();
+            log_scope.pipe_result("direct", "pipe_pair", &[], &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
-            None
+            let result = None;
+            log_scope.pipe_result("direct", "pipe_pair", &[], &result);
+            result
         }
     }
 
@@ -2036,14 +2730,32 @@ impl CompatibilityServices {
         hints_ptr: u64,
         result_ptr: u64,
     ) -> Option<HostCallResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_getaddrinfo(memory, node_ptr, service_ptr, hints_ptr, result_ptr);
+            let result =
+                proxy_host_getaddrinfo(memory, node_ptr, service_ptr, hints_ptr, result_ptr);
+            let log_args = [
+                ("node", hex_arg(node_ptr)),
+                ("service", hex_arg(service_ptr)),
+                ("hints", hex_arg(hints_ptr)),
+                ("result_ptr", hex_arg(result_ptr)),
+            ];
+            log_scope.call_result("direct", "getaddrinfo", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, node_ptr, service_ptr, hints_ptr, result_ptr);
-            None
+            let result = None;
+            let log_args = [
+                ("node", hex_arg(node_ptr)),
+                ("service", hex_arg(service_ptr)),
+                ("hints", hex_arg(hints_ptr)),
+                ("result_ptr", hex_arg(result_ptr)),
+            ];
+            log_scope.call_result("direct", "getaddrinfo", &log_args, &result);
+            result
         }
     }
 
@@ -2052,14 +2764,21 @@ impl CompatibilityServices {
         memory: &mut M,
         addrinfo_ptr: u64,
     ) -> Option<HostCallResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_freeaddrinfo(memory, addrinfo_ptr);
+            let result = proxy_host_freeaddrinfo(memory, addrinfo_ptr);
+            let log_args = [("addrinfo", hex_arg(addrinfo_ptr))];
+            log_scope.call_result("direct", "freeaddrinfo", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, addrinfo_ptr);
-            None
+            let result = None;
+            let log_args = [("addrinfo", hex_arg(addrinfo_ptr))];
+            log_scope.call_result("direct", "freeaddrinfo", &log_args, &result);
+            result
         }
     }
 
@@ -2090,9 +2809,10 @@ impl CompatibilityServices {
         service_len: u64,
         flags: u64,
     ) -> Option<HostCallResult> {
+        let log_scope = CompatLogScope::enter();
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_getnameinfo(
+            let result = proxy_host_getnameinfo(
                 memory,
                 sockaddr_ptr,
                 sockaddr_len,
@@ -2102,6 +2822,17 @@ impl CompatibilityServices {
                 service_len,
                 flags,
             );
+            let log_args = [
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+                ("host", hex_arg(host_ptr)),
+                ("host_len", host_len.to_string()),
+                ("service", hex_arg(service_ptr)),
+                ("service_len", service_len.to_string()),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.call_result("direct", "getnameinfo", &log_args, &result);
+            return result;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2115,7 +2846,18 @@ impl CompatibilityServices {
                 service_len,
                 flags,
             );
-            None
+            let result = None;
+            let log_args = [
+                ("sockaddr", hex_arg(sockaddr_ptr)),
+                ("sockaddr_len", sockaddr_len.to_string()),
+                ("host", hex_arg(host_ptr)),
+                ("host_len", host_len.to_string()),
+                ("service", hex_arg(service_ptr)),
+                ("service_len", service_len.to_string()),
+                ("flags", hex_arg(flags)),
+            ];
+            log_scope.call_result("direct", "getnameinfo", &log_args, &result);
+            result
         }
     }
 

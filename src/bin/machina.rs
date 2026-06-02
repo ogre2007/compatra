@@ -6,6 +6,27 @@ use machina::macos::{
 use machina::macos::{loader::consts::cpu_type, process_event, shared_trace_bus_for_mode_from_env};
 use machina::MachoBinary;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CompatLogOptions {
+    level: Option<String>,
+    filter: Option<String>,
+    preview_bytes: Option<String>,
+}
+
+impl CompatLogOptions {
+    fn apply_env(&self) {
+        if let Some(level) = &self.level {
+            std::env::set_var("MACHINA_COMPAT_LOG", level);
+        }
+        if let Some(filter) = &self.filter {
+            std::env::set_var("MACHINA_COMPAT_LOG_FILTER", filter);
+        }
+        if let Some(preview_bytes) = &self.preview_bytes {
+            std::env::set_var("MACHINA_COMPAT_LOG_PREVIEW_BYTES", preview_bytes);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn native_host_macho_cpu() -> Option<u32> {
     match std::env::consts::ARCH {
@@ -79,12 +100,35 @@ fn emulate_macos_binary_with_stub_resolver(
 }
 
 fn usage() -> &'static str {
-    "Usage: machina [--mode analysis|compat] [targets...]\n\nModes:\n  analysis  malware-analysis defaults with JSONL plugins and synthetic artifacts\n  compat    compatibility defaults without analysis bait data or detections"
+    "Usage: machina [--mode analysis|compat] [--compat-log off|summary|calls|verbose] [--compat-log-filter calls] [--compat-log-preview-bytes n] [targets...]\n\nModes:\n  analysis  malware-analysis defaults with JSONL plugins and synthetic artifacts\n  compat    compatibility defaults without analysis bait data or detections\n\nCompat logs are JSONL lines written to stderr. Filters are comma-separated normalized call names such as write,open,getaddrinfo."
 }
 
-fn parse_args(args: Vec<String>) -> Result<(RuntimeMode, Vec<String>), String> {
+fn parse_compat_log_level(value: String) -> Result<String, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" | "none" => Ok("off".to_string()),
+        "1" | "true" | "yes" | "summary" => Ok("summary".to_string()),
+        "call" | "calls" | "full" | "jsonl" | "on" => Ok("calls".to_string()),
+        "verbose" | "debug" => Ok("verbose".to_string()),
+        _ => Err(format!(
+            "--compat-log expects off, summary, calls, or verbose; got {value:?}"
+        )),
+    }
+}
+
+fn parse_preview_bytes(value: String) -> Result<String, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("--compat-log-preview-bytes expects an integer; got {value:?}"))?;
+    if parsed > 4096 {
+        return Err("--compat-log-preview-bytes must be <= 4096".to_string());
+    }
+    Ok(parsed.to_string())
+}
+
+fn parse_args(args: Vec<String>) -> Result<(RuntimeMode, CompatLogOptions, Vec<String>), String> {
     let mut mode = RuntimeMode::from_env()?;
     let mut targets = Vec::new();
+    let mut compat_log = CompatLogOptions::default();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         if arg == "--help" || arg == "-h" {
@@ -101,20 +145,41 @@ fn parse_args(args: Vec<String>) -> Result<(RuntimeMode, Vec<String>), String> {
             mode = value.parse()?;
         } else if let Some(value) = arg.strip_prefix("--mode=") {
             mode = value.parse()?;
+        } else if arg == "--compat-log" {
+            let value = iter
+                .next()
+                .ok_or_else(|| "--compat-log requires a value".to_string())?;
+            compat_log.level = Some(parse_compat_log_level(value)?);
+        } else if let Some(value) = arg.strip_prefix("--compat-log=") {
+            compat_log.level = Some(parse_compat_log_level(value.to_string())?);
+        } else if arg == "--compat-log-filter" {
+            compat_log.filter = Some(iter.next().ok_or_else(|| {
+                "--compat-log-filter requires a comma-separated value".to_string()
+            })?);
+        } else if let Some(value) = arg.strip_prefix("--compat-log-filter=") {
+            compat_log.filter = Some(value.to_string());
+        } else if arg == "--compat-log-preview-bytes" {
+            let value = iter
+                .next()
+                .ok_or_else(|| "--compat-log-preview-bytes requires a value".to_string())?;
+            compat_log.preview_bytes = Some(parse_preview_bytes(value)?);
+        } else if let Some(value) = arg.strip_prefix("--compat-log-preview-bytes=") {
+            compat_log.preview_bytes = Some(parse_preview_bytes(value.to_string())?);
         } else {
             targets.push(arg);
         }
     }
-    Ok((mode, targets))
+    Ok((mode, compat_log, targets))
 }
 
 fn main() {
-    let (runtime_mode, target_args) = parse_args(std::env::args().skip(1).collect())
+    let (runtime_mode, compat_log, target_args) = parse_args(std::env::args().skip(1).collect())
         .unwrap_or_else(|msg| {
             eprintln!("{}", msg);
             eprintln!("{}", usage());
             std::process::exit(2);
         });
+    compat_log.apply_env();
     let targets = targets_from_args(&target_args).unwrap_or_else(|msg| {
         eprintln!("{}", msg);
         std::process::exit(2);
