@@ -661,6 +661,429 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_network_matrix_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_network_matrix_compat.c");
+    let binary = out_dir.join("arm64_network_matrix_compat");
+    fs::write(
+        &source,
+        r#"#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+typedef int (*accept_fn)(int, struct sockaddr *, socklen_t *);
+typedef int (*bind_fn)(int, const struct sockaddr *, socklen_t);
+typedef int (*connect_fn)(int, const struct sockaddr *, socklen_t);
+typedef void (*freeaddrinfo_fn)(struct addrinfo *);
+typedef const char *(*gai_strerror_fn)(int);
+typedef int (*getaddrinfo_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+typedef int (*getpeername_fn)(int, struct sockaddr *, socklen_t *);
+typedef int (*getsockname_fn)(int, struct sockaddr *, socklen_t *);
+typedef int (*getsockopt_fn)(int, int, int, void *, socklen_t *);
+typedef int (*listen_fn)(int, int);
+typedef int (*poll_fn)(struct pollfd *, nfds_t, int);
+typedef ssize_t (*recv_fn)(int, void *, size_t, int);
+typedef ssize_t (*recvfrom_fn)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+typedef ssize_t (*recvmsg_fn)(int, struct msghdr *, int);
+typedef ssize_t (*send_fn)(int, const void *, size_t, int);
+typedef ssize_t (*sendmsg_fn)(int, const struct msghdr *, int);
+typedef ssize_t (*sendto_fn)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+typedef int (*setsockopt_fn)(int, int, int, const void *, socklen_t);
+typedef int (*shutdown_fn)(int, int);
+typedef int (*socket_fn)(int, int, int);
+
+uint32_t htonl(uint32_t);
+uint16_t htons(uint16_t);
+uint32_t ntohl(uint32_t);
+uint16_t ntohs(uint16_t);
+
+static void loopback_addr(struct sockaddr_in *sin, unsigned short port) {
+    memset(sin, 0, sizeof(*sin));
+#ifdef __APPLE__
+    sin->sin_len = sizeof(*sin);
+#endif
+    sin->sin_family = AF_INET;
+    sin->sin_port = htons(port);
+    sin->sin_addr.s_addr = htonl(0x7f000001U);
+}
+
+static unsigned short sockaddr_port(const struct sockaddr_in *sin) {
+    return ntohs(sin->sin_port);
+}
+
+static int text_eq(const char *value, const char *expected, long len) {
+    if (len < 0) {
+        return 0;
+    }
+    long i = 0;
+    for (; expected[i] != 0; i++) {
+        if (i >= len || value[i] != expected[i]) {
+            return 0;
+        }
+    }
+    return len == i;
+}
+
+static int probe_resolver(const char *label, getaddrinfo_fn gai, freeaddrinfo_fn free_gai, gai_strerror_fn gai_err) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST;
+
+    struct addrinfo *res = 0;
+    int ok_ret = gai("127.0.0.1", "443", &hints, &res);
+    int family = res ? res->ai_family : -1;
+    int socktype = res ? res->ai_socktype : -1;
+    unsigned addrlen = res ? (unsigned)res->ai_addrlen : 0;
+    printf("compat netmatrix resolver %s ok_ret=%d ptr=%p family=%d socktype=%d addrlen=%u\n", label, ok_ret, res, family, socktype, addrlen);
+    if (res) {
+        free_gai(res);
+    }
+
+    struct addrinfo *bad_res = 0;
+    int bad_ret = gai("not-a-numeric-address", "443", &hints, &bad_res);
+    const char *message = gai_err(bad_ret);
+    printf("compat netmatrix resolver %s bad_ret=%d err=%s bad_ptr=%p\n", label, bad_ret, message ? message : "<null>", bad_res);
+    if (bad_res) {
+        free_gai(bad_res);
+    }
+    return ok_ret == 0 && family == AF_INET && bad_ret != 0 && message && message[0] ? 0 : 10;
+}
+
+static int probe_udp(
+    const char *label,
+    socket_fn socket_impl,
+    bind_fn bind_impl,
+    getsockname_fn getsockname_impl,
+    sendto_fn sendto_impl,
+    recvfrom_fn recvfrom_impl,
+    sendmsg_fn sendmsg_impl,
+    recvmsg_fn recvmsg_impl,
+    setsockopt_fn setsockopt_impl,
+    getsockopt_fn getsockopt_impl,
+    poll_fn poll_impl
+) {
+    int failures = 0;
+    int recv_fd = socket_impl(AF_INET, SOCK_DGRAM, 0);
+    int send_fd = socket_impl(AF_INET, SOCK_DGRAM, 0);
+    int one = 1;
+    int set_ret = recv_fd >= 0 ? setsockopt_impl(recv_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) : -1;
+    int opt_value = 0;
+    socklen_t opt_len = sizeof(opt_value);
+    int get_ret = recv_fd >= 0 ? getsockopt_impl(recv_fd, SOL_SOCKET, SO_REUSEADDR, &opt_value, &opt_len) : -1;
+
+    struct sockaddr_in recv_addr;
+    struct sockaddr_in send_addr;
+    loopback_addr(&recv_addr, 0);
+    loopback_addr(&send_addr, 0);
+    int recv_bind = recv_fd >= 0 ? bind_impl(recv_fd, (struct sockaddr *)&recv_addr, sizeof(recv_addr)) : -1;
+    int send_bind = send_fd >= 0 ? bind_impl(send_fd, (struct sockaddr *)&send_addr, sizeof(send_addr)) : -1;
+    socklen_t recv_addr_len = sizeof(recv_addr);
+    socklen_t send_addr_len = sizeof(send_addr);
+    int recv_name = recv_fd >= 0 ? getsockname_impl(recv_fd, (struct sockaddr *)&recv_addr, &recv_addr_len) : -1;
+    int send_name = send_fd >= 0 ? getsockname_impl(send_fd, (struct sockaddr *)&send_addr, &send_addr_len) : -1;
+
+    struct pollfd pfd;
+    pfd.fd = recv_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int poll_empty = recv_fd >= 0 ? poll_impl(&pfd, 1, 0) : -1;
+    short empty_revents = pfd.revents;
+
+    const char udp_text[] = "udp-one";
+    long sent = send_fd >= 0 ? (long)sendto_impl(send_fd, udp_text, sizeof(udp_text) - 1, 0, (struct sockaddr *)&recv_addr, sizeof(recv_addr)) : -1;
+    pfd.fd = recv_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int poll_ready = recv_fd >= 0 ? poll_impl(&pfd, 1, 1000) : -1;
+    short ready_revents = pfd.revents;
+
+    char recv_buf[64] = {0};
+    struct sockaddr_in src_addr;
+    memset(&src_addr, 0, sizeof(src_addr));
+    socklen_t src_len = sizeof(src_addr);
+    long got = recv_fd >= 0 ? (long)recvfrom_impl(recv_fd, recv_buf, sizeof(recv_buf) - 1, 0, (struct sockaddr *)&src_addr, &src_len) : -1;
+    if (got >= 0 && got < (long)sizeof(recv_buf)) {
+        recv_buf[got] = 0;
+    }
+    printf(
+        "compat netmatrix udp %s fds=%d,%d bind=%d/%d name=%d/%d ports=%u/%u opt=%d/%d/%d/%u poll=%d/0x%x,%d/0x%x sendto=%ld recvfrom=%ld text=%s srclen=%u srcport=%u errno=%d\n",
+        label,
+        recv_fd,
+        send_fd,
+        recv_bind,
+        send_bind,
+        recv_name,
+        send_name,
+        sockaddr_port(&recv_addr),
+        sockaddr_port(&send_addr),
+        set_ret,
+        get_ret,
+        opt_value,
+        (unsigned)opt_len,
+        poll_empty,
+        (unsigned)empty_revents,
+        poll_ready,
+        (unsigned)ready_revents,
+        sent,
+        got,
+        recv_buf,
+        (unsigned)src_len,
+        sockaddr_port(&src_addr),
+        errno
+    );
+    if (recv_fd < 0 || send_fd < 0 || recv_bind != 0 || send_bind != 0 || recv_name != 0 || send_name != 0 || sockaddr_port(&recv_addr) == 0 || sockaddr_port(&send_addr) == 0 || set_ret != 0 || get_ret != 0 || opt_len == 0 || poll_empty != 0 || poll_ready <= 0 || sent != 7 || got != 7 || !text_eq(recv_buf, "udp-one", got) || src_len == 0 || sockaddr_port(&src_addr) == 0) {
+        failures += 20;
+    }
+
+    const char left[] = "msg-";
+    const char right[] = "udp";
+    struct iovec out_iov[2];
+    out_iov[0].iov_base = (void *)left;
+    out_iov[0].iov_len = 4;
+    out_iov[1].iov_base = (void *)right;
+    out_iov[1].iov_len = 3;
+    struct msghdr out_msg;
+    memset(&out_msg, 0, sizeof(out_msg));
+    out_msg.msg_name = &recv_addr;
+    out_msg.msg_namelen = sizeof(recv_addr);
+    out_msg.msg_iov = out_iov;
+    out_msg.msg_iovlen = 2;
+    long msg_sent = send_fd >= 0 ? (long)sendmsg_impl(send_fd, &out_msg, 0) : -1;
+
+    char msg_a[8] = {0};
+    char msg_b[8] = {0};
+    struct iovec in_iov[2];
+    in_iov[0].iov_base = msg_a;
+    in_iov[0].iov_len = 4;
+    in_iov[1].iov_base = msg_b;
+    in_iov[1].iov_len = 3;
+    struct sockaddr_in msg_src;
+    memset(&msg_src, 0, sizeof(msg_src));
+    struct msghdr in_msg;
+    memset(&in_msg, 0, sizeof(in_msg));
+    in_msg.msg_name = &msg_src;
+    in_msg.msg_namelen = sizeof(msg_src);
+    in_msg.msg_iov = in_iov;
+    in_msg.msg_iovlen = 2;
+    long msg_got = recv_fd >= 0 ? (long)recvmsg_impl(recv_fd, &in_msg, 0) : -1;
+    printf(
+        "compat netmatrix udp-msg %s sendmsg=%ld recvmsg=%ld text=%s%s namelen=%u srcport=%u flags=0x%x errno=%d\n",
+        label,
+        msg_sent,
+        msg_got,
+        msg_a,
+        msg_b,
+        (unsigned)in_msg.msg_namelen,
+        sockaddr_port(&msg_src),
+        (unsigned)in_msg.msg_flags,
+        errno
+    );
+    if (msg_sent != 7 || msg_got != 7 || msg_a[0] != 'm' || msg_a[1] != 's' || msg_a[2] != 'g' || msg_a[3] != '-' || msg_b[0] != 'u' || msg_b[1] != 'd' || msg_b[2] != 'p' || in_msg.msg_namelen == 0 || sockaddr_port(&msg_src) == 0) {
+        failures += 30;
+    }
+
+    if (recv_fd >= 0) {
+        close(recv_fd);
+    }
+    if (send_fd >= 0) {
+        close(send_fd);
+    }
+    return failures;
+}
+
+static int probe_tcp(
+    const char *label,
+    socket_fn socket_impl,
+    setsockopt_fn setsockopt_impl,
+    bind_fn bind_impl,
+    getsockname_fn getsockname_impl,
+    listen_fn listen_impl,
+    connect_fn connect_impl,
+    accept_fn accept_impl,
+    getpeername_fn getpeername_impl,
+    send_fn send_impl,
+    recv_fn recv_impl,
+    shutdown_fn shutdown_impl
+) {
+    int failures = 0;
+    int listener = socket_impl(AF_INET, SOCK_STREAM, 0);
+    int client = socket_impl(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    int set_ret = listener >= 0 ? setsockopt_impl(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) : -1;
+    struct sockaddr_in listen_addr;
+    loopback_addr(&listen_addr, 0);
+    int bind_ret = listener >= 0 ? bind_impl(listener, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) : -1;
+    socklen_t listen_len = sizeof(listen_addr);
+    int name_ret = listener >= 0 ? getsockname_impl(listener, (struct sockaddr *)&listen_addr, &listen_len) : -1;
+    int listen_ret = listener >= 0 ? listen_impl(listener, 1) : -1;
+    int connect_ret = client >= 0 ? connect_impl(client, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) : -1;
+    struct sockaddr_in accepted_peer;
+    memset(&accepted_peer, 0, sizeof(accepted_peer));
+    socklen_t accepted_peer_len = sizeof(accepted_peer);
+    int accepted = listener >= 0 ? accept_impl(listener, (struct sockaddr *)&accepted_peer, &accepted_peer_len) : -1;
+    struct sockaddr_in accepted_peer_check;
+    memset(&accepted_peer_check, 0, sizeof(accepted_peer_check));
+    socklen_t accepted_peer_check_len = sizeof(accepted_peer_check);
+    int peer_ret = accepted >= 0 ? getpeername_impl(accepted, (struct sockaddr *)&accepted_peer_check, &accepted_peer_check_len) : -1;
+
+    const char client_text[] = "tcp-ok";
+    char server_buf[32] = {0};
+    long client_sent = client >= 0 ? (long)send_impl(client, client_text, sizeof(client_text) - 1, 0) : -1;
+    long server_got = accepted >= 0 ? (long)recv_impl(accepted, server_buf, sizeof(server_buf) - 1, 0) : -1;
+    if (server_got >= 0 && server_got < (long)sizeof(server_buf)) {
+        server_buf[server_got] = 0;
+    }
+    const char server_text[] = "reply";
+    char client_buf[32] = {0};
+    long server_sent = accepted >= 0 ? (long)send_impl(accepted, server_text, sizeof(server_text) - 1, 0) : -1;
+    long client_got = client >= 0 ? (long)recv_impl(client, client_buf, sizeof(client_buf) - 1, 0) : -1;
+    if (client_got >= 0 && client_got < (long)sizeof(client_buf)) {
+        client_buf[client_got] = 0;
+    }
+    int shutdown_ret = client >= 0 ? shutdown_impl(client, SHUT_RDWR) : -1;
+
+    printf(
+        "compat netmatrix tcp %s fds=%d,%d,%d set=%d bind=%d name=%d port=%u listen=%d connect=%d accept=%d peer=%d peerlen=%u peerport=%u sendrecv=%ld/%ld/%s reply=%ld/%ld/%s shutdown=%d errno=%d\n",
+        label,
+        listener,
+        client,
+        accepted,
+        set_ret,
+        bind_ret,
+        name_ret,
+        sockaddr_port(&listen_addr),
+        listen_ret,
+        connect_ret,
+        accepted,
+        peer_ret,
+        (unsigned)accepted_peer_check_len,
+        sockaddr_port(&accepted_peer_check),
+        client_sent,
+        server_got,
+        server_buf,
+        server_sent,
+        client_got,
+        client_buf,
+        shutdown_ret,
+        errno
+    );
+    if (listener < 0 || client < 0 || accepted < 0 || set_ret != 0 || bind_ret != 0 || name_ret != 0 || sockaddr_port(&listen_addr) == 0 || listen_ret != 0 || connect_ret != 0 || peer_ret != 0 || accepted_peer_check_len == 0 || sockaddr_port(&accepted_peer_check) == 0 || client_sent != 6 || server_got != 6 || !text_eq(server_buf, "tcp-ok", server_got) || server_sent != 5 || client_got != 5 || !text_eq(client_buf, "reply", client_got) || shutdown_ret != 0) {
+        failures += 40;
+    }
+
+    if (accepted >= 0) {
+        close(accepted);
+    }
+    if (client >= 0) {
+        close(client);
+    }
+    if (listener >= 0) {
+        close(listener);
+    }
+    return failures;
+}
+
+int main(void) {
+    int failures = 0;
+    failures += probe_resolver("static", getaddrinfo, freeaddrinfo, gai_strerror);
+    failures += probe_udp("static", socket, bind, getsockname, sendto, recvfrom, sendmsg, recvmsg, setsockopt, getsockopt, poll);
+
+    void *self = dlopen(NULL, RTLD_NOW);
+    accept_fn dyn_accept = (accept_fn)dlsym(self, "accept");
+    bind_fn dyn_bind = (bind_fn)dlsym(self, "bind");
+    connect_fn dyn_connect = (connect_fn)dlsym(self, "connect");
+    freeaddrinfo_fn dyn_free = (freeaddrinfo_fn)dlsym(self, "freeaddrinfo");
+    gai_strerror_fn dyn_gai_err = (gai_strerror_fn)dlsym(self, "gai_strerror");
+    getaddrinfo_fn dyn_gai = (getaddrinfo_fn)dlsym(self, "getaddrinfo");
+    getpeername_fn dyn_getpeername = (getpeername_fn)dlsym(self, "getpeername");
+    getsockname_fn dyn_getsockname = (getsockname_fn)dlsym(self, "getsockname");
+    getsockopt_fn dyn_getsockopt = (getsockopt_fn)dlsym(self, "getsockopt");
+    listen_fn dyn_listen = (listen_fn)dlsym(self, "listen");
+    poll_fn dyn_poll = (poll_fn)dlsym(self, "poll");
+    recv_fn dyn_recv = (recv_fn)dlsym(self, "recv");
+    recvfrom_fn dyn_recvfrom = (recvfrom_fn)dlsym(self, "recvfrom");
+    recvmsg_fn dyn_recvmsg = (recvmsg_fn)dlsym(self, "recvmsg");
+    send_fn dyn_send = (send_fn)dlsym(self, "send");
+    sendmsg_fn dyn_sendmsg = (sendmsg_fn)dlsym(self, "sendmsg");
+    sendto_fn dyn_sendto = (sendto_fn)dlsym(self, "sendto");
+    setsockopt_fn dyn_setsockopt = (setsockopt_fn)dlsym(self, "setsockopt");
+    shutdown_fn dyn_shutdown = (shutdown_fn)dlsym(self, "shutdown");
+    socket_fn dyn_socket = (socket_fn)dlsym(self, "socket");
+    printf(
+        "compat netmatrix dlsym accept=%p bind=%p connect=%p gai=%p gaierr=%p getpeer=%p getsock=%p getopt=%p listen=%p poll=%p recv=%p recvfrom=%p recvmsg=%p send=%p sendmsg=%p sendto=%p setopt=%p shutdown=%p socket=%p\n",
+        (void *)dyn_accept,
+        (void *)dyn_bind,
+        (void *)dyn_connect,
+        (void *)dyn_gai,
+        (void *)dyn_gai_err,
+        (void *)dyn_getpeername,
+        (void *)dyn_getsockname,
+        (void *)dyn_getsockopt,
+        (void *)dyn_listen,
+        (void *)dyn_poll,
+        (void *)dyn_recv,
+        (void *)dyn_recvfrom,
+        (void *)dyn_recvmsg,
+        (void *)dyn_send,
+        (void *)dyn_sendmsg,
+        (void *)dyn_sendto,
+        (void *)dyn_setsockopt,
+        (void *)dyn_shutdown,
+        (void *)dyn_socket
+    );
+    if (!dyn_accept || !dyn_bind || !dyn_connect || !dyn_free || !dyn_gai_err || !dyn_gai || !dyn_getpeername || !dyn_getsockname || !dyn_getsockopt || !dyn_listen || !dyn_poll || !dyn_recv || !dyn_recvfrom || !dyn_recvmsg || !dyn_send || !dyn_sendmsg || !dyn_sendto || !dyn_setsockopt || !dyn_shutdown || !dyn_socket) {
+        failures += 50;
+    } else {
+        failures += probe_resolver("dlsym", dyn_gai, dyn_free, dyn_gai_err);
+        failures += probe_udp("dlsym", dyn_socket, dyn_bind, dyn_getsockname, dyn_sendto, dyn_recvfrom, dyn_sendmsg, dyn_recvmsg, dyn_setsockopt, dyn_getsockopt, dyn_poll);
+        failures += probe_tcp("dlsym", dyn_socket, dyn_setsockopt, dyn_bind, dyn_getsockname, dyn_listen, dyn_connect, dyn_accept, dyn_getpeername, dyn_send, dyn_recv, dyn_shutdown);
+    }
+    dlclose(self);
+    printf("compat netmatrix summary failures=%d\n", failures);
+    return failures == 0 ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 network matrix fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 network matrix fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 network matrix fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_fd_fixture() -> (PathBuf, PathBuf) {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -2605,6 +3028,89 @@ fn compat_mode_proxies_network_resolver_and_socket_imports() {
     assert!(
         stdout.contains("compat socketpair io sent=6 recv=6 text=net-ok"),
         "network fixture did not send and receive through host-proxied dynamic socket imports; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "deep Intel macOS network compatibility matrix; CI opts in with --include-ignored"]
+fn compat_mode_network_stack_matrix_manual() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode network matrix on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_network_matrix_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "long")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let proof_lines = stdout
+        .lines()
+        .filter(|line| line.contains("compat netmatrix"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    eprintln!(
+        "compat proof(netmatrix): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(netmatrix): status={status}");
+    eprintln!("compat proof(netmatrix): lines:\n{proof_lines}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(netmatrix): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "network matrix fixture exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("compat netmatrix resolver static ok_ret=0")
+            && stdout.contains("compat netmatrix resolver dlsym ok_ret=0"),
+        "network matrix did not complete resolver checks; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat netmatrix udp static")
+            && stdout.contains("sendto=7 recvfrom=7 text=udp-one")
+            && stdout.contains("compat netmatrix udp dlsym"),
+        "network matrix did not complete UDP sendto/recvfrom checks; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat netmatrix udp-msg static sendmsg=7 recvmsg=7 text=msg-udp")
+            && stdout.contains("compat netmatrix udp-msg dlsym sendmsg=7 recvmsg=7 text=msg-udp"),
+        "network matrix did not complete UDP sendmsg/recvmsg address checks; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat netmatrix tcp dlsym")
+            && stdout.contains("sendrecv=6/6/tcp-ok")
+            && stdout.contains("reply=5/5/reply")
+            && stdout.contains("shutdown=0"),
+        "network matrix did not complete TCP connect/accept/getpeername checks; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat netmatrix summary failures=0"),
+        "network matrix reported failures; stdout:\n{stdout}"
     );
 }
 

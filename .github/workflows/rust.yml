@@ -37,7 +37,7 @@ jobs:
           exit 1
         fi
     - name: Build and test compat utility with proof output
-      run: cargo test --release --no-default-features --test compat_mode_macos --verbose -- --nocapture
+      run: cargo test --release --no-default-features --test compat_mode_macos --verbose -- --include-ignored --nocapture
     - name: Package Intel macOS compatibility utility
       run: |
         test -x target/release/machina-compat

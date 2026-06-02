@@ -4702,7 +4702,10 @@ fn proxy_host_connect<M: GuestMemory + ?Sized>(
     sockaddr_ptr: u64,
     sockaddr_len: u64,
 ) -> Option<HostIoResult> {
-    let (storage, len) = read_sockaddr_storage(memory, sockaddr_ptr, sockaddr_len)?;
+    let (storage, len) = match read_sockaddr_storage(memory, sockaddr_ptr, sockaddr_len) {
+        Some(value) => value,
+        None => return Some(host_io_error(libc::EFAULT as u32)),
+    };
     clear_errno();
     let ret = unsafe {
         libc::connect(
@@ -4721,7 +4724,10 @@ fn proxy_host_bind<M: GuestMemory + ?Sized>(
     sockaddr_ptr: u64,
     sockaddr_len: u64,
 ) -> Option<HostIoResult> {
-    let (storage, len) = read_sockaddr_storage(memory, sockaddr_ptr, sockaddr_len)?;
+    let (storage, len) = match read_sockaddr_storage(memory, sockaddr_ptr, sockaddr_len) {
+        Some(value) => value,
+        None => return Some(host_io_error(libc::EFAULT as u32)),
+    };
     clear_errno();
     let ret = unsafe {
         libc::bind(
@@ -4838,7 +4844,10 @@ fn proxy_host_sendto<M: GuestMemory + ?Sized>(
             }
         }
     };
-    let (storage, len) = read_sockaddr_storage(memory, sockaddr_ptr, sockaddr_len)?;
+    let (storage, len) = match read_sockaddr_storage(memory, sockaddr_ptr, sockaddr_len) {
+        Some(value) => value,
+        None => return Some(host_io_error(libc::EFAULT as u32)),
+    };
     clear_errno();
     let ret = unsafe {
         libc::sendto(
@@ -4898,8 +4907,12 @@ fn proxy_host_recvfrom<M: GuestMemory + ?Sized>(
             .min(mem::size_of::<libc::sockaddr_storage>());
         let sockaddr_bytes =
             unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), sockaddr_copy_len) };
-        let _ = memory.write_memory(sockaddr_ptr, sockaddr_bytes);
-        let _ = write_socklen(memory, sockaddr_len_ptr, addr_len);
+        if sockaddr_copy_len > 0 && memory.write_memory(sockaddr_ptr, sockaddr_bytes).is_err() {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
+        if write_socklen(memory, sockaddr_len_ptr, addr_len).is_err() {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
         data.truncate(len.min(128));
     } else {
         data.clear();
@@ -5146,9 +5159,10 @@ fn proxy_host_setsockopt<M: GuestMemory + ?Sized>(
     let option_data = if option_len == 0 {
         Vec::new()
     } else {
-        memory
-            .read_memory(option_value_ptr, option_len as usize)
-            .ok()?
+        match memory.read_memory(option_value_ptr, option_len as usize) {
+            Ok(data) => data,
+            Err(_) => return Some(host_io_error(libc::EFAULT as u32)),
+        }
     };
     clear_errno();
     let ret = unsafe {
@@ -5175,7 +5189,13 @@ fn proxy_host_getsockopt<M: GuestMemory + ?Sized>(
     option_value_ptr: u64,
     option_len_ptr: u64,
 ) -> Option<HostIoResult> {
-    let requested_len = read_socklen(memory, option_len_ptr)? as usize;
+    let requested_len = match read_socklen(memory, option_len_ptr) {
+        Some(value) => value as usize,
+        None => return Some(host_io_error(libc::EFAULT as u32)),
+    };
+    if option_value_ptr == 0 && requested_len > 0 {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
     let mut option_data = vec![0u8; requested_len];
     let mut option_len = requested_len as libc::socklen_t;
     clear_errno();
@@ -5190,8 +5210,16 @@ fn proxy_host_getsockopt<M: GuestMemory + ?Sized>(
     };
     if ret == 0 {
         let write_len = (option_len as usize).min(option_data.len());
-        let _ = memory.write_memory(option_value_ptr, &option_data[..write_len]);
-        let _ = write_socklen(memory, option_len_ptr, option_len);
+        if write_len > 0
+            && memory
+                .write_memory(option_value_ptr, &option_data[..write_len])
+                .is_err()
+        {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
+        if write_socklen(memory, option_len_ptr, option_len).is_err() {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
         option_data.truncate(write_len.min(128));
     } else {
         option_data.clear();
