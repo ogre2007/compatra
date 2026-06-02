@@ -5,8 +5,9 @@ repo. The intent is to keep direction stable across short, automated sessions.
 
 ## Project identity
 
-- Project name: `Machina` (Cargo package `machina`, lib `machina`, bins
-  `machina` and `machina-compat`).
+- Project name: `Machina` (Cargo package `machina`, lib `machina`, bin
+  `machina`; dedicated compat CLI package `machina-compat-cli`, bin
+  `machina-compat`).
 - Language: Rust, edition 2021.
 - Workspace architecture crates:
   - `crates/machina-arch` — architecture-neutral identifiers and traits.
@@ -23,6 +24,13 @@ repo. The intent is to keep direction stable across short, automated sessions.
   - `crates/machina-compat` — compatibility-only host proxy services behind a
     guest-memory trait; it must not depend on analysis services or the main
     `machina` crate.
+  - `crates/machina-compat-cli` — compatibility-only CLI and Intel macOS
+    integration tests. It depends on `crates/machina-runtime` with default
+    features disabled.
+  - `crates/machina-runtime` — macOS emulation runtime: Mach-O loader, Unicorn
+    wrapper, trace pipeline, runtime facades, arm64 execution flow, and
+    Apple/Darwin service modeling. The root `machina` crate re-exports this
+    public runtime API.
 - Scope: macOS `arm64` Mach-O userland emulation for malware analysis.
 - CPU backend: published `unicorn-engine` / `unicorn-engine-sys` crates (no
   vendored source, no submodule).
@@ -31,12 +39,14 @@ repo. The intent is to keep direction stable across short, automated sessions.
 
 ## Code organization rules
 
-`src/macos/mod.rs` is intentionally flat: each leaf file is declared once via
-`#[path = ".../foo.rs"] pub mod foo;` and then the grouped façades re-export
-the same modules under shorter names. When you add a new file:
+`crates/machina-runtime/src/macos/mod.rs` is intentionally flat: each leaf file
+is declared once via `#[path = ".../foo.rs"] pub mod foo;` and then the grouped
+façades re-export the same modules under shorter names. When you add a new
+file:
 
 1. Decide which group it belongs to (see below).
-2. Add the `#[path]` declaration in `src/macos/mod.rs`.
+2. Add the `#[path]` declaration in
+   `crates/machina-runtime/src/macos/mod.rs`.
 3. Re-export it from the matching group's `mod.rs` (`core`, `arch_arm64`,
    `analysis_arm64`, `platform_apple`, `guest_model`) using `pub use` so
    callers can keep importing through the façade.
@@ -45,25 +55,25 @@ the same modules under shorter names. When you add a new file:
 
 Group ownership:
 
-- `src/macos/core` — architecture-neutral orchestration, analysis-service
+- `crates/machina-runtime/src/macos/core` — architecture-neutral orchestration, analysis-service
   boundary (`analysis.rs`), compatibility-service boundary (`compat.rs`),
   tracing, plugin and runtime façades, batch
   emulation driver (`emulation.rs`), JSONL trace pipeline (`trace.rs`,
   `plugin_events.rs`, `runner_plugins.rs`).
-- `src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics,
+- `crates/machina-runtime/src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics,
   shared arm64 runtime state (`state.rs`), import-stub plumbing
   (`import_stubs.rs`), dynamic import trampolines (`dynamic_imports.rs`),
   LSE atomic / indirect-branch hooks, and arm64 `*_imports.rs` thunk groups
   that are required by both runtime modes.
-- `src/macos/analysis_arm64` — arm64-only analysis hooks and diagnostic shims
+- `crates/machina-runtime/src/macos/analysis_arm64` — arm64-only analysis hooks and diagnostic shims
   that are not part of the compatibility runtime. C++/libc++ synthetic hook
   models, fake analysis data symbols, and other operator-facing arm64 analysis
   glue belong here behind `AnalysisRuntimeHooks`/analysis-mode gating.
-- `src/macos/platform_apple` — CoreFoundation, Security, XPC, libobjc and
+- `crates/machina-runtime/src/macos/platform_apple` — CoreFoundation, Security, XPC, libobjc and
   other Apple-facing synthetic runtime services.
-- `src/macos/guest_model` — guest filesystem (`files.rs`), guest memory
+- `crates/machina-runtime/src/macos/guest_model` — guest filesystem (`files.rs`), guest memory
   (`memory.rs`), and synthetic OS-visible resources.
-- `src/macos/loader` — Mach-O parser, command/header decoding, and the
+- `crates/machina-runtime/src/macos/loader` — Mach-O parser, command/header decoding, and the
   no-dyld vs dyld load-path switch (`MACHINA_USE_DYLD`).
 
 Architecture-neutral logic should not live in `arch_arm64`. Prefer reusable
@@ -76,15 +86,17 @@ Unicorn hooks, trace events, guest filesystem, and Apple/Darwin service
 modeling in the main crate until their runtime dependencies are split cleanly.
 
 Analysis and compatibility behavior should not live in the same implementation
-module. `src/macos/core/analysis.rs`, `compat.rs`, `capture.rs`, `mode.rs`, and
-`src/macos/guest_model/analysis_artifacts.rs` are facades/adapters only; real
-behavior belongs in `crates/machina-analysis`, `crates/machina-compat`, or
-`crates/machina-mode`. Compatibility code must not emit detections, write
-captures, synthesize analyst bait data, or depend on the analysis crate.
+module. `crates/machina-runtime/src/macos/core/analysis.rs`, `compat.rs`,
+`capture.rs`, `mode.rs`, and
+`crates/machina-runtime/src/macos/guest_model/analysis_artifacts.rs` are
+facades/adapters only; real behavior belongs in `crates/machina-analysis`,
+`crates/machina-compat`, or `crates/machina-mode`. Compatibility code must not
+emit detections, write captures, synthesize analyst bait data, or depend on the
+analysis crate.
 If arm64 code needs analysis behavior, route it through
 `AnalysisRuntimeHooks` or an `analysis_arm64` module instead of storing
 capture state or parsing analysis-only env knobs directly in
-`src/macos/arch_arm64`.
+`crates/machina-runtime/src/macos/arch_arm64`.
 
 ## Logging rules
 
@@ -135,9 +147,9 @@ add new ones):
   source copies.
 - Do not introduce new architecture features into `unicorn-engine` unless
   the project scope changes explicitly.
-- `build.rs` is intentionally minimal: it only locates and copies
-  `unicorn.dll` on Windows builds. Do not extend it with project-specific
-  build logic.
+- `crates/machina-runtime/build.rs` is intentionally minimal: it only locates
+  and copies `unicorn.dll` on Windows builds. Do not extend it with
+  project-specific build logic.
 
 ## Sample corpus rules
 
@@ -168,15 +180,15 @@ add new ones):
   (`macos-15-intel`). The AMOS regression contract lives in
   `tests/amos_private_access.rs`, the RustDoor fast-mode contract lives in
   `tests/rustdoor_fast_mode.rs`, and the Intel macOS compatibility smoke
-  lives in `tests/compat_mode_macos.rs`.
+  lives in `crates/machina-compat-cli/tests/compat_mode_macos.rs`.
 - Canonical local smoke flow:
   - `cargo build --bin machina`
   - `cargo run --bin machina -- fixtures/macos/bin/arm64_hello`
-  - `cargo build --no-default-features --bin machina-compat` for the
-    compatibility-only utility
+  - `cargo build -p machina-compat-cli --no-default-features --bin machina-compat`
+    for the compatibility-only utility
   - `cargo test --test amos_private_access` for the AMOS regression
   - `cargo test --test rustdoor_fast_mode` for the RustDoor milestones
-  - `cargo test --release --no-default-features --test compat_mode_macos -- --nocapture`
+  - `cargo test -p machina-compat-cli --release --no-default-features --test compat_mode_macos -- --nocapture`
     on Intel macOS for compat mode
 
 ## Repo hygiene

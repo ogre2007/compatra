@@ -17,6 +17,8 @@ const HELLO_FIXTURE: &str = "fixtures/macos/bin/arm64_hello";
 #[cfg(target_os = "macos")]
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
 }
 
 #[cfg(target_os = "macos")]

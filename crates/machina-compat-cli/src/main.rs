@@ -1,10 +1,12 @@
-use machina::macos::{
+use machina_runtime::macos::{
     cpu_type_name, emulate_macos_binary_with_mode, macho_cputype, run_target_batch_with_mode,
     targets_from_args, MacosCpu, RuntimeMode,
 };
 #[cfg(target_os = "macos")]
-use machina::macos::{loader::consts::cpu_type, process_event, shared_trace_bus_for_mode_from_env};
-use machina::MachoBinary;
+use machina_runtime::macos::{
+    loader::consts::cpu_type, process_event, shared_trace_bus_for_mode_from_env,
+};
+use machina_runtime::MachoBinary;
 
 #[cfg(target_os = "macos")]
 fn native_host_macho_cpu() -> Option<u32> {
@@ -39,9 +41,13 @@ fn run_native_compatible_fat(binary_path: &str) -> Result<(), Box<dyn std::error
     let trace_bus = shared_trace_bus_for_mode_from_env(RuntimeMode::Compat);
     if let Some(bus) = &trace_bus {
         let _ = bus.send(
-            process_event(&machina::macos::TraceMetadata::new(), "native-fat", "exec")
-                .arg("Path", binary_path.to_string())
-                .arg("HostArch", std::env::consts::ARCH.to_string()),
+            process_event(
+                &machina_runtime::macos::TraceMetadata::new(),
+                "native-fat",
+                "exec",
+            )
+            .arg("Path", binary_path.to_string())
+            .arg("HostArch", std::env::consts::ARCH.to_string()),
         );
     }
     let status = std::process::Command::new(binary_path).status()?;

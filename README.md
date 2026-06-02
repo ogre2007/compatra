@@ -17,15 +17,15 @@ is:
 ## Repository layout
 
 - [src/bin/machina.rs](D:/dev/quiling/qiling/src/bin/machina.rs): analysis-capable CLI entrypoint
-- [src/bin/machina-compat.rs](D:/dev/quiling/qiling/src/bin/machina-compat.rs): compatibility-only CLI entrypoint for no-analysis builds
 - [crates/machina-mode](D:/dev/quiling/qiling/crates/machina-mode): shared `RuntimeMode` parsing and predicates
 - [crates/machina-analysis](D:/dev/quiling/qiling/crates/machina-analysis): analysis-only services, synthetic analysis artifacts, capture helpers, and built-in plugin preset specs
 - [crates/machina-compat](D:/dev/quiling/qiling/crates/machina-compat): compatibility-only host proxy services behind a guest-memory trait
-- [src/macos](D:/dev/quiling/qiling/src/macos): macOS emulation code
-- [src/macos/core/mod.rs](D:/dev/quiling/qiling/src/macos/core/mod.rs): architecture-neutral emulation pipeline, tracing, and runtime façades
-- [src/macos/arch_arm64/mod.rs](D:/dev/quiling/qiling/src/macos/arch_arm64/mod.rs): grouped view of arm64-specific modules
-- [src/macos/platform_apple/mod.rs](D:/dev/quiling/qiling/src/macos/platform_apple/mod.rs): grouped view of Apple compatibility layers
-- [src/macos/guest_model/mod.rs](D:/dev/quiling/qiling/src/macos/guest_model/mod.rs): grouped view of guest filesystem and memory helpers
+- [crates/machina-compat-cli](D:/dev/quiling/qiling/crates/machina-compat-cli): dedicated `machina-compat` CLI and Intel macOS compatibility tests
+- [crates/machina-runtime](D:/dev/quiling/qiling/crates/machina-runtime): macOS emulation runtime, loader, Unicorn wrapper, trace pipeline, and arm64 execution flow
+- [crates/machina-runtime/src/macos/core/mod.rs](D:/dev/quiling/qiling/crates/machina-runtime/src/macos/core/mod.rs): architecture-neutral emulation pipeline, tracing, and runtime façades
+- [crates/machina-runtime/src/macos/arch_arm64/mod.rs](D:/dev/quiling/qiling/crates/machina-runtime/src/macos/arch_arm64/mod.rs): grouped view of arm64-specific modules
+- [crates/machina-runtime/src/macos/platform_apple/mod.rs](D:/dev/quiling/qiling/crates/machina-runtime/src/macos/platform_apple/mod.rs): grouped view of Apple compatibility layers
+- [crates/machina-runtime/src/macos/guest_model/mod.rs](D:/dev/quiling/qiling/crates/machina-runtime/src/macos/guest_model/mod.rs): grouped view of guest filesystem and memory helpers
 - [fixtures](D:/dev/quiling/qiling/fixtures): development sample corpus and analysis notes
 - [docs/sample-status.md](D:/dev/quiling/qiling/docs/sample-status.md): current fixture status and observed behavior
 
@@ -35,8 +35,10 @@ Machina uses the published `unicorn-engine` / `unicorn-engine-sys` crates as
 normal Cargo dependencies.
 
 There is no vendored Unicorn source tree in the repository anymore, and Unicorn
-is not managed as a git submodule. [build.rs](D:/dev/quiling/qiling/build.rs)
-only handles Windows-side `unicorn.dll` placement after Cargo builds the crate.
+is not managed as a git submodule.
+[crates/machina-runtime/build.rs](D:/dev/quiling/qiling/crates/machina-runtime/build.rs)
+only handles Windows-side `unicorn.dll` placement after Cargo builds the runtime
+crate.
 
 ## Runtime modes
 
@@ -52,9 +54,9 @@ Runtime mode and Cargo features are related but not identical:
 
 - `cargo build --bin machina` builds the full analysis-capable binary. It can
   still run `--mode compat`, but the analysis crate is present in the build.
-- `cargo build --no-default-features --bin machina-compat` builds the dedicated
-  compatibility utility. It always runs compat mode and does not link
-  `machina-analysis`.
+- `cargo build -p machina-compat-cli --no-default-features --bin machina-compat`
+  builds the dedicated compatibility utility. It always runs compat mode and
+  does not link `machina-analysis`.
 - Compatibility mode is not a security boundary and does not add defensive
   isolation. It is a userland compatibility path that tries to proxy supported
   guest operations into host-backed helpers.
@@ -94,7 +96,7 @@ cargo build --bin machina
 The compatibility utility can be built without the default `analysis` feature:
 
 ```powershell
-cargo build --no-default-features --bin machina-compat
+cargo build -p machina-compat-cli --no-default-features --bin machina-compat
 ```
 
 ## Run
@@ -115,17 +117,17 @@ cargo run --bin machina -- --mode compat fixtures\macos\bin\arm64_hello
 For compatibility-only runs prefer the dedicated binary:
 
 ```powershell
-cargo run --no-default-features --bin machina-compat -- fixtures\macos\bin\arm64_hello
+cargo run -p machina-compat-cli --no-default-features --bin machina-compat -- fixtures\macos\bin\arm64_hello
 ```
 
 ## Local compat smoke check
 
-Compatibility mode is pinned by `tests/compat_mode_macos.rs`. The test is
-intended for Intel macOS, where host-library compatibility work can be
-validated:
+Compatibility mode is pinned by
+`crates/machina-compat-cli/tests/compat_mode_macos.rs`. The test is intended
+for Intel macOS, where host-library compatibility work can be validated:
 
 ```
-cargo test --release --no-default-features --test compat_mode_macos -- --nocapture
+cargo test -p machina-compat-cli --release --no-default-features --test compat_mode_macos -- --nocapture
 ```
 
 Use `-- --nocapture` when debugging CI or a local Intel macOS machine. The test
