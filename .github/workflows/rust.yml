@@ -16,9 +16,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
+    - name: Build and run tests
       run: cargo test --verbose
 
   macos-intel-compat:
@@ -38,12 +36,11 @@ jobs:
           cargo tree --no-default-features -e normal
           exit 1
         fi
-    - name: Build release compatibility utility without analysis feature
-      run: cargo build --release --no-default-features --bin machina-compat --verbose
-    - name: Run compat-mode smoke test with proof output
+    - name: Build and test compat utility with proof output
       run: cargo test --release --no-default-features --test compat_mode_macos --verbose -- --nocapture
     - name: Package Intel macOS compatibility utility
       run: |
+        test -x target/release/machina-compat
         mkdir -p dist
         cp target/release/machina-compat dist/machina-compat
         chmod +x dist/machina-compat

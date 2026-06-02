@@ -1,7 +1,7 @@
 # Machina
 
 `Machina` is a Rust project for emulating macOS `arm64` Mach-O binaries with a
-malware-analysis focus.
+malware-analysis and userland compatibility focus.
 
 The project is intentionally no longer a generic Qiling port. Its current scope
 is:
@@ -9,13 +9,18 @@ is:
 - `arm64` macOS userland binaries
 - Unicorn-backed CPU emulation
 - synthetic macOS runtime services
-- JSONL-first tracing and detection workflows
-- fixture-driven compatibility work against real samples, including stealers
+- two runtime modes: `analysis` for malware-analysis workflows and `compat`
+  for host-backed userland compatibility work
+- JSONL-first tracing in analysis mode
+- fixture-driven progress against real samples, including stealers
 
 ## Repository layout
 
 - [src/bin/machina.rs](D:/dev/quiling/qiling/src/bin/machina.rs): analysis-capable CLI entrypoint
 - [src/bin/machina-compat.rs](D:/dev/quiling/qiling/src/bin/machina-compat.rs): compatibility-only CLI entrypoint for no-analysis builds
+- [crates/machina-mode](D:/dev/quiling/qiling/crates/machina-mode): shared `RuntimeMode` parsing and predicates
+- [crates/machina-analysis](D:/dev/quiling/qiling/crates/machina-analysis): analysis-only services, synthetic analysis artifacts, capture helpers, and built-in plugin preset specs
+- [crates/machina-compat](D:/dev/quiling/qiling/crates/machina-compat): compatibility-only host proxy services behind a guest-memory trait
 - [src/macos](D:/dev/quiling/qiling/src/macos): macOS emulation code
 - [src/macos/core/mod.rs](D:/dev/quiling/qiling/src/macos/core/mod.rs): architecture-neutral emulation pipeline, tracing, and runtime façades
 - [src/macos/arch_arm64/mod.rs](D:/dev/quiling/qiling/src/macos/arch_arm64/mod.rs): grouped view of arm64-specific modules
@@ -33,6 +38,27 @@ There is no vendored Unicorn source tree in the repository anymore, and Unicorn
 is not managed as a git submodule. [build.rs](D:/dev/quiling/qiling/build.rs)
 only handles Windows-side `unicorn.dll` placement after Cargo builds the crate.
 
+## Runtime modes
+
+Machina has two runtime modes. The mode is selected by `--mode`, the shorthand
+flags `--analysis` / `--compat`, or `MACHINA_MODE`.
+
+| Mode | Entrypoint | Purpose | Behavior |
+| --- | --- | --- | --- |
+| `analysis` | `machina` | Malware-analysis runs against samples | Enables analysis services, synthetic analyst-visible guest data, capture/detection events, and built-in JSONL trace plugin presets. This is the default mode and the default Cargo feature set. |
+| `compat` | `machina` or `machina-compat` | Running arm64 macOS userland code with fewer analysis assumptions | Disables analysis-only synthetic artifacts, captures, detections, and built-in analysis plugin presets. Host-backed Darwin/libSystem import and raw syscall proxies are used where implemented. |
+
+Runtime mode and Cargo features are related but not identical:
+
+- `cargo build --bin machina` builds the full analysis-capable binary. It can
+  still run `--mode compat`, but the analysis crate is present in the build.
+- `cargo build --no-default-features --bin machina-compat` builds the dedicated
+  compatibility utility. It always runs compat mode and does not link
+  `machina-analysis`.
+- Compatibility mode is not a security boundary and does not add defensive
+  isolation. It is a userland compatibility path that tries to proxy supported
+  guest operations into host-backed helpers.
+
 ## Logging
 
 Default runtime output is expected to be structured JSONL through the trace bus.
@@ -41,9 +67,8 @@ debug output to be removed or gated over time.
 
 Useful knobs:
 
-- `MACHINA_MODE=analysis`: malware-analysis defaults; `compat` disables
-  analysis-only synthetic artifacts, captures, detections, and built-in trace
-  plugin presets
+- `MACHINA_MODE=analysis`: select analysis mode, the default
+- `MACHINA_MODE=compat`: select compatibility mode for the `machina` binary
 - `MACHINA_PLUGIN_TRACE=1`: enable plugin trace bus
 - `MACHINA_TRACE_FORMAT=jsonl`: force JSONL output
 - `MACHINA_TRACE_FORMAT=human`: legacy human-readable sink for debugging
@@ -74,11 +99,10 @@ cargo build --no-default-features --bin machina-compat
 cargo run --bin machina -- fixtures\macos\bin\arm64_hello
 ```
 
-Compatibility mode keeps the same arm64 userland execution path but uses
-non-analysis defaults. It is a userland compatibility path, not a security or
-analysis sandbox: selected Darwin/libSystem imports and raw `svc #0x80` syscall
-traps are proxied into host-backed helpers so small arm64 programs can make
-observable progress under an Intel macOS host.
+Compatibility mode keeps the same arm64 loader and execution path but uses
+non-analysis runtime services. Selected Darwin/libSystem imports and raw
+`svc #0x80` syscall traps are proxied into host-backed helpers so small arm64
+programs can make observable progress under an Intel macOS host.
 
 ```powershell
 cargo run --bin machina -- --mode compat fixtures\macos\bin\arm64_hello

@@ -416,6 +416,11 @@ typedef ssize_t (*recv_fn)(int, void *, size_t, int);
 typedef ssize_t (*sendmsg_fn)(int, const struct msghdr *, int);
 typedef ssize_t (*recvmsg_fn)(int, struct msghdr *, int);
 
+uint32_t htonl(uint32_t);
+uint16_t htons(uint16_t);
+uint32_t ntohl(uint32_t);
+uint16_t ntohs(uint16_t);
+
 static int probe_gai(const char *label, getaddrinfo_fn gai, freeaddrinfo_fn free_gai) {
     struct addrinfo hints = {0};
     struct addrinfo *res = 0;
