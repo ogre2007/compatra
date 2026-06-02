@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
@@ -16,6 +17,18 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Cache Cargo build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-${{ github.job }}-
     - name: Build and run tests
       run: cargo test --verbose
 
@@ -24,6 +37,18 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Cache Cargo build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-${{ github.job }}-
     - name: Verify Intel macOS runner
       run: |
         test "$(uname -s)" = "Darwin"
