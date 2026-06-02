@@ -105,6 +105,7 @@ fn build_mod_init_trampoline(
     //   sub sp, sp, #32                ; reserve scratch frame
     //   stp x0, x1, [sp]               ; save argc, argv
     //   str x2, [sp, #16]              ; save envp
+    //   str x30, [sp, #24]             ; save original return target
     //   ; per initializer:
     //   movz x16, #imm0
     //   movk x16, #imm1, lsl #16
@@ -114,6 +115,7 @@ fn build_mod_init_trampoline(
     //   ; after the last initializer:
     //   ldp x0, x1, [sp]
     //   ldr x2, [sp, #16]
+    //   ldr x30, [sp, #24]
     //   add sp, sp, #32
     //   movz x16, #imm0    ; <main>
     //   movk x16, #imm1, lsl #16
@@ -121,7 +123,7 @@ fn build_mod_init_trampoline(
     //   movk x16, #imm3, lsl #48
     //   br   x16
     //
-    // Each init = 6 instructions (24 bytes); prelude/epilogue =
+    // Each init = 5 instructions (20 bytes); prelude/epilogue =
     // 8 instructions (32 bytes); main jump = 5 instructions (20
     // bytes). Add a 4-byte ret guard at the tail for safety.
     let mut code: Vec<u8> = Vec::new();
@@ -129,7 +131,8 @@ fn build_mod_init_trampoline(
     // Prelude.
     code.extend_from_slice(&0xD10083FFu32.to_le_bytes()); // sub sp, sp, #32
     code.extend_from_slice(&0xA90007E0u32.to_le_bytes()); // stp x0, x1, [sp]
-    code.extend_from_slice(&0xF90008E2u32.to_le_bytes()); // str x2, [sp, #16]
+    code.extend_from_slice(&0xF9000BE2u32.to_le_bytes()); // str x2, [sp, #16]
+    code.extend_from_slice(&0xF9000FFEu32.to_le_bytes()); // str x30, [sp, #24]
 
     let emit_load_x16 = |code: &mut Vec<u8>, target: u64| {
         let imm0 = (target & 0xFFFF) as u32;
@@ -152,12 +155,15 @@ fn build_mod_init_trampoline(
         code.extend_from_slice(&0xD63F0200u32.to_le_bytes());
     }
 
-    // Epilogue: restore argc/argv/envp.
+    // Epilogue: restore argc/argv/envp and the original LR. The
+    // initializer BLR instructions clobber x30; without restoring it, main
+    // returns into this trampoline and repeats instead of reaching done_addr.
     code.extend_from_slice(&0xA94007E0u32.to_le_bytes()); // ldp x0, x1, [sp]
-    code.extend_from_slice(&0xF94008E2u32.to_le_bytes()); // ldr x2, [sp, #16]
+    code.extend_from_slice(&0xF9400BE2u32.to_le_bytes()); // ldr x2, [sp, #16]
+    code.extend_from_slice(&0xF9400FFEu32.to_le_bytes()); // ldr x30, [sp, #24]
     code.extend_from_slice(&0x910083FFu32.to_le_bytes()); // add sp, sp, #32
 
-    // Tail-call main via br x16 (LR already points at done_addr).
+    // Tail-call main via br x16 with LR restored to done_addr.
     emit_load_x16(&mut code, main_addr);
     code.extend_from_slice(&0xD61F0200u32.to_le_bytes()); // br x16
     code.extend_from_slice(&0xD65F03C0u32.to_le_bytes()); // ret (safety net)

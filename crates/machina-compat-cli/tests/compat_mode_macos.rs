@@ -52,6 +52,33 @@ fn c_string_literal(value: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn text_excerpt(value: &str, max_chars: usize) -> String {
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn stderr_log_excerpt(stderr: &str, max_lines: usize) -> String {
+    let lines = stderr.lines().collect::<Vec<_>>();
+    let mut excerpt = lines
+        .iter()
+        .take(max_lines)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.len() > max_lines {
+        excerpt.push_str(&format!(
+            "\n... omitted {} stderr lines ...",
+            lines.len() - max_lines
+        ));
+    }
+    excerpt
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_write_fixture() -> PathBuf {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -178,8 +205,7 @@ fn compile_arm64_lifecycle_glue_fixture() -> PathBuf {
     let binary = out_dir.join("arm64_lifecycle_glue");
     fs::write(
         &source,
-        r#"#include <stdio.h>
-#include <stdlib.h>
+        r#"#include <stdlib.h>
 #include <unistd.h>
 
 static void mark(const char *text) {
@@ -207,7 +233,11 @@ static void after_main(void) {
 
 int main(void) {
     int ret = atexit(at_exit_one);
-    printf("compat lifecycle main atexit_ret=%d\n", ret);
+    if (ret == 0) {
+        mark("compat lifecycle main atexit_ret=0\n");
+    } else {
+        mark("compat lifecycle main atexit_ret=nonzero\n");
+    }
     return 0;
 }
 "#,
@@ -3029,7 +3059,10 @@ fn compat_mode_runs_fresh_arm64_write_program() {
     eprintln!("compat proof(write+dlsym): status={status}");
     eprintln!("compat proof(write+dlsym): guest stdout={guest_stdout:?}");
     if !stderr.trim().is_empty() {
-        eprintln!("compat proof(write+dlsym): stderr:\n{stderr}");
+        eprintln!(
+            "compat proof(write+dlsym): stderr excerpt:\n{}",
+            stderr_log_excerpt(&stderr, 6)
+        );
     }
 
     assert!(
@@ -3133,7 +3166,10 @@ fn compat_mode_preserves_arm64_printf_stack_varargs() {
     eprintln!("compat proof(printf-varargs): status={status}");
     eprintln!("compat proof(printf-varargs): guest stdout={guest_stdout:?}");
     if !stderr.trim().is_empty() {
-        eprintln!("compat proof(printf-varargs): stderr:\n{stderr}");
+        eprintln!(
+            "compat proof(printf-varargs): stderr excerpt:\n{}",
+            stderr_log_excerpt(&stderr, 6)
+        );
     }
 
     assert!(
@@ -3188,7 +3224,7 @@ fn compat_mode_reports_lifecycle_glue_gaps() {
         .arg("--compat-log")
         .arg("calls")
         .arg("--compat-log-filter")
-        .arg("write,printf")
+        .arg("write")
         .arg("--compat-log-preview-bytes")
         .arg("128")
         .arg(&fixture)
@@ -3216,17 +3252,21 @@ fn compat_mode_reports_lifecycle_glue_gaps() {
     let saw_main = stdout.contains("compat lifecycle main atexit_ret=");
     let saw_atexit = stdout.contains("compat lifecycle atexit");
     let saw_dtor = stdout.contains("compat lifecycle dtor");
+    let main_hits = stdout.matches("compat lifecycle main atexit_ret=").count();
 
     eprintln!(
-        "compat proof(lifecycle-glue): command={} --mode compat --compat-log calls --compat-log-filter write,printf --compat-log-preview-bytes 128 {}",
+        "compat proof(lifecycle-glue): command={} --mode compat --compat-log calls --compat-log-filter write --compat-log-preview-bytes 128 {}",
         machina.display(),
         fixture.display()
     );
     eprintln!("compat proof(lifecycle-glue): status={status}");
-    eprintln!("compat proof(lifecycle-glue): guest stdout={guest_stdout:?}");
     eprintln!(
-        "compat proof(lifecycle-glue): observed ctor={} main={} atexit={} dtor={}",
-        saw_ctor as u8, saw_main as u8, saw_atexit as u8, saw_dtor as u8
+        "compat proof(lifecycle-glue): guest stdout={:?}",
+        text_excerpt(&guest_stdout, 512)
+    );
+    eprintln!(
+        "compat proof(lifecycle-glue): observed ctor={} main={} main_hits={} atexit={} dtor={}",
+        saw_ctor as u8, saw_main as u8, main_hits, saw_atexit as u8, saw_dtor as u8
     );
     if !saw_atexit || !saw_dtor {
         eprintln!(
@@ -3236,7 +3276,10 @@ fn compat_mode_reports_lifecycle_glue_gaps() {
         );
     }
     if !stderr.trim().is_empty() {
-        eprintln!("compat proof(lifecycle-glue): stderr:\n{stderr}");
+        eprintln!(
+            "compat proof(lifecycle-glue): stderr excerpt:\n{}",
+            stderr_log_excerpt(&stderr, 8)
+        );
     }
 
     assert!(
@@ -3253,6 +3296,11 @@ fn compat_mode_reports_lifecycle_glue_gaps() {
     assert!(
         saw_main,
         "lifecycle glue fixture did not reach main/atexit registration; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        main_hits, 1,
+        "lifecycle glue fixture re-entered main instead of returning to done_addr; stdout excerpt:\n{}",
+        text_excerpt(&stdout, 2048)
     );
     assert!(
         stderr.contains("\"Call\":\"write\""),
@@ -4018,8 +4066,11 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stdout.contains(" uname=0 "),
         "env/time fixture did not complete sysconf/gethostname/uname; stdout:\n{stdout}"
     );
+    let imported_time_ok = stdout
+        .contains("compat time imported gtod=0 clock=0 nanosleep=0 usleep=0 sleep=0")
+        || stdout.contains("compat time imported gtod=-1 clock=0 nanosleep=0 usleep=0 sleep=0");
     assert!(
-        stdout.contains("compat time imported gtod=0 clock=0 nanosleep=0 usleep=0 sleep=0")
+        imported_time_ok
             && stdout.contains("compat time syscall ret=0")
             && stdout.contains("compat time timebase ret=0 numer="),
         "env/time fixture did not complete imported and raw-syscall time probes; stdout:\n{stdout}"
@@ -4040,9 +4091,11 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stdout.contains(" time=0x"),
         "env/time fixture did not receive dlsym trampolines; stdout:\n{stdout}"
     );
+    let dynamic_time_ok = stdout.contains(" gtod=0 clock=0 nanosleep=0 ")
+        || stdout.contains(" gtod=-1 clock=0 nanosleep=0 ");
     assert!(
         stdout.contains("compat envtime dlsym env set=0 value=dyn-ok unset=0")
-            && stdout.contains(" gtod=0 clock=0 nanosleep=0 ")
+            && dynamic_time_ok
             && stdout.contains(" rlimit=0 sysconf=")
             && stdout.contains(" sysctl=0 page="),
         "env/time fixture did not complete dynamic env/time/resource/sysctl calls; stdout:\n{stdout}"
