@@ -3172,6 +3172,57 @@ pub fn process_chained_fixups_with_binary(
     Ok(stats)
 }
 
+pub fn chained_fixup_import_symbols(
+    binary: &crate::macos::loader::parser::MachoBinary,
+) -> Result<Vec<String>, MacOsError> {
+    let (blob_off, blob_size) = match binary.commands.iter().find_map(|c| match c {
+        LoadCommand::DyldChainedFixups(cf) => {
+            Some((cf.data_offset as usize, cf.data_size as usize))
+        }
+        _ => None,
+    }) {
+        Some(pair) => pair,
+        None => return Ok(Vec::new()),
+    };
+    let raw = &binary.data;
+    if blob_off
+        .checked_add(blob_size)
+        .map(|end| end > raw.len())
+        .unwrap_or(true)
+    {
+        return Err(MacOsError::LoaderError(
+            "chained-fixups blob extends past binary EOF".to_string(),
+        ));
+    }
+    let blob = &raw[blob_off..blob_off + blob_size];
+    if blob.len() < 28 {
+        return Err(MacOsError::LoaderError(
+            "chained-fixups header truncated".to_string(),
+        ));
+    }
+
+    let imports_offset = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
+    let symbols_offset = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
+    let imports_count = u32::from_le_bytes(blob[16..20].try_into().unwrap()) as usize;
+    let imports_format = u32::from_le_bytes(blob[20..24].try_into().unwrap());
+    let symbols_format = u32::from_le_bytes(blob[24..28].try_into().unwrap());
+    if symbols_format != 0 {
+        return Err(MacOsError::LoaderError(format!(
+            "chained-fixups symbols_format={} (only uncompressed=0 is supported)",
+            symbols_format
+        )));
+    }
+
+    let imports = parse_chained_fixup_imports(
+        blob,
+        imports_offset,
+        symbols_offset,
+        imports_count,
+        imports_format,
+    )?;
+    Ok(imports.into_iter().map(|(_, _, name)| name).collect())
+}
+
 /// Decode the chained-fixup imports table into `(lib_ordinal, weak, name)` triples.
 fn parse_chained_fixup_imports(
     blob: &[u8],
@@ -3582,4 +3633,52 @@ pub fn patch_macho_import_pointer_sections(
     }
 
     Ok((patched, mapped_to_syscall, unresolved_fallback))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macos::loader::command::{DyldChainedFixupsCommand, LoadCommand};
+    use crate::macos::loader::header::MachOMagic;
+    use crate::macos::loader::parser::MachoBinary;
+    use std::collections::HashMap;
+
+    #[test]
+    fn chained_fixup_import_symbols_reads_static_dyld_import_table() {
+        use crate::macos::loader::consts::dyld_chained_fixups::DYLD_CHAINED_IMPORT;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0u32.to_le_bytes()); // fixups_version
+        blob.extend_from_slice(&0u32.to_le_bytes()); // starts_offset
+        blob.extend_from_slice(&28u32.to_le_bytes()); // imports_offset
+        blob.extend_from_slice(&36u32.to_le_bytes()); // symbols_offset
+        blob.extend_from_slice(&2u32.to_le_bytes()); // imports_count
+        blob.extend_from_slice(&DYLD_CHAINED_IMPORT.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes()); // symbols_format
+
+        let first_import = 1u32;
+        let second_import = 1u32 | (7u32 << 9);
+        blob.extend_from_slice(&first_import.to_le_bytes());
+        blob.extend_from_slice(&second_import.to_le_bytes());
+        blob.extend_from_slice(b"_write\0_gettimeofday\0");
+
+        let data_size = blob.len() as u32;
+        let binary = MachoBinary {
+            data: blob,
+            magic: MachOMagic::Magic64,
+            header_64: None,
+            header_32: None,
+            commands: vec![LoadCommand::DyldChainedFixups(DyldChainedFixupsCommand {
+                data_offset: 0,
+                data_size,
+            })],
+            segments: Vec::new(),
+            entry_point: None,
+            is_driver: false,
+            segments_data: HashMap::new(),
+        };
+
+        let symbols = chained_fixup_import_symbols(&binary).unwrap();
+        assert_eq!(symbols, vec!["_write", "_gettimeofday"]);
+    }
 }

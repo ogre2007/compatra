@@ -311,7 +311,43 @@ pub fn emulate_macos_arm64_binary_with_mode(
     let done_addr = stub_region.done_addr;
     let thread_exit_stub = stub_region.thread_exit_stub.unwrap_or(done_addr);
 
-    let undefs = binary.get_undefined_symbols();
+    let mut undefs = binary.get_undefined_symbols();
+    let symtab_undef_count = undefs.len();
+    match crate::macos::imports::chained_fixup_import_symbols(&binary) {
+        Ok(chained_imports) => {
+            let chained_count = chained_imports.len();
+            let mut added = 0usize;
+            for name in chained_imports {
+                let normalized = crate::macos::imports::normalize_import_symbol(name.clone());
+                let already_present = undefs.iter().any(|(existing, _)| {
+                    existing == &name
+                        || crate::macos::imports::normalize_import_symbol(existing.clone())
+                            == normalized
+                });
+                if !already_present {
+                    undefs.push((name, 0));
+                    added += 1;
+                }
+            }
+            if let Some(bus) = &trace_bus {
+                let _ = bus.send(
+                    process_event(&metadata, "static-import-set", "static_import_set")
+                        .arg("SymtabUndefined", symtab_undef_count.to_string())
+                        .arg("ChainedImports", chained_count.to_string())
+                        .arg("Added", added.to_string())
+                        .arg("Total", undefs.len().to_string()),
+                );
+            }
+        }
+        Err(err) => {
+            if let Some(bus) = &trace_bus {
+                let _ = bus.send(
+                    process_event(&metadata, "static-import-set-error", "static_import_set")
+                        .arg("Error", format!("{}", err)),
+                );
+            }
+        }
+    }
     if let Some(bus) = &trace_bus {
         let preview = undefs
             .iter()
