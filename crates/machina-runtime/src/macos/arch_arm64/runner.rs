@@ -16,6 +16,7 @@ use crate::macos::process_imports::install_process_imports;
 use crate::macos::pthread_imports::install_pthread_imports;
 use crate::macos::runner_support::{
     initialize_import_tracker, initialize_shared_state_with_mode, install_return_stubs,
+    Arm64ExitHandler, Arm64ExitHandlerKind,
 };
 use crate::macos::runtime_hooks::install_runtime_hooks;
 use crate::macos::time_imports::install_time_imports;
@@ -30,6 +31,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const INDIRECT_BRANCH_MODE_ENV: &str = "MACHINA_INDIRECT_BRANCH_MODE";
+
+fn section_pointer_values(
+    emulator: &mut UnicornEmulator,
+    binary: &MachoBinary,
+    section_name: &str,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let section = binary
+        .segments
+        .iter()
+        .flat_map(|s| s.sections.iter())
+        .find(|sec| {
+            let name = String::from_utf8_lossy(
+                &sec.sectname[..sec
+                    .sectname
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(sec.sectname.len())],
+            );
+            name == section_name
+        });
+    let Some(sec) = section else {
+        return Ok(Vec::new());
+    };
+    if sec.size == 0 || sec.size % 8 != 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::with_capacity((sec.size / 8) as usize);
+    for i in 0..(sec.size / 8) as usize {
+        let slot_addr = sec.addr + (i as u64) * 8;
+        let bytes = emulator.read_memory(slot_addr, 8)?;
+        let arr: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| format!("short read on {section_name} slot"))?;
+        let addr = u64::from_le_bytes(arr);
+        if addr != 0 {
+            values.push(addr);
+        }
+    }
+    Ok(values)
+}
 
 /// Build a synthetic trampoline that invokes each
 /// `__mod_init_func` entry in order, then tail-jumps to the real
@@ -52,51 +94,10 @@ fn build_mod_init_trampoline(
     trace_bus: &Option<SharedTraceBus>,
     metadata: &TraceMetadata,
 ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
-    // Locate the __mod_init_func section regardless of which
-    // segment claims it — obfuscators rename the parent segment
-    // (e.g. ".<71" instead of "__DATA_CONST") so we can't rely
-    // on `get_section(seg, "__mod_init_func")`.
-    let init_section = binary
-        .segments
-        .iter()
-        .flat_map(|s| s.sections.iter())
-        .find(|sec| {
-            let name = String::from_utf8_lossy(
-                &sec.sectname[..sec
-                    .sectname
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(sec.sectname.len())],
-            );
-            name == "__mod_init_func"
-        });
-    let Some(sec) = init_section else {
-        return Ok(None);
-    };
-    if sec.size == 0 || sec.size % 8 != 0 {
-        return Ok(None);
-    }
-    let entry_count = (sec.size / 8) as usize;
-    if entry_count == 0 {
-        return Ok(None);
-    }
-
     // Read every initializer address out of guest memory — the
     // chained-fixups pass has already replaced the on-disk chain
     // entries with resolved absolute addresses.
-    let mut init_addrs: Vec<u64> = Vec::with_capacity(entry_count);
-    for i in 0..entry_count {
-        let slot_addr = sec.addr + (i as u64) * 8;
-        let bytes = emulator.read_memory(slot_addr, 8)?;
-        let arr: [u8; 8] = bytes
-            .try_into()
-            .map_err(|_| "short read on __mod_init_func slot")?;
-        let addr = u64::from_le_bytes(arr);
-        if addr == 0 {
-            continue;
-        }
-        init_addrs.push(addr);
-    }
+    let init_addrs = section_pointer_values(emulator, binary, "__mod_init_func")?;
     if init_addrs.is_empty() {
         return Ok(None);
     }
@@ -536,6 +537,36 @@ pub fn emulate_macos_arm64_binary_with_mode(
     );
     let syscall_count = runtime_context.core.runtime.syscall_count.clone();
     install_runtime_plugins(&mut emulator, &runtime_context, &[&SyscallRuntimePlugin])?;
+
+    match section_pointer_values(&mut emulator, &binary, "__mod_term_func") {
+        Ok(term_addrs) if !term_addrs.is_empty() => {
+            if let Ok(mut handlers) = shared_state.exit_handlers.lock() {
+                for function in term_addrs.iter().copied() {
+                    handlers.push(Arm64ExitHandler {
+                        function,
+                        argument: 0,
+                        dso_handle: 0,
+                        kind: Arm64ExitHandlerKind::ModTerm,
+                    });
+                }
+            }
+            if let Some(bus) = &trace_bus {
+                let _ = bus.send(
+                    memory_event(&metadata, "mod-term-handlers")
+                        .arg("Count", term_addrs.len().to_string())
+                        .arg("First", format!("0x{:X}", term_addrs[0])),
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            if let Some(bus) = &trace_bus {
+                let _ = bus.send(
+                    memory_event(&metadata, "mod-term-error").arg("Error", format!("{}", err)),
+                );
+            }
+        }
+    }
 
     let actual_entry = resolve_entry(&binary);
 

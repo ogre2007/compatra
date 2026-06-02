@@ -17,6 +17,7 @@ use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
     Arm64SharedState,
 };
+use crate::macos::arm64_state::{Arm64ExitHandler, Arm64ExitHandlerKind};
 use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::{
     close_synthetic_fd, dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id,
@@ -1403,6 +1404,63 @@ pub fn install_arm64_process_imports(
                         "ResumedParentTid",
                         resumed_parent_tid.unwrap_or(0).to_string(),
                     );
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    for sym in ["_atexit", "___cxa_atexit"] {
+        let Some(&addr) = stub_map.get(sym) else {
+            continue;
+        };
+        let exit_handlers = shared_state.exit_handlers.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let function = emu.read_reg("x0").unwrap_or(0);
+                let argument = if sym == "___cxa_atexit" {
+                    emu.read_reg("x1").unwrap_or(0)
+                } else {
+                    0
+                };
+                let dso_handle = if sym == "___cxa_atexit" {
+                    emu.read_reg("x2").unwrap_or(0)
+                } else {
+                    0
+                };
+                let kind = if sym == "___cxa_atexit" {
+                    Arm64ExitHandlerKind::CxaAtexit
+                } else {
+                    Arm64ExitHandlerKind::Atexit
+                };
+                if function != 0 {
+                    if let Ok(mut handlers) = exit_handlers.lock() {
+                        handlers.push(Arm64ExitHandler {
+                            function,
+                            argument,
+                            dso_handle,
+                            kind,
+                        });
+                    }
+                }
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "{sym}(func=0x{function:X}, arg=0x{argument:X}, dso=0x{dso_handle:X}) -> 0"
+                    ),
+                );
+                let event = arm64_process_event(1, 1, "atexit", sym)
+                    .arg("Function", format!("0x{:X}", function))
+                    .arg("Argument", format!("0x{:X}", argument))
+                    .arg("DsoHandle", format!("0x{:X}", dso_handle));
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;

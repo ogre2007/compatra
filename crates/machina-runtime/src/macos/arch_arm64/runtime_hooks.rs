@@ -11,6 +11,7 @@ macro_rules! println {
 use crate::macos::arm64_runner_support::{
     arm64_process_event, arm64_thread_event, emit_arm64_event, Arm64SharedState,
 };
+use crate::macos::arm64_state::Arm64ExitHandlerKind;
 use crate::macos::{
     dispatch_pending_arm64_thread, read_arm64_argv, read_cstring, restore_arm64_context,
     save_arm64_context, SharedTraceBus,
@@ -31,6 +32,7 @@ pub fn install_arm64_runtime_hooks(
     let thread_runtime = shared_state.thread_runtime.clone();
     let os_runtime = shared_state.os_runtime.clone();
     let child_trace_budget = shared_state.child_trace_budget.clone();
+    let exit_handlers = shared_state.exit_handlers.clone();
 
     {
         let thread_runtime = thread_runtime.clone();
@@ -186,6 +188,7 @@ pub fn install_arm64_runtime_hooks(
     {
         let thread_runtime = thread_runtime.clone();
         let os_runtime = os_runtime.clone();
+        let exit_handlers = exit_handlers.clone();
         let trace_bus_for_hook = trace_bus.clone();
         emulator.add_code_hook(
             done_addr,
@@ -193,7 +196,11 @@ pub fn install_arm64_runtime_hooks(
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
                 let mut stop_now = false;
                 let mut dispatched = false;
+                let mut finalizer_dispatched = false;
+                let mut finalizer_kind = String::new();
+                let mut finalizer_function = 0;
                 let mut exited_pid = None;
+                let mut current_pid_for_done = 1;
                 if let Ok(mut runtime) = thread_runtime.lock() {
                     let pc = emu.read_reg("pc").unwrap_or(0);
                     let lr = emu.read_reg("lr").unwrap_or(0);
@@ -203,6 +210,7 @@ pub fn install_arm64_runtime_hooks(
                         .ok()
                         .and_then(|os| os.thread_processes.get(&runtime.current_thread_id).copied())
                         .unwrap_or(1);
+                    current_pid_for_done = pid;
                     println!(
                         "[THREAD][arm64] reached done_addr current={} pid={} active={} pending={} pc=0x{:X} lr=0x{:X} sp=0x{:X}",
                         runtime.current_thread_id,
@@ -237,8 +245,41 @@ pub fn install_arm64_runtime_hooks(
                         stop_now = true;
                     }
                 }
+                if stop_now && current_pid_for_done == 1 {
+                    let next_handler = exit_handlers.lock().ok().and_then(|mut handlers| {
+                        while let Some(handler) = handlers.pop() {
+                            if handler.function != 0 {
+                                return Some(handler);
+                            }
+                        }
+                        None
+                    });
+                    if let Some(handler) = next_handler {
+                        finalizer_dispatched = true;
+                        finalizer_kind = format!("{:?}", handler.kind);
+                        finalizer_function = handler.function;
+                        stop_now = false;
+                        let _ = emu.write_reg("pc", handler.function);
+                        let _ = emu.write_reg("lr", done_addr);
+                        let x0 = if matches!(handler.kind, Arm64ExitHandlerKind::CxaAtexit) {
+                            handler.argument
+                        } else {
+                            0
+                        };
+                        let _ = emu.write_reg("x0", x0);
+                        println!(
+                            "[PROC][arm64] dispatch exit handler kind={} func=0x{:X} arg=0x{:X}",
+                            finalizer_kind, handler.function, handler.argument
+                        );
+                    }
+                }
                 if dispatched {
                     println!("[THREAD][arm64] done_addr dispatches pending synthetic thread");
+                } else if finalizer_dispatched {
+                    println!(
+                        "[PROC][arm64] done_addr dispatches exit handler kind={} func=0x{:X}",
+                        finalizer_kind, finalizer_function
+                    );
                 } else {
                     if let Some(pid) = exited_pid {
                         println!(
@@ -269,6 +310,9 @@ pub fn install_arm64_runtime_hooks(
                     .unwrap_or(exited_pid.unwrap_or(1));
                 let event = arm64_process_event(pid, current_tid, "done-addr", "done_addr")
                     .arg("Dispatched", dispatched.to_string())
+                    .arg("FinalizerDispatched", finalizer_dispatched.to_string())
+                    .arg("FinalizerKind", finalizer_kind)
+                    .arg("FinalizerFunction", format!("0x{:X}", finalizer_function))
                     .arg("StopNow", stop_now.to_string())
                     .arg("ExitedPid", exited_pid.unwrap_or(0).to_string());
                 emit_arm64_event(&trace_bus_for_hook, event);

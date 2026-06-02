@@ -121,6 +121,8 @@ fn arm64_static_symbol_has_exact_hook(symbol: &str) -> bool {
             | "_usleep"
             | "_sysctl"
             | "_sysctlbyname"
+            | "_atexit"
+            | "___cxa_atexit"
     )
 }
 

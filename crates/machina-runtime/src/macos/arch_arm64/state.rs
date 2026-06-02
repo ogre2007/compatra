@@ -14,6 +14,21 @@ use crate::macos::{
     GuestProcessBootstrap, RuntimeMode, SyntheticProcess, ARM64_SYNTHETIC_THREAD_STACK_BASE,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Arm64ExitHandlerKind {
+    Atexit,
+    CxaAtexit,
+    ModTerm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Arm64ExitHandler {
+    pub function: u64,
+    pub argument: u64,
+    pub dso_handle: u64,
+    pub kind: Arm64ExitHandlerKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct Arm64SharedState {
     pub runtime_mode: RuntimeMode,
@@ -32,6 +47,7 @@ pub struct Arm64SharedState {
     pub thread_runtime: Arc<Mutex<Arm64ThreadRuntime>>,
     pub os_runtime: Arc<Mutex<Arm64SyntheticOsRuntime>>,
     pub apple_runtime: Arc<Mutex<AppleRuntime>>,
+    pub exit_handlers: Arc<Mutex<Vec<Arm64ExitHandler>>>,
     pub analysis: AnalysisRuntimeHooks,
     pub child_trace_budget: Arc<AtomicUsize>,
 }
@@ -96,6 +112,7 @@ pub fn initialize_arm64_shared_state_with_mode(
             ..Default::default()
         })),
         apple_runtime: Arc::new(Mutex::new(AppleRuntime::default())),
+        exit_handlers: Arc::new(Mutex::new(Vec::new())),
         analysis: AnalysisRuntimeHooks::for_mode(runtime_mode),
         child_trace_budget: Arc::new(AtomicUsize::new(80)),
     }

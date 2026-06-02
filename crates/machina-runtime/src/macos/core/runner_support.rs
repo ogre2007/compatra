@@ -1,6 +1,6 @@
 pub use crate::macos::arm64_import_stubs::Arm64ImportTracker;
 pub use crate::macos::arm64_runner_support::*;
-pub use crate::macos::arm64_state::Arm64SharedState;
+pub use crate::macos::arm64_state::{Arm64ExitHandler, Arm64ExitHandlerKind, Arm64SharedState};
 
 pub type ImportTracker = Arm64ImportTracker;
 pub type SharedState = Arm64SharedState;

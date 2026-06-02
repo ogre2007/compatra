@@ -1109,7 +1109,7 @@ impl CompatibilityServices {
                 }
                 HostImportKind::Uname => Some(self.uname(memory, args[0])?.into()),
                 HostImportKind::GetTimeOfDay => {
-                    Some(self.gettimeofday(memory, args[0], args[1], args[2])?.into())
+                    Some(self.gettimeofday(memory, args[0], args[1], 0)?.into())
                 }
                 HostImportKind::ClockGetTime => {
                     Some(self.clock_gettime(memory, args[0], args[1])?.into())

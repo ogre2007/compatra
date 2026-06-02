@@ -3207,7 +3207,7 @@ fn compat_mode_preserves_arm64_printf_stack_varargs() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn compat_mode_reports_lifecycle_glue_gaps() {
+fn compat_mode_runs_lifecycle_glue() {
     if std::env::consts::ARCH != "x86_64" {
         eprintln!(
             "skipping Intel macOS compat-mode lifecycle glue diagnostic on {}",
@@ -3268,13 +3268,6 @@ fn compat_mode_reports_lifecycle_glue_gaps() {
         "compat proof(lifecycle-glue): observed ctor={} main={} main_hits={} atexit={} dtor={}",
         saw_ctor as u8, saw_main as u8, main_hits, saw_atexit as u8, saw_dtor as u8
     );
-    if !saw_atexit || !saw_dtor {
-        eprintln!(
-            "compat proof(lifecycle-glue): missing lifecycle stages -> atexit_handlers={} mod_term_destructors={}",
-            (!saw_atexit) as u8,
-            (!saw_dtor) as u8
-        );
-    }
     if !stderr.trim().is_empty() {
         eprintln!(
             "compat proof(lifecycle-glue): stderr excerpt:\n{}",
@@ -3301,6 +3294,14 @@ fn compat_mode_reports_lifecycle_glue_gaps() {
         main_hits, 1,
         "lifecycle glue fixture re-entered main instead of returning to done_addr; stdout excerpt:\n{}",
         text_excerpt(&stdout, 2048)
+    );
+    assert!(
+        saw_atexit,
+        "lifecycle glue fixture did not run registered atexit handlers; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_dtor,
+        "lifecycle glue fixture did not run __mod_term_func destructors; stdout:\n{stdout}"
     );
     assert!(
         stderr.contains("\"Call\":\"write\""),
@@ -4066,11 +4067,8 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stdout.contains(" uname=0 "),
         "env/time fixture did not complete sysconf/gethostname/uname; stdout:\n{stdout}"
     );
-    let imported_time_ok = stdout
-        .contains("compat time imported gtod=0 clock=0 nanosleep=0 usleep=0 sleep=0")
-        || stdout.contains("compat time imported gtod=-1 clock=0 nanosleep=0 usleep=0 sleep=0");
     assert!(
-        imported_time_ok
+        stdout.contains("compat time imported gtod=0 clock=0 nanosleep=0 usleep=0 sleep=0")
             && stdout.contains("compat time syscall ret=0")
             && stdout.contains("compat time timebase ret=0 numer="),
         "env/time fixture did not complete imported and raw-syscall time probes; stdout:\n{stdout}"
@@ -4091,11 +4089,9 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stdout.contains(" time=0x"),
         "env/time fixture did not receive dlsym trampolines; stdout:\n{stdout}"
     );
-    let dynamic_time_ok = stdout.contains(" gtod=0 clock=0 nanosleep=0 ")
-        || stdout.contains(" gtod=-1 clock=0 nanosleep=0 ");
     assert!(
         stdout.contains("compat envtime dlsym env set=0 value=dyn-ok unset=0")
-            && dynamic_time_ok
+            && stdout.contains(" gtod=0 clock=0 nanosleep=0 ")
             && stdout.contains(" rlimit=0 sysconf=")
             && stdout.contains(" sysctl=0 page="),
         "env/time fixture did not complete dynamic env/time/resource/sysctl calls; stdout:\n{stdout}"
