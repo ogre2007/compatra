@@ -66,7 +66,7 @@ fn machoman_profiler_system_commands_are_visible_on_popen_hooks() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env(
             "MACHINA_BYPASS_USAGE_CHECK",
-            "0x10022AE68@0x10022812C=1,0;\
+            "0x10022AE68@0x10022812C=0;\
              0x10022AE68@0x100225548=0;\
              0x10022AE68@0x100225ADC=0",
         )

@@ -33,6 +33,7 @@ pub fn install_arm64_runtime_hooks(
     let os_runtime = shared_state.os_runtime.clone();
     let child_trace_budget = shared_state.child_trace_budget.clone();
     let exit_handlers = shared_state.exit_handlers.clone();
+    let run_exit_handlers = shared_state.runtime_mode.is_compat();
 
     {
         let thread_runtime = thread_runtime.clone();
@@ -245,7 +246,7 @@ pub fn install_arm64_runtime_hooks(
                         stop_now = true;
                     }
                 }
-                if stop_now && current_pid_for_done == 1 {
+                if run_exit_handlers && stop_now && current_pid_for_done == 1 {
                     let next_handler = exit_handlers.lock().ok().and_then(|mut handlers| {
                         while let Some(handler) = handlers.pop() {
                             if handler.function != 0 {

@@ -538,32 +538,34 @@ pub fn emulate_macos_arm64_binary_with_mode(
     let syscall_count = runtime_context.core.runtime.syscall_count.clone();
     install_runtime_plugins(&mut emulator, &runtime_context, &[&SyscallRuntimePlugin])?;
 
-    match section_pointer_values(&mut emulator, &binary, "__mod_term_func") {
-        Ok(term_addrs) if !term_addrs.is_empty() => {
-            if let Ok(mut handlers) = shared_state.exit_handlers.lock() {
-                for function in term_addrs.iter().copied() {
-                    handlers.push(Arm64ExitHandler {
-                        function,
-                        argument: 0,
-                        dso_handle: 0,
-                        kind: Arm64ExitHandlerKind::ModTerm,
-                    });
+    if runtime_mode.is_compat() {
+        match section_pointer_values(&mut emulator, &binary, "__mod_term_func") {
+            Ok(term_addrs) if !term_addrs.is_empty() => {
+                if let Ok(mut handlers) = shared_state.exit_handlers.lock() {
+                    for function in term_addrs.iter().copied() {
+                        handlers.push(Arm64ExitHandler {
+                            function,
+                            argument: 0,
+                            dso_handle: 0,
+                            kind: Arm64ExitHandlerKind::ModTerm,
+                        });
+                    }
+                }
+                if let Some(bus) = &trace_bus {
+                    let _ = bus.send(
+                        memory_event(&metadata, "mod-term-handlers")
+                            .arg("Count", term_addrs.len().to_string())
+                            .arg("First", format!("0x{:X}", term_addrs[0])),
+                    );
                 }
             }
-            if let Some(bus) = &trace_bus {
-                let _ = bus.send(
-                    memory_event(&metadata, "mod-term-handlers")
-                        .arg("Count", term_addrs.len().to_string())
-                        .arg("First", format!("0x{:X}", term_addrs[0])),
-                );
-            }
-        }
-        Ok(_) => {}
-        Err(err) => {
-            if let Some(bus) = &trace_bus {
-                let _ = bus.send(
-                    memory_event(&metadata, "mod-term-error").arg("Error", format!("{}", err)),
-                );
+            Ok(_) => {}
+            Err(err) => {
+                if let Some(bus) = &trace_bus {
+                    let _ = bus.send(
+                        memory_event(&metadata, "mod-term-error").arg("Error", format!("{}", err)),
+                    );
+                }
             }
         }
     }
