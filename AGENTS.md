@@ -5,7 +5,8 @@ repo. The intent is to keep direction stable across short, automated sessions.
 
 ## Project identity
 
-- Project name: `Machina` (Cargo package `machina`, lib `machina`, bin `machina`).
+- Project name: `Machina` (Cargo package `machina`, lib `machina`, bins
+  `machina` and `machina-compat`).
 - Language: Rust, edition 2021.
 - Workspace architecture crates:
   - `crates/machina-arch` — architecture-neutral identifiers and traits.
@@ -101,6 +102,9 @@ add new ones):
 - `MACHINA_MODE` — `analysis` (default) or `compat`. Analysis mode keeps
   malware-analysis defaults; compat mode disables analysis-only synthetic
   artifacts, captures, detections, and built-in trace plugin presets.
+  The dedicated `machina-compat` binary always runs compat mode and is built
+  with `--no-default-features` in Intel macOS CI so `machina-analysis` is not
+  linked into the compatibility utility.
 - `MACHINA_TRACE_FORMAT` — `jsonl` (default) or `human`.
 - `MACHINA_TRACE_PROFILE` — `compact` (default), `full`, or `debug`.
 - `MACHINA_TRACE_WINDOW_START` / `_END` / `_HITS` — bounded instruction trace
@@ -168,9 +172,12 @@ add new ones):
 - Canonical local smoke flow:
   - `cargo build --bin machina`
   - `cargo run --bin machina -- fixtures/macos/bin/arm64_hello`
+  - `cargo build --no-default-features --bin machina-compat` for the
+    compatibility-only utility
   - `cargo test --test amos_private_access` for the AMOS regression
   - `cargo test --test rustdoor_fast_mode` for the RustDoor milestones
-  - `cargo test --test compat_mode_macos` on Intel macOS for compat mode
+  - `cargo test --release --no-default-features --test compat_mode_macos -- --nocapture`
+    on Intel macOS for compat mode
 
 ## Repo hygiene
 

@@ -14,7 +14,8 @@ is:
 
 ## Repository layout
 
-- [src/bin/machina.rs](D:/dev/quiling/qiling/src/bin/machina.rs): CLI entrypoint
+- [src/bin/machina.rs](D:/dev/quiling/qiling/src/bin/machina.rs): analysis-capable CLI entrypoint
+- [src/bin/machina-compat.rs](D:/dev/quiling/qiling/src/bin/machina-compat.rs): compatibility-only CLI entrypoint for no-analysis builds
 - [src/macos](D:/dev/quiling/qiling/src/macos): macOS emulation code
 - [src/macos/core/mod.rs](D:/dev/quiling/qiling/src/macos/core/mod.rs): architecture-neutral emulation pipeline, tracing, and runtime façades
 - [src/macos/arch_arm64/mod.rs](D:/dev/quiling/qiling/src/macos/arch_arm64/mod.rs): grouped view of arm64-specific modules
@@ -61,6 +62,12 @@ Useful knobs:
 cargo build --bin machina
 ```
 
+The compatibility utility can be built without the default `analysis` feature:
+
+```powershell
+cargo build --no-default-features --bin machina-compat
+```
+
 ## Run
 
 ```powershell
@@ -77,6 +84,12 @@ observable progress under an Intel macOS host.
 cargo run --bin machina -- --mode compat fixtures\macos\bin\arm64_hello
 ```
 
+For compatibility-only runs prefer the dedicated binary:
+
+```powershell
+cargo run --no-default-features --bin machina-compat -- fixtures\macos\bin\arm64_hello
+```
+
 ## Local compat smoke check
 
 Compatibility mode is pinned by `tests/compat_mode_macos.rs`. The test is
@@ -84,7 +97,7 @@ intended for Intel macOS, where host-library compatibility work can be
 validated:
 
 ```
-cargo test --test compat_mode_macos
+cargo test --release --no-default-features --test compat_mode_macos -- --nocapture
 ```
 
 Use `-- --nocapture` when debugging CI or a local Intel macOS machine. The test

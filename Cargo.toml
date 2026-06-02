@@ -18,13 +18,17 @@ members = [
 ]
 resolver = "2"
 
+[features]
+default = ["analysis"]
+analysis = ["dep:machina-analysis"]
+
 [dependencies]
 bitflags = "2"
 thiserror = "1"
 log = "0.4"
 libc = "0.2"
 byteorder = "1"
-machina-analysis = { path = "crates/machina-analysis" }
+machina-analysis = { path = "crates/machina-analysis", optional = true }
 machina-arch-arm64 = { path = "crates/machina-arch-arm64" }
 machina-compat = { path = "crates/machina-compat" }
 machina-mode = { path = "crates/machina-mode" }
@@ -36,3 +40,11 @@ unicorn-engine = "2.1.5"
 [lib]
 name = "machina"
 path = "src/lib.rs"
+
+[[bin]]
+name = "machina"
+path = "src/bin/machina.rs"
+
+[[bin]]
+name = "machina-compat"
+path = "src/bin/machina-compat.rs"

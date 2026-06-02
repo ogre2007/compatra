@@ -130,7 +130,7 @@ pub fn detect_event(metadata: &TraceMetadata, name: impl Into<String>) -> TraceE
 
 #[cfg(test)]
 mod tests {
-    use crate::macos::analysis::register_analysis_plugins;
+    #[cfg(feature = "analysis")]
     use crate::macos::trace::PluginRegistry;
 
     use super::*;
@@ -152,8 +152,11 @@ mod tests {
         assert_eq!(event.call.as_deref(), Some("write"));
     }
 
+    #[cfg(feature = "analysis")]
     #[test]
     fn drakvuf_plugins_claim_built_events() {
+        use crate::macos::analysis::register_analysis_plugins;
+
         let mut registry = PluginRegistry::new();
         register_analysis_plugins(&mut registry);
 

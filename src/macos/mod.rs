@@ -1,6 +1,10 @@
 #[path = "core/analysis.rs"]
 pub mod analysis;
+#[cfg(feature = "analysis")]
 #[path = "analysis_arm64/cpp_imports.rs"]
+pub mod analysis_arm64_cpp_imports;
+#[cfg(not(feature = "analysis"))]
+#[path = "analysis_arm64/noop_cpp_imports.rs"]
 pub mod analysis_arm64_cpp_imports;
 #[path = "platform_apple/imports.rs"]
 pub mod apple_imports;
@@ -161,7 +165,7 @@ pub use runtime::{
     stat_guest_path, terminate_synthetic_process, wake_cond_waiters, wake_one_cond_waiter,
     yield_active_arm64_thread, ActiveArm64Thread, Arm64ThreadRuntime, ForkParentResume,
     PendingArm64Thread, SyntheticFdTarget, SyntheticKeventRegistration, SyntheticOsRuntime,
-    SyntheticPipe, SyntheticProcess, ThreadContext, WaitingArm64Thread,
+    SyntheticPipe, SyntheticPopenStream, SyntheticProcess, ThreadContext, WaitingArm64Thread,
     ARM64_SYNTHETIC_THREAD_STACK_BASE, ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
 };
 pub use runtime_plugins::{

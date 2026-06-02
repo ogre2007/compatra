@@ -70,6 +70,18 @@ pub struct SyntheticKeventRegistration {
     pub fflags: u32,
     pub data: i64,
     pub udata: u64,
+    pub triggered: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SyntheticPopenStream {
+    pub command: String,
+    pub mode: String,
+    pub label: Option<String>,
+    pub output: Vec<u8>,
+    pub offset: usize,
+    pub eof: bool,
+    pub error: bool,
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +104,7 @@ pub struct Arm64SyntheticOsRuntime {
     pub last_pipe_reads: HashMap<(u64, u64), VecDeque<Vec<u8>>>,
     pub pipe_empty_eof_reads: HashMap<(u64, u64, u64), u64>,
     pub kqueues: HashMap<u64, Vec<SyntheticKeventRegistration>>,
+    pub popen_streams: HashMap<u64, SyntheticPopenStream>,
 }
 
 fn synthetic_target_ref_exists(
@@ -566,8 +579,14 @@ mod tests {
     use super::*;
 
     fn os_runtime() -> Arm64SyntheticOsRuntime {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let guest_fs_base = std::env::temp_dir().join(format!("machina-runtime-test-{unique}"));
+        std::fs::create_dir_all(guest_fs_base.join("Users/analyst/.electrum/wallets")).unwrap();
         Arm64SyntheticOsRuntime {
-            guest_files: GuestFileTable::new(std::env::temp_dir().join("machina-runtime-test")),
+            guest_files: GuestFileTable::new(guest_fs_base),
             ..Default::default()
         }
     }

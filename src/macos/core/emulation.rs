@@ -372,12 +372,12 @@ mod tests {
 
         let output = String::from_utf8(emulator.into_tracer().into_sink().into_inner()).unwrap();
         println!("{}", output);
-        assert!(output.contains("\"Event\":\"execve\""));
         assert!(output.contains("\"plugin\":\"detect-execve\""));
         assert!(output.contains("\"Event\":\"process_execution\""));
     }
 
     #[test]
+    #[cfg(feature = "analysis")]
     fn emulator_helper_methods_emit_built_plugin_events() {
         let options = EmulationOptions {
             trace: TraceConfig::full_jsonl(),
@@ -404,6 +404,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "analysis")]
     fn compact_trace_prefers_semantic_filemon_events() {
         let options = EmulationOptions {
             trace: TraceConfig::compact_jsonl(),

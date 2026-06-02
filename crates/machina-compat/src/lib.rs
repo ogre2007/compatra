@@ -221,6 +221,10 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     InetNtop,
     #[cfg(target_os = "macos")]
+    InetAddr,
+    #[cfg(target_os = "macos")]
+    InetAton,
+    #[cfg(target_os = "macos")]
     Htonl,
     #[cfg(target_os = "macos")]
     Htons,
@@ -688,6 +692,10 @@ impl CompatibilityServices {
             HostImportKind::InetNtop => {
                 Some(self.inet_ntop(memory, args[0], args[1], args[2], args[3])?)
             }
+            #[cfg(target_os = "macos")]
+            HostImportKind::InetAddr => Some(self.inet_addr(memory, args[0])?),
+            #[cfg(target_os = "macos")]
+            HostImportKind::InetAton => Some(self.inet_aton(memory, args[0], args[1])?),
             #[cfg(target_os = "macos")]
             HostImportKind::Htonl => Some(HostCallResult {
                 return_value: (args[0] as u32).to_be() as u64,
@@ -2148,6 +2156,39 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn inet_addr<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        src_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_inet_addr(memory, src_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, src_ptr);
+            None
+        }
+    }
+
+    pub fn inet_aton<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        src_ptr: u64,
+        dst_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_inet_aton(memory, src_ptr, dst_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, src_ptr, dst_ptr);
+            None
+        }
+    }
+
     pub fn getenv<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -3267,6 +3308,8 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "getnameinfo" => Some(HostImportKind::GetNameInfo),
             "inet_pton" => Some(HostImportKind::InetPton),
             "inet_ntop" => Some(HostImportKind::InetNtop),
+            "inet_addr" => Some(HostImportKind::InetAddr),
+            "inet_aton" => Some(HostImportKind::InetAton),
             "htonl" => Some(HostImportKind::Htonl),
             "htons" => Some(HostImportKind::Htons),
             "ntohl" => Some(HostImportKind::Ntohl),
@@ -3602,6 +3645,8 @@ fn note_host_fd_close(fd: u64) {
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    fn inet_addr(cp: *const libc::c_char) -> libc::in_addr_t;
+    fn inet_aton(cp: *const libc::c_char, inp: *mut libc::in_addr) -> libc::c_int;
     fn inet_pton(af: libc::c_int, src: *const libc::c_char, dst: *mut libc::c_void) -> libc::c_int;
     fn inet_ntop(
         af: libc::c_int,
@@ -6477,6 +6522,76 @@ fn proxy_host_inet_ntop<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_host_inet_addr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    src_ptr: u64,
+) -> Option<HostCallResult> {
+    let host_src = match read_cstring(memory, src_ptr, 4096)
+        .ok()
+        .and_then(|src| CString::new(src).ok())
+    {
+        Some(value) => value,
+        None => {
+            return Some(HostCallResult {
+                return_value: libc::INADDR_NONE as u64,
+                errno: Some(libc::EFAULT as u32),
+            });
+        }
+    };
+    clear_errno();
+    let ret = unsafe { inet_addr(host_src.as_ptr()) };
+    Some(HostCallResult {
+        return_value: ret as u64,
+        errno: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_inet_aton<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    src_ptr: u64,
+    dst_ptr: u64,
+) -> Option<HostCallResult> {
+    if dst_ptr == 0 {
+        return Some(HostCallResult {
+            return_value: 0,
+            errno: Some(libc::EFAULT as u32),
+        });
+    }
+
+    let host_src = match read_cstring(memory, src_ptr, 4096)
+        .ok()
+        .and_then(|src| CString::new(src).ok())
+    {
+        Some(value) => value,
+        None => {
+            return Some(HostCallResult {
+                return_value: 0,
+                errno: Some(libc::EFAULT as u32),
+            });
+        }
+    };
+    let mut addr = libc::in_addr { s_addr: 0 };
+    clear_errno();
+    let ret = unsafe { inet_aton(host_src.as_ptr(), &mut addr) };
+    if ret != 0 {
+        if memory
+            .write_memory(dst_ptr, &addr.s_addr.to_le_bytes())
+            .is_err()
+        {
+            return Some(HostCallResult {
+                return_value: 0,
+                errno: Some(libc::EFAULT as u32),
+            });
+        }
+    }
+    Some(HostCallResult {
+        return_value: ret as u64,
+        errno: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_getenv<M: GuestMemory + ?Sized>(
     memory: &mut M,
     name_ptr: u64,
@@ -7866,7 +7981,15 @@ mod tests {
             assert!(compat.should_proxy_import("_getaddrinfo"));
             assert!(compat.should_proxy_import("_freeaddrinfo"));
             assert!(compat.should_proxy_import("_gai_strerror"));
+            assert!(compat.should_proxy_import("_getnameinfo"));
             assert!(compat.should_proxy_import("_inet_pton"));
+            assert!(compat.should_proxy_import("_inet_ntop"));
+            assert!(compat.should_proxy_import("_inet_addr"));
+            assert!(compat.should_proxy_import("_inet_aton"));
+            assert!(compat.should_proxy_import("_htonl"));
+            assert!(compat.should_proxy_import("_htons"));
+            assert!(compat.should_proxy_import("_ntohl"));
+            assert!(compat.should_proxy_import("_ntohs"));
             assert!(compat.should_proxy_import("_poll"));
             assert!(compat.should_proxy_import("_readv"));
             assert!(compat.should_proxy_import("_writev$NOCANCEL"));

@@ -17,16 +17,72 @@ use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
     Arm64SharedState,
 };
+use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::{
     close_synthetic_fd, dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id,
     read_arm64_argv, read_cstring, resolve_process_fd_target, restore_arm64_context,
     save_arm64_context, terminate_synthetic_process, Emulator, ForkParentResume,
-    PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticProcess, MAX_SYNTHETIC_THREADS,
+    PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticPopenStream, SyntheticProcess,
+    MAX_SYNTHETIC_THREADS,
 };
 use crate::UnicornEmulator;
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
+}
+
+fn read_popen_stream_bytes(stream: &mut SyntheticPopenStream, byte_count: usize) -> Vec<u8> {
+    if byte_count == 0 {
+        return Vec::new();
+    }
+    if stream.offset >= stream.output.len() {
+        stream.eof = true;
+        return Vec::new();
+    }
+
+    let available = stream.output.len() - stream.offset;
+    let read_len = available.min(byte_count);
+    let data = stream.output[stream.offset..stream.offset + read_len].to_vec();
+    stream.offset += read_len;
+    if stream.offset >= stream.output.len() {
+        stream.eof = true;
+    }
+    data
+}
+
+fn read_popen_stream_line(stream: &mut SyntheticPopenStream, capacity: usize) -> Vec<u8> {
+    if capacity <= 1 {
+        return Vec::new();
+    }
+    if stream.offset >= stream.output.len() {
+        stream.eof = true;
+        return Vec::new();
+    }
+
+    let max_payload = capacity - 1;
+    let available = &stream.output[stream.offset..];
+    let read_len = available
+        .iter()
+        .take(max_payload)
+        .position(|byte| *byte == b'\n')
+        .map(|idx| idx + 1)
+        .unwrap_or_else(|| available.len().min(max_payload));
+    let data = available[..read_len].to_vec();
+    stream.offset += read_len;
+    if stream.offset >= stream.output.len() {
+        stream.eof = true;
+    }
+    data
+}
+
+fn checked_stdio_byte_count(size: u64, nmemb: u64) -> Option<(usize, usize, usize)> {
+    if size == 0 || nmemb == 0 {
+        return Some((size as usize, nmemb as usize, 0));
+    }
+    let item_size = usize::try_from(size).ok()?;
+    let item_count = usize::try_from(nmemb).ok()?;
+    let byte_count = item_size.checked_mul(item_count)?;
+    Some((item_size, item_count, byte_count.min(0x10000)))
 }
 
 fn install_posix_spawn_hook(
@@ -271,6 +327,69 @@ fn install_posix_spawn_file_action_hooks(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn popen_stream(output: &[u8]) -> SyntheticPopenStream {
+        SyntheticPopenStream {
+            command: "test".to_string(),
+            mode: "r".to_string(),
+            label: Some("test-output".to_string()),
+            output: output.to_vec(),
+            offset: 0,
+            eof: output.is_empty(),
+            error: false,
+        }
+    }
+
+    #[test]
+    fn popen_line_reader_keeps_newlines_and_nul_capacity() {
+        let mut stream = popen_stream(b"Darwin\narm64\n");
+
+        let first = read_popen_stream_line(&mut stream, 8);
+        assert_eq!(first, b"Darwin\n");
+        assert_eq!(stream.offset, 7);
+        assert!(!stream.eof);
+
+        let second = read_popen_stream_line(&mut stream, 6);
+        assert_eq!(second, b"arm64");
+        assert_eq!(stream.offset, 12);
+        assert!(!stream.eof);
+
+        let third = read_popen_stream_line(&mut stream, 6);
+        assert_eq!(third, b"\n");
+        assert!(stream.eof);
+
+        let eof = read_popen_stream_line(&mut stream, 6);
+        assert!(eof.is_empty());
+        assert!(stream.eof);
+    }
+
+    #[test]
+    fn popen_byte_reader_reports_eof_after_last_byte() {
+        let mut stream = popen_stream(b"abcdef");
+
+        assert_eq!(read_popen_stream_bytes(&mut stream, 2), b"ab");
+        assert_eq!(stream.offset, 2);
+        assert!(!stream.eof);
+
+        assert_eq!(read_popen_stream_bytes(&mut stream, 10), b"cdef");
+        assert_eq!(stream.offset, 6);
+        assert!(stream.eof);
+
+        assert!(read_popen_stream_bytes(&mut stream, 1).is_empty());
+        assert!(stream.eof);
+    }
+
+    #[test]
+    fn stdio_byte_count_rejects_overflow() {
+        assert_eq!(checked_stdio_byte_count(1, 4), Some((1, 4, 4)));
+        assert_eq!(checked_stdio_byte_count(0, 4), Some((0, 4, 0)));
+        assert!(checked_stdio_byte_count(u64::MAX, 2).is_none());
+    }
+}
+
 pub fn install_arm64_process_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
@@ -289,6 +408,7 @@ pub fn install_arm64_process_imports(
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
+        let analysis_for_hook = analysis.clone();
         let malloc_next_addr = shared_state.malloc_next_addr.clone();
         let malloc_mapped_until = shared_state.malloc_mapped_until.clone();
         let malloc_allocations = shared_state.malloc_allocations.clone();
@@ -320,6 +440,29 @@ pub fn install_arm64_process_imports(
                 )
                 .map(|(addr, _)| addr)
                 .unwrap_or(0);
+                let synthetic_output = analysis_for_hook.synthetic_popen_output(&command);
+                let synthetic_label = synthetic_output.as_ref().map(|output| output.label.clone());
+                let output = synthetic_output
+                    .as_ref()
+                    .map(|output| output.output.clone())
+                    .unwrap_or_default();
+                let output_len = output.len();
+                if result != 0 {
+                    if let Ok(mut os) = os_runtime.lock() {
+                        os.popen_streams.insert(
+                            result,
+                            SyntheticPopenStream {
+                                command: command.clone(),
+                                mode: mode.clone(),
+                                label: synthetic_label.clone(),
+                                output,
+                                offset: 0,
+                                eof: output_len == 0,
+                                error: false,
+                            },
+                        );
+                    }
+                }
                 let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
                 let lr = emu.read_reg("lr").unwrap_or(0);
                 let _ = emu.write_reg("x0", result);
@@ -329,8 +472,8 @@ pub fn install_arm64_process_imports(
                 record_arm64_import(
                     &import_tracker,
                     format!(
-                        "_popen(command={:?}, mode={:?}) -> 0x{:X}",
-                        command, mode, result
+                        "_popen(command={:?}, mode={:?}) -> 0x{:X} synthetic_label={:?} output_bytes={}",
+                        command, mode, result, synthetic_label, output_len
                     ),
                 );
                 let event = arm64_process_event(current_pid, current_tid, "popen", "popen")
@@ -338,6 +481,9 @@ pub fn install_arm64_process_imports(
                     .arg("ModePtr", format!("0x{:X}", mode_ptr))
                     .arg("Command", command)
                     .arg("Mode", mode)
+                    .arg("SyntheticOutput", synthetic_label.is_some().to_string())
+                    .arg("SyntheticLabel", synthetic_label.unwrap_or_default())
+                    .arg("OutputBytes", output_len.to_string())
                     .arg("Result", format!("0x{:X}", result))
                     .arg("Errno", "0");
                 emit_arm64_event(&trace_bus_for_hook, event);
@@ -365,6 +511,10 @@ pub fn install_arm64_process_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                let removed = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|mut os| os.popen_streams.remove(&stream));
                 let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
                 let lr = emu.read_reg("lr").unwrap_or(0);
                 let _ = emu.write_reg("x0", 0u64);
@@ -373,15 +523,393 @@ pub fn install_arm64_process_imports(
                 }
                 record_arm64_import(
                     &import_tracker,
-                    format!("_pclose(stream=0x{:X}) -> 0", stream),
+                    format!(
+                        "_pclose(stream=0x{:X}) -> 0 synthetic={}",
+                        stream,
+                        removed.is_some()
+                    ),
                 );
-                let event = arm64_process_event(current_pid, current_tid, "pclose", "pclose")
+                let mut event = arm64_process_event(current_pid, current_tid, "pclose", "pclose")
                     .arg("Stream", format!("0x{:X}", stream))
+                    .arg("SyntheticPopen", removed.is_some().to_string())
                     .arg("Result", "0")
                     .arg("Errno", "0");
+                if let Some(stream_state) = removed {
+                    event = event
+                        .arg("Command", stream_state.command)
+                        .arg("Mode", stream_state.mode)
+                        .arg("Offset", stream_state.offset.to_string())
+                        .arg("OutputBytes", stream_state.output.len().to_string())
+                        .arg("SyntheticLabel", stream_state.label.unwrap_or_default());
+                }
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
+    }
+
+    if analysis.is_enabled() {
+        if let Some(&addr) = stub_map.get("_fgets") {
+            let os_runtime = shared_state.os_runtime.clone();
+            let thread_runtime = shared_state.thread_runtime.clone();
+            let import_tracker = import_tracker.clone();
+            let trace_bus_for_hook = trace_bus.clone();
+            emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let buf_ptr = emu.read_reg("x0").unwrap_or(0);
+                let size_raw = emu.read_reg("x1").unwrap_or(0);
+                let stream = emu.read_reg("x2").unwrap_or(0);
+                let size = size_raw as i32;
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+
+                let (synthetic, data, eof, label, offset) = if buf_ptr == 0 || size <= 0 {
+                    (false, Vec::new(), false, None, 0usize)
+                } else {
+                    os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|mut os| {
+                            let stream_state = os.popen_streams.get_mut(&stream)?;
+                            let data = read_popen_stream_line(stream_state, size as usize);
+                            Some((
+                                true,
+                                data,
+                                stream_state.eof,
+                                stream_state.label.clone(),
+                                stream_state.offset,
+                            ))
+                        })
+                        .unwrap_or((false, Vec::new(), false, None, 0usize))
+                };
+
+                let mut errno = 0u32;
+                let result = if synthetic && !data.is_empty() {
+                    let mut c_string = data.clone();
+                    c_string.push(0);
+                    match emu.write_memory(buf_ptr, &c_string) {
+                        Ok(()) => buf_ptr,
+                        Err(_) => {
+                            errno = 14;
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+                let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+
+                let preview = lossy_data_preview(&data, 128);
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_fgets(buf=0x{:X}, size={}, stream=0x{:X}) -> 0x{:X} synthetic={} bytes={} eof={} label={:?}",
+                        buf_ptr,
+                        size,
+                        stream,
+                        result,
+                        synthetic,
+                        data.len(),
+                        eof,
+                        label
+                    ),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "fgets", "fgets")
+                    .arg("Buf", format!("0x{:X}", buf_ptr))
+                    .arg("Size", size.to_string())
+                    .arg("Stream", format!("0x{:X}", stream))
+                    .arg("SyntheticPopen", synthetic.to_string())
+                    .arg("SyntheticLabel", label.unwrap_or_default())
+                    .arg("Bytes", data.len().to_string())
+                    .arg("Offset", offset.to_string())
+                    .arg("Eof", eof.to_string())
+                    .arg("Preview", preview)
+                    .arg("Result", format!("0x{:X}", result))
+                    .arg("Errno", errno.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+        }
+
+        if let Some(&addr) = stub_map.get("_fread") {
+            let os_runtime = shared_state.os_runtime.clone();
+            let thread_runtime = shared_state.thread_runtime.clone();
+            let import_tracker = import_tracker.clone();
+            let trace_bus_for_hook = trace_bus.clone();
+            emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let buf_ptr = emu.read_reg("x0").unwrap_or(0);
+                let size = emu.read_reg("x1").unwrap_or(0);
+                let nmemb = emu.read_reg("x2").unwrap_or(0);
+                let stream = emu.read_reg("x3").unwrap_or(0);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+
+                let (item_size, _item_count, byte_count) =
+                    checked_stdio_byte_count(size, nmemb).unwrap_or((0, 0, 0));
+                let (synthetic, data, eof, label, offset) = if buf_ptr == 0 {
+                    (false, Vec::new(), false, None, 0usize)
+                } else {
+                    os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|mut os| {
+                            let stream_state = os.popen_streams.get_mut(&stream)?;
+                            let data = read_popen_stream_bytes(stream_state, byte_count);
+                            Some((
+                                true,
+                                data,
+                                stream_state.eof,
+                                stream_state.label.clone(),
+                                stream_state.offset,
+                            ))
+                        })
+                        .unwrap_or((false, Vec::new(), false, None, 0usize))
+                };
+
+                let mut errno = 0u32;
+                let result_items = if synthetic && !data.is_empty() {
+                    match emu.write_memory(buf_ptr, &data) {
+                        Ok(()) => {
+                            if item_size == 0 {
+                                0
+                            } else {
+                                data.len() / item_size
+                            }
+                        }
+                        Err(_) => {
+                            errno = 14;
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+                let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result_items as u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+
+                let preview = lossy_data_preview(&data, 128);
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_fread(buf=0x{:X}, size={}, nmemb={}, stream=0x{:X}) -> {} synthetic={} bytes={} eof={} label={:?}",
+                        buf_ptr,
+                        size,
+                        nmemb,
+                        stream,
+                        result_items,
+                        synthetic,
+                        data.len(),
+                        eof,
+                        label
+                    ),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "fread", "fread")
+                    .arg("Buf", format!("0x{:X}", buf_ptr))
+                    .arg("Size", size.to_string())
+                    .arg("Nmemb", nmemb.to_string())
+                    .arg("Stream", format!("0x{:X}", stream))
+                    .arg("SyntheticPopen", synthetic.to_string())
+                    .arg("SyntheticLabel", label.unwrap_or_default())
+                    .arg("Bytes", data.len().to_string())
+                    .arg("Offset", offset.to_string())
+                    .arg("Eof", eof.to_string())
+                    .arg("Preview", preview)
+                    .arg("Result", result_items.to_string())
+                    .arg("Errno", errno.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+        }
+
+        if let Some(&addr) = stub_map.get("_feof") {
+            let os_runtime = shared_state.os_runtime.clone();
+            let thread_runtime = shared_state.thread_runtime.clone();
+            let import_tracker = import_tracker.clone();
+            let trace_bus_for_hook = trace_bus.clone();
+            emulator.add_code_hook(
+                addr,
+                addr + 4,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    let stream = emu.read_reg("x0").unwrap_or(0);
+                    let current_tid = thread_runtime
+                        .lock()
+                        .ok()
+                        .map(|rt| rt.current_thread_id.max(1))
+                        .unwrap_or(1);
+                    let current_pid = os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                        .unwrap_or(1);
+                    let (synthetic, eof, label) = os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|os| {
+                            let stream_state = os.popen_streams.get(&stream)?;
+                            Some((true, stream_state.eof, stream_state.label.clone()))
+                        })
+                        .unwrap_or((false, false, None));
+                    let result = u64::from(synthetic && eof);
+                    let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
+                    let lr = emu.read_reg("lr").unwrap_or(0);
+                    let _ = emu.write_reg("x0", result);
+                    if lr != 0 {
+                        let _ = emu.write_reg("pc", lr);
+                    }
+                    record_arm64_import(
+                        &import_tracker,
+                        format!(
+                            "_feof(stream=0x{:X}) -> {} synthetic={} label={:?}",
+                            stream, result, synthetic, label
+                        ),
+                    );
+                    let event = arm64_process_event(current_pid, current_tid, "feof", "feof")
+                        .arg("Stream", format!("0x{:X}", stream))
+                        .arg("SyntheticPopen", synthetic.to_string())
+                        .arg("SyntheticLabel", label.unwrap_or_default())
+                        .arg("Result", result.to_string())
+                        .arg("Errno", "0");
+                    emit_arm64_event(&trace_bus_for_hook, event);
+                },
+            )?;
+        }
+
+        if let Some(&addr) = stub_map.get("_ferror") {
+            let os_runtime = shared_state.os_runtime.clone();
+            let thread_runtime = shared_state.thread_runtime.clone();
+            let import_tracker = import_tracker.clone();
+            let trace_bus_for_hook = trace_bus.clone();
+            emulator.add_code_hook(
+                addr,
+                addr + 4,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    let stream = emu.read_reg("x0").unwrap_or(0);
+                    let current_tid = thread_runtime
+                        .lock()
+                        .ok()
+                        .map(|rt| rt.current_thread_id.max(1))
+                        .unwrap_or(1);
+                    let current_pid = os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                        .unwrap_or(1);
+                    let (synthetic, error, label) = os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|os| {
+                            let stream_state = os.popen_streams.get(&stream)?;
+                            Some((true, stream_state.error, stream_state.label.clone()))
+                        })
+                        .unwrap_or((false, false, None));
+                    let result = u64::from(synthetic && error);
+                    let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
+                    let lr = emu.read_reg("lr").unwrap_or(0);
+                    let _ = emu.write_reg("x0", result);
+                    if lr != 0 {
+                        let _ = emu.write_reg("pc", lr);
+                    }
+                    record_arm64_import(
+                        &import_tracker,
+                        format!(
+                            "_ferror(stream=0x{:X}) -> {} synthetic={} label={:?}",
+                            stream, result, synthetic, label
+                        ),
+                    );
+                    let event = arm64_process_event(current_pid, current_tid, "ferror", "ferror")
+                        .arg("Stream", format!("0x{:X}", stream))
+                        .arg("SyntheticPopen", synthetic.to_string())
+                        .arg("SyntheticLabel", label.unwrap_or_default())
+                        .arg("Result", result.to_string())
+                        .arg("Errno", "0");
+                    emit_arm64_event(&trace_bus_for_hook, event);
+                },
+            )?;
+        }
+
+        if let Some(&addr) = stub_map.get("_clearerr") {
+            let os_runtime = shared_state.os_runtime.clone();
+            let thread_runtime = shared_state.thread_runtime.clone();
+            let import_tracker = import_tracker.clone();
+            let trace_bus_for_hook = trace_bus.clone();
+            emulator.add_code_hook(
+                addr,
+                addr + 4,
+                move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                    let stream = emu.read_reg("x0").unwrap_or(0);
+                    let current_tid = thread_runtime
+                        .lock()
+                        .ok()
+                        .map(|rt| rt.current_thread_id.max(1))
+                        .unwrap_or(1);
+                    let current_pid = os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                        .unwrap_or(1);
+                    let (synthetic, label) = os_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|mut os| {
+                            let stream_state = os.popen_streams.get_mut(&stream)?;
+                            stream_state.eof = false;
+                            stream_state.error = false;
+                            Some((true, stream_state.label.clone()))
+                        })
+                        .unwrap_or((false, None));
+                    let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
+                    let lr = emu.read_reg("lr").unwrap_or(0);
+                    let _ = emu.write_reg("x0", 0u64);
+                    if lr != 0 {
+                        let _ = emu.write_reg("pc", lr);
+                    }
+                    record_arm64_import(
+                        &import_tracker,
+                        format!(
+                            "_clearerr(stream=0x{:X}) synthetic={} label={:?}",
+                            stream, synthetic, label
+                        ),
+                    );
+                    let event =
+                        arm64_process_event(current_pid, current_tid, "clearerr", "clearerr")
+                            .arg("Stream", format!("0x{:X}", stream))
+                            .arg("SyntheticPopen", synthetic.to_string())
+                            .arg("SyntheticLabel", label.unwrap_or_default())
+                            .arg("Result", "0")
+                            .arg("Errno", "0");
+                    emit_arm64_event(&trace_bus_for_hook, event);
+                },
+            )?;
+        }
     }
 
     if let Some(&addr) = stub_map.get("_kill") {

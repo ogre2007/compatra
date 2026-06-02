@@ -117,6 +117,41 @@ fn machoman_profiler_system_commands_are_visible_on_popen_hooks() {
     assert_line_with(
         &trace,
         &[
+            "\"Call\":\"popen\"",
+            "\"Command\":\"uname -s 2>/dev/null\"",
+            "\"SyntheticOutput\":\"true\"",
+            "\"SyntheticLabel\":\"uname-kernel\"",
+            "\"OutputBytes\":\"7\"",
+        ],
+        "synthetic stdout metadata for uname -s",
+    );
+
+    assert_line_with(
+        &trace,
+        &[
+            "\"Call\":\"fgets\"",
+            "\"SyntheticPopen\":\"true\"",
+            "\"SyntheticLabel\":\"uname-kernel\"",
+            "\"Preview\":\"Darwin\\\\n\"",
+            "\"Result\":\"0x",
+        ],
+        "guest fgets reading synthetic uname output",
+    );
+
+    assert_line_with(
+        &trace,
+        &[
+            "\"Call\":\"fgets\"",
+            "\"SyntheticPopen\":\"true\"",
+            "\"SyntheticLabel\":\"process-list\"",
+            "Google Chrome",
+        ],
+        "guest fgets reading synthetic process-list output",
+    );
+
+    assert_line_with(
+        &trace,
+        &[
             "\"Call\":\"emulation-stop\"",
             "idle_sleep_loop(seconds=1, caller=0x100228950, sleeps=3)",
         ],

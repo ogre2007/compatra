@@ -8,7 +8,7 @@ pub use crate::macos::arm64_runtime::{
     terminate_synthetic_process, wake_arm64_cond_waiters, wake_one_arm64_cond_waiter,
     yield_active_arm64_thread, ActiveArm64Thread, Arm64ThreadRuntime, ForkParentResume,
     PendingArm64Thread, SyntheticFdTarget, SyntheticKeventRegistration, SyntheticPipe,
-    SyntheticProcess, WaitingArm64Thread, ARM64_SYNTHETIC_THREAD_STACK_BASE,
+    SyntheticPopenStream, SyntheticProcess, WaitingArm64Thread, ARM64_SYNTHETIC_THREAD_STACK_BASE,
     ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
 };
 

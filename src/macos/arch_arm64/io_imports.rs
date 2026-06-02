@@ -26,12 +26,72 @@ use crate::macos::{
     duplicate_synthetic_fd, fstat_guest_file, open_directory_stream, open_guest_file,
     open_guest_file_with_flags, read_guest_directory_entry, read_guest_file, register_process_fd,
     resolve_directory_stream_fd, resolve_guest_path, resolve_process_fd_target, stat_guest_path,
-    terminate_synthetic_process, Emulator, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
-    SyntheticKeventRegistration, SyntheticPipe,
+    terminate_synthetic_process, Arm64SyntheticOsRuntime, Emulator, PendingArm64Thread,
+    SharedTraceBus, SyntheticFdTarget, SyntheticKeventRegistration, SyntheticPipe,
 };
 use crate::UnicornEmulator;
 
 const ARM64_PIPE_IDLE_EOF_READ_LIMIT: u64 = 256;
+const EV_ADD: u16 = 0x0001;
+const EV_DELETE: u16 = 0x0002;
+const EV_ENABLE: u16 = 0x0004;
+const EV_DISABLE: u16 = 0x0008;
+const EV_CLEAR: u16 = 0x0020;
+const EV_RECEIPT: u16 = 0x0040;
+const EV_ERROR: u16 = 0x4000;
+const EV_EOF: u16 = 0x8000;
+const EVFILT_READ: i16 = -1;
+const EVFILT_WRITE: i16 = -2;
+const EVFILT_USER: i16 = -10;
+const NOTE_TRIGGER: u32 = 0x0100_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SyntheticReadyKevent {
+    ident: u64,
+    filter: i16,
+    flags: u16,
+    data: i64,
+    fflags: u32,
+    udata: u64,
+    clear_user_trigger: bool,
+}
+
+impl SyntheticReadyKevent {
+    fn new(ident: u64, filter: i16, flags: u16, data: i64, fflags: u32, udata: u64) -> Self {
+        Self {
+            ident,
+            filter,
+            flags,
+            data,
+            fflags,
+            udata,
+            clear_user_trigger: false,
+        }
+    }
+
+    fn user(
+        ident: u64,
+        flags: u16,
+        data: i64,
+        fflags: u32,
+        udata: u64,
+        clear_user_trigger: bool,
+    ) -> Self {
+        Self {
+            ident,
+            filter: EVFILT_USER,
+            flags,
+            data,
+            fflags,
+            udata,
+            clear_user_trigger,
+        }
+    }
+
+    fn receipt(ident: u64, filter: i16, udata: u64) -> Self {
+        Self::new(ident, filter, EV_ERROR, 0, 0, udata)
+    }
+}
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
@@ -55,6 +115,189 @@ fn read_cstring(emu: &mut dyn Emulator, addr: u64, max_len: usize) -> String {
         out.push(byte);
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn apply_synthetic_kevent_change(
+    registrations: &mut Vec<SyntheticKeventRegistration>,
+    ident: u64,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: i64,
+    udata: u64,
+) -> Option<SyntheticReadyKevent> {
+    let wants_receipt = flags & EV_RECEIPT != 0;
+    let stored_flags = flags & !(EV_RECEIPT | EV_ERROR);
+
+    if flags & EV_DELETE != 0 {
+        registrations.retain(|reg| !(reg.ident == ident && reg.filter == filter));
+        return wants_receipt.then(|| SyntheticReadyKevent::receipt(ident, filter, udata));
+    }
+
+    if filter == EVFILT_USER && fflags & NOTE_TRIGGER != 0 {
+        if let Some(registration) = registrations
+            .iter_mut()
+            .find(|reg| reg.ident == ident && reg.filter == filter)
+        {
+            registration.triggered = true;
+            registration.fflags |= fflags;
+            if data != 0 {
+                registration.data = data;
+            }
+        }
+    }
+
+    if flags & EV_ADD != 0 {
+        registrations.retain(|reg| !(reg.ident == ident && reg.filter == filter));
+        registrations.push(SyntheticKeventRegistration {
+            ident,
+            filter,
+            flags: stored_flags,
+            fflags,
+            data,
+            udata,
+            triggered: filter == EVFILT_USER && fflags & NOTE_TRIGGER != 0,
+        });
+    } else if flags & EV_ENABLE != 0 {
+        if let Some(registration) = registrations
+            .iter_mut()
+            .find(|reg| reg.ident == ident && reg.filter == filter)
+        {
+            registration.flags &= !EV_DISABLE;
+            registration.flags |= stored_flags & !EV_ENABLE;
+            if fflags != 0 {
+                registration.fflags = fflags;
+            }
+            if data != 0 {
+                registration.data = data;
+            }
+            if udata != 0 {
+                registration.udata = udata;
+            }
+        }
+    } else if flags & EV_DISABLE != 0 {
+        if let Some(registration) = registrations
+            .iter_mut()
+            .find(|reg| reg.ident == ident && reg.filter == filter)
+        {
+            registration.flags |= EV_DISABLE;
+        }
+    }
+
+    wants_receipt.then(|| SyntheticReadyKevent::receipt(ident, filter, udata))
+}
+
+fn collect_synthetic_kevent_ready(
+    os: &Arm64SyntheticOsRuntime,
+    pid: u64,
+    registrations: &[SyntheticKeventRegistration],
+    registration_debug: &mut Vec<String>,
+) -> Vec<SyntheticReadyKevent> {
+    let mut ready = Vec::new();
+    for reg in registrations {
+        if reg.flags & EV_DISABLE != 0 {
+            registration_debug.push(format!(
+                "ident={} filter={} disabled flags=0x{:X}",
+                reg.ident, reg.filter, reg.flags
+            ));
+            continue;
+        }
+
+        if reg.filter == EVFILT_USER {
+            registration_debug.push(format!(
+                "ident={} filter={} user triggered={} flags=0x{:X} fflags=0x{:X}",
+                reg.ident, reg.filter, reg.triggered, reg.flags, reg.fflags
+            ));
+            if reg.triggered {
+                ready.push(SyntheticReadyKevent::user(
+                    reg.ident,
+                    0,
+                    reg.data,
+                    reg.fflags,
+                    reg.udata,
+                    reg.flags & EV_CLEAR != 0,
+                ));
+            }
+            continue;
+        }
+
+        let Some(target) = resolve_process_fd_target(os, pid, reg.ident) else {
+            registration_debug.push(format!(
+                "ident={} filter={} unresolved",
+                reg.ident, reg.filter
+            ));
+            continue;
+        };
+        match target {
+            SyntheticFdTarget::PipeRead(pipe_id) => {
+                if let Some(pipe) = os.pipes.get(&pipe_id) {
+                    let available = pipe.buffer.len() as u64;
+                    let eof = !pipe.write_open;
+                    registration_debug.push(format!(
+                        "ident={} filter={} pipe={} kind=read available={} read_open={} write_open={}",
+                        reg.ident, reg.filter, pipe_id, available, pipe.read_open, pipe.write_open
+                    ));
+                    if reg.filter == EVFILT_READ && (available > 0 || eof) {
+                        ready.push(SyntheticReadyKevent::new(
+                            reg.ident,
+                            reg.filter,
+                            if eof { EV_EOF } else { 0 },
+                            available as i64,
+                            reg.fflags,
+                            reg.udata,
+                        ));
+                    }
+                }
+            }
+            SyntheticFdTarget::PipeWrite(pipe_id) => {
+                if let Some(pipe) = os.pipes.get(&pipe_id) {
+                    let buffered = pipe.buffer.len() as u64;
+                    let eof = !pipe.read_open;
+                    registration_debug.push(format!(
+                        "ident={} filter={} pipe={} kind=write buffered={} read_open={} write_open={}",
+                        reg.ident, reg.filter, pipe_id, buffered, pipe.read_open, pipe.write_open
+                    ));
+                    if reg.filter == EVFILT_WRITE && (pipe.read_open || eof) {
+                        ready.push(SyntheticReadyKevent::new(
+                            reg.ident,
+                            reg.filter,
+                            if eof { EV_EOF } else { 0 },
+                            buffered as i64,
+                            reg.fflags,
+                            reg.udata,
+                        ));
+                    }
+                }
+            }
+            SyntheticFdTarget::File(_) => {
+                registration_debug.push(format!("ident={} filter={} file", reg.ident, reg.filter));
+            }
+            SyntheticFdTarget::Directory(_) => {
+                registration_debug.push(format!(
+                    "ident={} filter={} directory",
+                    reg.ident, reg.filter
+                ));
+            }
+        }
+    }
+    ready
+}
+
+fn clear_emitted_user_triggers(
+    registrations: &mut [SyntheticKeventRegistration],
+    emitted_events: &[SyntheticReadyKevent],
+) {
+    for emitted in emitted_events {
+        if !emitted.clear_user_trigger {
+            continue;
+        }
+        if let Some(registration) = registrations
+            .iter_mut()
+            .find(|reg| reg.ident == emitted.ident && reg.filter == emitted.filter)
+        {
+            registration.triggered = false;
+        }
+    }
 }
 
 fn tagged_addr_candidates(addr: u64) -> Vec<u64> {
@@ -269,14 +512,6 @@ pub fn install_arm64_io_imports(
             addr,
             addr + 4,
             move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
-                const EV_ADD: u16 = 0x0001;
-                const EV_DELETE: u16 = 0x0002;
-                const EV_ENABLE: u16 = 0x0004;
-                const EV_DISABLE: u16 = 0x0008;
-                const EV_EOF: u16 = 0x8000;
-                const EVFILT_READ: i16 = -1;
-                const EVFILT_WRITE: i16 = -2;
-
                 let kq_fd = emu.read_reg("x0").unwrap_or(0);
                 let changelist = emu.read_reg("x1").unwrap_or(0);
                 let nchanges = emu.read_reg("x2").unwrap_or(0);
@@ -300,8 +535,9 @@ pub fn install_arm64_io_imports(
                         Ok(os) => os,
                         Err(_) => return,
                     };
-                    let registrations_snapshot = {
+                    let (registrations_snapshot, receipt_events) = {
                         let registrations = os.kqueues.entry(kq_fd).or_default();
+                        let mut receipt_events = Vec::new();
                         for idx in 0..nchanges {
                             let entry_addr = changelist + (idx as u64).saturating_mul(32);
                             let entry = emu.read_memory(entry_addr, 32).unwrap_or_default();
@@ -324,116 +560,68 @@ pub fn install_arm64_io_imports(
                                 "ident={} filter={} flags=0x{:X} fflags=0x{:X} data={} udata=0x{:X}",
                                 ident, filter, flags, fflags, data, udata
                             ));
-                            if flags & EV_DELETE != 0 {
-                                registrations.retain(|reg| !(reg.ident == ident && reg.filter == filter));
-                                continue;
-                            }
-                            if flags & EV_ADD != 0 || flags & EV_ENABLE != 0 {
-                                registrations.retain(|reg| !(reg.ident == ident && reg.filter == filter));
-                                if flags & EV_DISABLE == 0 {
-                                    registrations.push(SyntheticKeventRegistration {
-                                        ident,
-                                        filter,
-                                        flags,
-                                        fflags,
-                                        data,
-                                        udata,
-                                    });
-                                }
+                            if let Some(receipt) = apply_synthetic_kevent_change(
+                                registrations,
+                                ident,
+                                filter,
+                                flags,
+                                fflags,
+                                data,
+                                udata,
+                            ) {
+                                receipt_events.push(receipt);
                             }
                         }
-                        registrations.clone()
+                        (registrations.clone(), receipt_events)
                     };
-
-                    let mut ready = Vec::new();
-                    for reg in registrations_snapshot.iter() {
-                        let Some(target) = resolve_process_fd_target(&os, current_pid, reg.ident) else {
-                            registration_debug.push(format!(
-                                "ident={} filter={} unresolved",
-                                reg.ident, reg.filter
-                            ));
-                            continue;
-                        };
-                        match target {
-                            SyntheticFdTarget::PipeRead(pipe_id) => {
-                                if let Some(pipe) = os.pipes.get(&pipe_id) {
-                                    let available = pipe.buffer.len() as u64;
-                                    let eof = !pipe.write_open;
-                                    registration_debug.push(format!(
-                                        "ident={} filter={} pipe={} kind=read available={} read_open={} write_open={}",
-                                        reg.ident, reg.filter, pipe_id, available, pipe.read_open, pipe.write_open
-                                    ));
-                                    if reg.filter == EVFILT_READ && (available > 0 || eof) {
-                                        ready.push((
-                                            reg.ident,
-                                            reg.filter,
-                                            if eof { EV_EOF } else { 0 },
-                                            available,
-                                            reg.fflags,
-                                            reg.udata,
-                                        ));
-                                    }
-                                }
-                            }
-                            SyntheticFdTarget::PipeWrite(pipe_id) => {
-                                if let Some(pipe) = os.pipes.get(&pipe_id) {
-                                    let buffered = pipe.buffer.len() as u64;
-                                    let eof = !pipe.read_open;
-                                    registration_debug.push(format!(
-                                        "ident={} filter={} pipe={} kind=write buffered={} read_open={} write_open={}",
-                                        reg.ident, reg.filter, pipe_id, buffered, pipe.read_open, pipe.write_open
-                                    ));
-                                    if reg.filter == EVFILT_WRITE && (pipe.read_open || eof) {
-                                        ready.push((
-                                            reg.ident,
-                                            reg.filter,
-                                            if eof { EV_EOF } else { 0 },
-                                            buffered,
-                                            reg.fflags,
-                                            reg.udata,
-                                        ));
-                                    }
-                                }
-                            }
-                            SyntheticFdTarget::File(_) => {
-                                registration_debug.push(format!(
-                                    "ident={} filter={} file",
-                                    reg.ident, reg.filter
-                                ));
-                            }
-                            SyntheticFdTarget::Directory(_) => {
-                                registration_debug.push(format!(
-                                    "ident={} filter={} directory",
-                                    reg.ident, reg.filter
-                                ));
-                            }
-                        }
+                    if !receipt_events.is_empty() {
+                        receipt_events
+                    } else {
+                        collect_synthetic_kevent_ready(
+                            &os,
+                            current_pid,
+                            &registrations_snapshot,
+                            &mut registration_debug,
+                        )
                     }
-                    ready
                 };
 
                 let mut emitted = 0u64;
                 let mut emitted_summaries = Vec::new();
+                let mut emitted_events = Vec::new();
                 if eventlist != 0 {
-                    for (idx, (ident, filter, flags, data, fflags, udata)) in
+                    for (idx, ready_event) in
                         ready_events.into_iter().take(nevents as usize).enumerate()
                     {
                         let entry_addr = eventlist + (idx as u64).saturating_mul(32);
                         let mut entry = [0u8; 32];
-                        entry[0..8].copy_from_slice(&ident.to_le_bytes());
-                        entry[8..10].copy_from_slice(&filter.to_le_bytes());
-                        entry[10..12].copy_from_slice(&flags.to_le_bytes());
-                        entry[12..16].copy_from_slice(&fflags.to_le_bytes());
-                        entry[16..24].copy_from_slice(&(data as i64).to_le_bytes());
-                        entry[24..32].copy_from_slice(&udata.to_le_bytes());
+                        entry[0..8].copy_from_slice(&ready_event.ident.to_le_bytes());
+                        entry[8..10].copy_from_slice(&ready_event.filter.to_le_bytes());
+                        entry[10..12].copy_from_slice(&ready_event.flags.to_le_bytes());
+                        entry[12..16].copy_from_slice(&ready_event.fflags.to_le_bytes());
+                        entry[16..24].copy_from_slice(&ready_event.data.to_le_bytes());
+                        entry[24..32].copy_from_slice(&ready_event.udata.to_le_bytes());
                         let _ = emu.write_memory(entry_addr, &entry);
-                        if current_tid == 2 && nchanges == 0 && emitted_summaries.len() < 8 {
+                        if emitted_summaries.len() < 8 {
                             emitted_summaries.push(format!(
                                 "ident={} filter={} flags=0x{:X} fflags=0x{:X} data={} udata=0x{:X}",
-                                ident, filter, flags, fflags, data, udata
+                                ready_event.ident,
+                                ready_event.filter,
+                                ready_event.flags,
+                                ready_event.fflags,
+                                ready_event.data,
+                                ready_event.udata
                             ));
                         }
+                        emitted_events.push(ready_event);
                         emitted = emitted.saturating_add(1);
+                    }
+                }
+                if !emitted_events.is_empty() {
+                    if let Ok(mut os) = os_runtime.lock() {
+                        if let Some(registrations) = os.kqueues.get_mut(&kq_fd) {
+                            clear_emitted_user_triggers(registrations, &emitted_events);
+                        }
                     }
                 }
 
@@ -461,7 +649,7 @@ pub fn install_arm64_io_imports(
                         kq_fd, current_pid, current_tid, registration_debug.join(" | ")
                     );
                 }
-                if emitted > 0 && nchanges == 0 && current_tid == 2 && !emitted_summaries.is_empty() {
+                if emitted > 0 && nchanges == 0 && !emitted_summaries.is_empty() {
                     println!(
                         "[KQUEUE-EMIT][arm64] kq={} pid={} tid={} events={}",
                         kq_fd, current_pid, current_tid, emitted_summaries.join(" | ")
@@ -3371,4 +3559,176 @@ pub fn install_arm64_io_imports(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    fn user_registration(flags: u16) -> SyntheticKeventRegistration {
+        SyntheticKeventRegistration {
+            ident: 0,
+            filter: EVFILT_USER,
+            flags,
+            fflags: 0,
+            data: 0,
+            udata: 0xABCD,
+            triggered: false,
+        }
+    }
+
+    #[test]
+    fn evfilt_user_registration_receipt_and_trigger_are_reported() {
+        let mut registrations = Vec::new();
+
+        let receipt = apply_synthetic_kevent_change(
+            &mut registrations,
+            0,
+            EVFILT_USER,
+            EV_ADD | EV_CLEAR | EV_RECEIPT,
+            0,
+            0,
+            0x1234,
+        );
+
+        assert_eq!(
+            receipt,
+            Some(SyntheticReadyKevent::receipt(0, EVFILT_USER, 0x1234))
+        );
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].ident, 0);
+        assert_eq!(registrations[0].filter, EVFILT_USER);
+        assert_eq!(registrations[0].udata, 0x1234);
+        assert!(!registrations[0].triggered);
+
+        let trigger_receipt = apply_synthetic_kevent_change(
+            &mut registrations,
+            0,
+            EVFILT_USER,
+            0,
+            NOTE_TRIGGER,
+            7,
+            0,
+        );
+
+        assert_eq!(trigger_receipt, None);
+        assert!(registrations[0].triggered);
+        assert_eq!(registrations[0].data, 7);
+
+        let os = Arm64SyntheticOsRuntime::default();
+        let mut debug = Vec::new();
+        let ready = collect_synthetic_kevent_ready(&os, 1, &registrations, &mut debug);
+
+        assert_eq!(
+            ready,
+            vec![SyntheticReadyKevent::user(
+                0,
+                0,
+                7,
+                NOTE_TRIGGER,
+                0x1234,
+                true
+            )]
+        );
+        assert!(debug
+            .iter()
+            .any(|line| line.contains("filter=-10 user triggered=true")));
+
+        clear_emitted_user_triggers(&mut registrations, &ready);
+        assert!(!registrations[0].triggered);
+    }
+
+    #[test]
+    fn evfilt_user_without_ev_clear_remains_triggered_after_emit() {
+        let mut registrations = vec![user_registration(0)];
+        registrations[0].triggered = true;
+
+        let os = Arm64SyntheticOsRuntime::default();
+        let mut debug = Vec::new();
+        let ready = collect_synthetic_kevent_ready(&os, 1, &registrations, &mut debug);
+
+        assert_eq!(ready.len(), 1);
+        assert!(!ready[0].clear_user_trigger);
+        clear_emitted_user_triggers(&mut registrations, &ready);
+        assert!(registrations[0].triggered);
+    }
+
+    #[test]
+    fn disabled_evfilter_user_is_not_ready_until_enabled() {
+        let mut registrations = Vec::new();
+
+        let receipt = apply_synthetic_kevent_change(
+            &mut registrations,
+            0,
+            EVFILT_USER,
+            EV_ADD | EV_CLEAR | EV_DISABLE | EV_RECEIPT,
+            NOTE_TRIGGER,
+            0,
+            0xDEAD,
+        );
+        assert_eq!(
+            receipt,
+            Some(SyntheticReadyKevent::receipt(0, EVFILT_USER, 0xDEAD))
+        );
+        assert_eq!(registrations.len(), 1);
+        assert!(registrations[0].triggered);
+        assert_ne!(registrations[0].flags & EV_DISABLE, 0);
+
+        let os = Arm64SyntheticOsRuntime::default();
+        let mut debug = Vec::new();
+        let ready = collect_synthetic_kevent_ready(&os, 1, &registrations, &mut debug);
+        assert!(ready.is_empty());
+        assert!(debug
+            .iter()
+            .any(|line| line.contains("filter=-10 disabled")));
+
+        apply_synthetic_kevent_change(&mut registrations, 0, EVFILT_USER, EV_ENABLE, 0, 0, 0);
+        assert_eq!(registrations[0].flags & EV_DISABLE, 0);
+
+        let mut debug = Vec::new();
+        let ready = collect_synthetic_kevent_ready(&os, 1, &registrations, &mut debug);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].udata, 0xDEAD);
+    }
+
+    #[test]
+    fn pipe_read_registration_still_reports_buffered_bytes() {
+        let pid = 7;
+        let fd = 42;
+        let pipe_id = 9;
+        let mut os = Arm64SyntheticOsRuntime::default();
+        os.pipes.insert(
+            pipe_id,
+            SyntheticPipe {
+                read_fd: fd,
+                write_fd: fd + 1,
+                buffer: VecDeque::from([b'a', b'b', b'c']),
+                read_open: true,
+                write_open: true,
+            },
+        );
+        bind_process_fd_target(&mut os, pid, fd, SyntheticFdTarget::PipeRead(pipe_id));
+
+        let registrations = vec![SyntheticKeventRegistration {
+            ident: fd,
+            filter: EVFILT_READ,
+            flags: EV_ADD,
+            fflags: 0,
+            data: 0,
+            udata: 0xCAFE,
+            triggered: false,
+        }];
+        let mut debug = Vec::new();
+        let ready = collect_synthetic_kevent_ready(&os, pid, &registrations, &mut debug);
+
+        assert_eq!(
+            ready,
+            vec![SyntheticReadyKevent::new(fd, EVFILT_READ, 0, 3, 0, 0xCAFE)]
+        );
+        assert!(debug
+            .iter()
+            .any(|line| line.contains("kind=read available=3")));
+    }
 }

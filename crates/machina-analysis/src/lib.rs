@@ -31,4 +31,7 @@ pub use operator_hooks::{
 };
 pub use plugin_preset::{analysis_plugin_specs, AnalysisEventCategory, AnalysisPluginSpec};
 pub use runtime_hooks::{AnalysisRuntimeHooks, PipeStdinCaptureProgress};
-pub use service::{AnalysisServices, FilePayloadDump, PipeStdinCaptureReport, SyntheticLogStream};
+pub use service::{
+    AnalysisServices, FilePayloadDump, PipeStdinCaptureReport, SyntheticLogStream,
+    SyntheticPopenOutput,
+};

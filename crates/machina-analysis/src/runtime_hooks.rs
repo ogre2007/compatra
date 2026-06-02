@@ -9,7 +9,10 @@ use crate::operator_hooks::{
     function_entry_specs_from_env, usage_bypass_specs_from_env, FunctionEntryProbeSpec,
     UsageBypassHookSpec,
 };
-use crate::{AnalysisServices, FilePayloadDump, PipeStdinCaptureReport, SyntheticLogStream};
+use crate::{
+    AnalysisServices, FilePayloadDump, PipeStdinCaptureReport, SyntheticLogStream,
+    SyntheticPopenOutput,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct AnalysisRuntimeHooks {
@@ -59,6 +62,10 @@ impl AnalysisRuntimeHooks {
 
     pub fn synthetic_log_stream(&self, path: &str, argv: &[String]) -> Option<SyntheticLogStream> {
         self.services?.synthetic_log_stream(path, argv)
+    }
+
+    pub fn synthetic_popen_output(&self, command: &str) -> Option<SyntheticPopenOutput> {
+        self.services?.synthetic_popen_output(command)
     }
 
     pub fn write_posix_spawn_argv_capture(
@@ -188,6 +195,9 @@ mod tests {
         assert!(!hooks.is_enabled());
         assert!(hooks
             .synthetic_log_stream("log", &["stream".to_string()])
+            .is_none());
+        assert!(hooks
+            .synthetic_popen_output("uname -s 2>/dev/null")
             .is_none());
         assert!(hooks.observe_pipe_stdin_write(1, b"ignored").is_none());
     }

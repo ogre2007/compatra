@@ -52,7 +52,7 @@ pub use macos::runtime::{
     terminate_synthetic_process, wake_cond_waiters, wake_one_cond_waiter,
     yield_active_arm64_thread, ActiveArm64Thread, Arm64ThreadRuntime, ForkParentResume,
     PendingArm64Thread, SyntheticFdTarget, SyntheticKeventRegistration, SyntheticOsRuntime,
-    SyntheticPipe, SyntheticProcess, ThreadContext, WaitingArm64Thread,
+    SyntheticPipe, SyntheticPopenStream, SyntheticProcess, ThreadContext, WaitingArm64Thread,
     ARM64_SYNTHETIC_THREAD_STACK_BASE, ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
 };
 pub use macos::runtime_plugins::{

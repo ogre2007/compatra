@@ -31,22 +31,31 @@ jobs:
         test "$(uname -s)" = "Darwin"
         test "$(uname -m)" = "x86_64"
         sw_vers
-    - name: Build release machina and run compat-mode smoke test with proof output
-      run: cargo test --release --test compat_mode_macos --verbose -- --nocapture
+    - name: Verify compatibility utility excludes analysis crate
+      run: |
+        if cargo tree --no-default-features -e normal | grep -q 'machina-analysis'; then
+          echo "machina-analysis unexpectedly appears in no-default compatibility dependency graph"
+          cargo tree --no-default-features -e normal
+          exit 1
+        fi
+    - name: Build release compatibility utility without analysis feature
+      run: cargo build --release --no-default-features --bin machina-compat --verbose
+    - name: Run compat-mode smoke test with proof output
+      run: cargo test --release --no-default-features --test compat_mode_macos --verbose -- --nocapture
     - name: Package Intel macOS compatibility utility
       run: |
         mkdir -p dist
-        cp target/release/machina dist/machina
-        chmod +x dist/machina
-        tar -czf dist/machina-macos-intel-x86_64.tar.gz -C dist machina
-        shasum -a 256 dist/machina-macos-intel-x86_64.tar.gz > dist/machina-macos-intel-x86_64.tar.gz.sha256
+        cp target/release/machina-compat dist/machina-compat
+        chmod +x dist/machina-compat
+        tar -czf dist/machina-compat-macos-intel-x86_64.tar.gz -C dist machina-compat
+        shasum -a 256 dist/machina-compat-macos-intel-x86_64.tar.gz > dist/machina-compat-macos-intel-x86_64.tar.gz.sha256
         ls -lh dist
     - name: Upload Intel macOS compatibility utility
       uses: actions/upload-artifact@v4
       with:
-        name: machina-macos-intel-x86_64
+        name: machina-compat-macos-intel-x86_64
         path: |
-          dist/machina-macos-intel-x86_64.tar.gz
-          dist/machina-macos-intel-x86_64.tar.gz.sha256
+          dist/machina-compat-macos-intel-x86_64.tar.gz
+          dist/machina-compat-macos-intel-x86_64.tar.gz.sha256
         if-no-files-found: error
         retention-days: 14

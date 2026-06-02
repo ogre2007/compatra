@@ -26,7 +26,15 @@ fn fixture_path() -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn machina_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_machina"))
+    option_env!("CARGO_BIN_EXE_machina-compat")
+        .or(option_env!("CARGO_BIN_EXE_machina"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            workspace_root()
+                .join("target")
+                .join("release")
+                .join("machina-compat")
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -381,16 +389,28 @@ fn compile_arm64_network_fixture() -> PathBuf {
     let binary = out_dir.join("arm64_network_compat");
     fs::write(
         &source,
-        r#"#include <dlfcn.h>
+        r#"#include <arpa/inet.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 typedef int (*getaddrinfo_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
 typedef void (*freeaddrinfo_fn)(struct addrinfo *);
+typedef int (*getnameinfo_fn)(const struct sockaddr *, socklen_t, char *, socklen_t, char *, socklen_t, int);
+typedef in_addr_t (*inet_addr_fn)(const char *);
+typedef int (*inet_aton_fn)(const char *, struct in_addr *);
+typedef const char *(*inet_ntop_fn)(int, const void *, char *, socklen_t);
+typedef uint32_t (*htonl_fn)(uint32_t);
+typedef uint16_t (*htons_fn)(uint16_t);
+typedef uint32_t (*ntohl_fn)(uint32_t);
+typedef uint16_t (*ntohs_fn)(uint16_t);
 typedef ssize_t (*send_fn)(int, const void *, size_t, int);
 typedef ssize_t (*recv_fn)(int, void *, size_t, int);
 typedef ssize_t (*sendmsg_fn)(int, const struct msghdr *, int);
@@ -464,32 +484,123 @@ static int probe_msg(const char *label, sendmsg_fn send_msg, recvmsg_fn recv_msg
     return 0;
 }
 
+static int probe_inet_legacy(
+    const char *label,
+    inet_addr_fn inet_addr_ptr,
+    inet_aton_fn inet_aton_ptr,
+    inet_ntop_fn inet_ntop_ptr,
+    htonl_fn htonl_ptr,
+    htons_fn htons_ptr,
+    ntohl_fn ntohl_ptr,
+    ntohs_fn ntohs_ptr
+) {
+    struct in_addr parsed = {0};
+    char text[INET_ADDRSTRLEN] = {0};
+    in_addr_t loopback = inet_addr_ptr("127.0.0.1");
+    int aton_ret = inet_aton_ptr("10.20.30.40", &parsed);
+    const char *ntop_ret = inet_ntop_ptr(AF_INET, &parsed, text, sizeof(text));
+    uint32_t net_long = htonl_ptr(0x11223344U);
+    uint32_t host_long = ntohl_ptr(net_long);
+    uint16_t net_short = htons_ptr(0x1357U);
+    uint16_t host_short = ntohs_ptr(net_short);
+    printf(
+        "compat inet %s addr=0x%08x aton=%d text=%s ntop=%p htonl=0x%08x ntohl=0x%08x htons=0x%04x ntohs=0x%04x errno=%d\n",
+        label,
+        (unsigned)loopback,
+        aton_ret,
+        text,
+        (void *)ntop_ret,
+        (unsigned)net_long,
+        (unsigned)host_long,
+        (unsigned)net_short,
+        (unsigned)host_short,
+        errno
+    );
+    if (loopback != htonl_ptr(0x7f000001U) || aton_ret != 1 || ntop_ret == 0 || strcmp(text, "10.20.30.40") != 0 || host_long != 0x11223344U || host_short != 0x1357U) {
+        return 11;
+    }
+    return 0;
+}
+
+static int probe_nameinfo(
+    const char *label,
+    getnameinfo_fn getnameinfo_ptr,
+    inet_aton_fn inet_aton_ptr,
+    htons_fn htons_ptr
+) {
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+#ifdef __APPLE__
+    sin.sin_len = sizeof(sin);
+#endif
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons_ptr(443);
+    inet_aton_ptr("127.0.0.1", &sin.sin_addr);
+
+    char host[NI_MAXHOST] = {0};
+    char service[NI_MAXSERV] = {0};
+    int ret = getnameinfo_ptr(
+        (const struct sockaddr *)&sin,
+        (socklen_t)sizeof(sin),
+        host,
+        sizeof(host),
+        service,
+        sizeof(service),
+        NI_NUMERICHOST | NI_NUMERICSERV
+    );
+    printf("compat getnameinfo %s ret=%d host=%s service=%s errno=%d\n", label, ret, host, service, errno);
+    if (ret != 0 || strcmp(host, "127.0.0.1") != 0 || strcmp(service, "443") != 0) {
+        return 13;
+    }
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += probe_gai("static", getaddrinfo, freeaddrinfo);
     failures += probe_msg("static", sendmsg, recvmsg);
+    failures += probe_inet_legacy("static", inet_addr, inet_aton, inet_ntop, htonl, htons, ntohl, ntohs);
+    failures += probe_nameinfo("static", getnameinfo, inet_aton, htons);
 
     void *self = dlopen(NULL, RTLD_NOW);
     getaddrinfo_fn dyn_gai = (getaddrinfo_fn)dlsym(self, "getaddrinfo");
     freeaddrinfo_fn dyn_free = (freeaddrinfo_fn)dlsym(self, "freeaddrinfo");
+    getnameinfo_fn dyn_nameinfo = (getnameinfo_fn)dlsym(self, "getnameinfo");
+    inet_addr_fn dyn_inet_addr = (inet_addr_fn)dlsym(self, "inet_addr");
+    inet_aton_fn dyn_inet_aton = (inet_aton_fn)dlsym(self, "inet_aton");
+    inet_ntop_fn dyn_inet_ntop = (inet_ntop_fn)dlsym(self, "inet_ntop");
+    htonl_fn dyn_htonl = (htonl_fn)dlsym(self, "htonl");
+    htons_fn dyn_htons = (htons_fn)dlsym(self, "htons");
+    ntohl_fn dyn_ntohl = (ntohl_fn)dlsym(self, "ntohl");
+    ntohs_fn dyn_ntohs = (ntohs_fn)dlsym(self, "ntohs");
     send_fn dyn_send = (send_fn)dlsym(self, "send");
     recv_fn dyn_recv = (recv_fn)dlsym(self, "recv");
     sendmsg_fn dyn_sendmsg = (sendmsg_fn)dlsym(self, "sendmsg");
     recvmsg_fn dyn_recvmsg = (recvmsg_fn)dlsym(self, "recvmsg");
     printf(
-        "compat dlsym network ptrs %p %p %p %p %p %p\n",
+        "compat dlsym network ptrs gai=%p free=%p nameinfo=%p inet_addr=%p inet_aton=%p inet_ntop=%p htonl=%p htons=%p ntohl=%p ntohs=%p send=%p recv=%p sendmsg=%p recvmsg=%p\n",
         (void *)dyn_gai,
         (void *)dyn_free,
+        (void *)dyn_nameinfo,
+        (void *)dyn_inet_addr,
+        (void *)dyn_inet_aton,
+        (void *)dyn_inet_ntop,
+        (void *)dyn_htonl,
+        (void *)dyn_htons,
+        (void *)dyn_ntohl,
+        (void *)dyn_ntohs,
         (void *)dyn_send,
         (void *)dyn_recv,
         (void *)dyn_sendmsg,
         (void *)dyn_recvmsg
     );
-    if (dyn_gai == 0 || dyn_free == 0 || dyn_send == 0 || dyn_recv == 0 || dyn_sendmsg == 0 || dyn_recvmsg == 0) {
+    if (dyn_gai == 0 || dyn_free == 0 || dyn_nameinfo == 0 || dyn_inet_addr == 0 || dyn_inet_aton == 0 || dyn_inet_ntop == 0 || dyn_htonl == 0 || dyn_htons == 0 || dyn_ntohl == 0 || dyn_ntohs == 0 || dyn_send == 0 || dyn_recv == 0 || dyn_sendmsg == 0 || dyn_recvmsg == 0) {
         return 4;
     }
     failures += probe_gai("dlsym", dyn_gai, dyn_free);
     failures += probe_msg("dlsym", dyn_sendmsg, dyn_recvmsg);
+    failures += probe_inet_legacy("dlsym", dyn_inet_addr, dyn_inet_aton, dyn_inet_ntop, dyn_htonl, dyn_htons, dyn_ntohl, dyn_ntohs);
+    failures += probe_nameinfo("dlsym", dyn_nameinfo, dyn_inet_aton, dyn_htons);
 
     int sv[2] = {-1, -1};
     int pair_ret = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
@@ -2449,8 +2560,30 @@ fn compat_mode_proxies_network_resolver_and_socket_imports() {
         "network fixture did not complete dlsym getaddrinfo; stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("compat dlsym network ptrs 0x"),
+        stdout.contains("compat dlsym network ptrs gai=0x")
+            && stdout.contains("inet_addr=0x")
+            && stdout.contains("ntohs=0x"),
         "network fixture did not receive dlsym trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat inet static addr=0x0100007f aton=1 text=10.20.30.40")
+            && stdout.contains("ntohl=0x11223344")
+            && stdout.contains("ntohs=0x1357"),
+        "network fixture did not complete static inet/byte-order proxies; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat inet dlsym addr=0x0100007f aton=1 text=10.20.30.40")
+            && stdout.contains("ntohl=0x11223344")
+            && stdout.contains("ntohs=0x1357"),
+        "network fixture did not complete dlsym inet/byte-order proxies; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat getnameinfo static ret=0 host=127.0.0.1 service=443"),
+        "network fixture did not complete static getnameinfo proxy; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat getnameinfo dlsym ret=0 host=127.0.0.1 service=443"),
+        "network fixture did not complete dlsym getnameinfo proxy; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat sendmsg static sent=6 recv=6 text=msg-ok"),
