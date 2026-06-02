@@ -3864,6 +3864,127 @@ fn proxy_host_printf<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Default)]
+struct PrintfField {
+    alternate: bool,
+    zero_pad: bool,
+    left_align: bool,
+    show_sign: bool,
+    leading_space: bool,
+    width: Option<usize>,
+    precision: Option<usize>,
+}
+
+#[cfg(target_os = "macos")]
+fn apply_printf_width(value: String, field: &PrintfField, zero_padding_allowed: bool) -> String {
+    let Some(width) = field.width else {
+        return value;
+    };
+    let len = value.chars().count();
+    if len >= width {
+        return value;
+    }
+
+    let pad_len = width - len;
+    if field.left_align {
+        return format!("{value}{}", " ".repeat(pad_len));
+    }
+
+    if field.zero_pad && zero_padding_allowed && field.precision.is_none() {
+        let prefix_len =
+            if value.starts_with('-') || value.starts_with('+') || value.starts_with(' ') {
+                1
+            } else if value.starts_with("0x") || value.starts_with("0X") {
+                2
+            } else {
+                0
+            };
+        if prefix_len > 0 {
+            let (prefix, rest) = value.split_at(prefix_len);
+            return format!("{prefix}{}{rest}", "0".repeat(pad_len));
+        }
+        return format!("{}{value}", "0".repeat(pad_len));
+    }
+
+    format!("{}{value}", " ".repeat(pad_len))
+}
+
+#[cfg(target_os = "macos")]
+fn apply_integer_precision(value: String, field: &PrintfField) -> String {
+    let Some(precision) = field.precision else {
+        return value;
+    };
+
+    let prefix_len = if value.starts_with('-') || value.starts_with('+') || value.starts_with(' ') {
+        1
+    } else if value.starts_with("0x") || value.starts_with("0X") {
+        2
+    } else {
+        0
+    };
+    let digit_len = value.len().saturating_sub(prefix_len);
+    if digit_len >= precision {
+        return value;
+    }
+
+    let (prefix, rest) = value.split_at(prefix_len);
+    format!("{prefix}{}{rest}", "0".repeat(precision - digit_len))
+}
+
+#[cfg(target_os = "macos")]
+fn render_printf_signed(arg: u64, long_count: usize, field: &PrintfField) -> String {
+    let value = if long_count > 0 {
+        arg as i64
+    } else {
+        arg as i32 as i64
+    };
+    let mut rendered = value.to_string();
+    if value >= 0 {
+        if field.show_sign {
+            rendered = format!("+{rendered}");
+        } else if field.leading_space {
+            rendered = format!(" {rendered}");
+        }
+    }
+    let rendered = apply_integer_precision(rendered, field);
+    apply_printf_width(rendered, field, true)
+}
+
+#[cfg(target_os = "macos")]
+fn render_printf_unsigned(arg: u64, long_count: usize, field: &PrintfField) -> String {
+    let rendered = if long_count > 0 {
+        arg.to_string()
+    } else {
+        (arg as u32).to_string()
+    };
+    let rendered = apply_integer_precision(rendered, field);
+    apply_printf_width(rendered, field, true)
+}
+
+#[cfg(target_os = "macos")]
+fn render_printf_hex(arg: u64, long_count: usize, upper: bool, field: &PrintfField) -> String {
+    let value = if long_count > 0 {
+        arg
+    } else {
+        arg as u32 as u64
+    };
+    let mut rendered = if upper {
+        format!("{value:X}")
+    } else {
+        format!("{value:x}")
+    };
+    if field.alternate && value != 0 {
+        rendered = if upper {
+            format!("0X{rendered}")
+        } else {
+            format!("0x{rendered}")
+        };
+    }
+    let rendered = apply_integer_precision(rendered, field);
+    apply_printf_width(rendered, field, true)
+}
+
+#[cfg(target_os = "macos")]
 fn render_arm64_printf<M: GuestMemory + ?Sized>(
     memory: &mut M,
     format: &str,
@@ -3884,17 +4005,42 @@ fn render_arm64_printf<M: GuestMemory + ?Sized>(
             continue;
         }
 
-        while matches!(chars.peek(), Some('#' | '0' | '-' | '+' | ' ')) {
+        let mut field = PrintfField::default();
+        loop {
+            match chars.peek().copied() {
+                Some('#') => field.alternate = true,
+                Some('0') => field.zero_pad = true,
+                Some('-') => field.left_align = true,
+                Some('+') => field.show_sign = true,
+                Some(' ') => field.leading_space = true,
+                _ => break,
+            }
             chars.next();
         }
+        let mut width = 0usize;
+        let mut has_width = false;
         while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+            has_width = true;
+            width = width
+                .saturating_mul(10)
+                .saturating_add(chars.peek().and_then(|ch| ch.to_digit(10)).unwrap_or(0) as usize);
             chars.next();
+        }
+        if has_width {
+            field.width = Some(width);
         }
         if chars.peek() == Some(&'.') {
             chars.next();
+            let mut precision = 0usize;
+            let mut has_precision = false;
             while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                has_precision = true;
+                precision = precision.saturating_mul(10).saturating_add(
+                    chars.peek().and_then(|ch| ch.to_digit(10)).unwrap_or(0) as usize,
+                );
                 chars.next();
             }
+            field.precision = Some(if has_precision { precision } else { 0 });
         }
         let mut long_count = 0usize;
         while chars.peek() == Some(&'l') {
@@ -3910,54 +4056,43 @@ fn render_arm64_printf<M: GuestMemory + ?Sized>(
         }
         match spec {
             's' => {
+                let mut value = String::new();
                 let mut rendered = false;
                 for candidate in stack_arg.into_iter().chain(register_arg) {
                     if candidate == 0 {
-                        out.push_str("(null)");
+                        value.push_str("(null)");
                         rendered = true;
                         break;
                     }
                     if let Ok(value) = read_cstring(memory, candidate, 4096) {
-                        out.push_str(&value);
+                        let precision_limited = match field.precision {
+                            Some(limit) => value.chars().take(limit).collect::<String>(),
+                            None => value,
+                        };
+                        out.push_str(&apply_printf_width(precision_limited, &field, false));
                         rendered = true;
                         break;
                     }
+                }
+                if !value.is_empty() {
+                    out.push_str(&apply_printf_width(value, &field, false));
                 }
                 if !rendered {
                     // Leave unreadable string arguments empty, matching the
                     // previous permissive renderer behavior.
                 }
             }
-            'c' => out.push(char::from_u32((arg as u8) as u32).unwrap_or('\u{FFFD}')),
-            'd' | 'i' => {
-                if long_count > 0 {
-                    out.push_str(&(arg as i64).to_string());
-                } else {
-                    out.push_str(&(arg as i32).to_string());
-                }
+            'c' => {
+                let value = char::from_u32((arg as u8) as u32)
+                    .unwrap_or('\u{FFFD}')
+                    .to_string();
+                out.push_str(&apply_printf_width(value, &field, false));
             }
-            'u' => {
-                if long_count > 0 {
-                    out.push_str(&arg.to_string());
-                } else {
-                    out.push_str(&(arg as u32).to_string());
-                }
-            }
-            'x' => {
-                if long_count > 0 {
-                    out.push_str(&format!("{:x}", arg));
-                } else {
-                    out.push_str(&format!("{:x}", arg as u32));
-                }
-            }
-            'X' => {
-                if long_count > 0 {
-                    out.push_str(&format!("{:X}", arg));
-                } else {
-                    out.push_str(&format!("{:X}", arg as u32));
-                }
-            }
-            'p' => out.push_str(&format!("0x{:x}", arg)),
+            'd' | 'i' => out.push_str(&render_printf_signed(arg, long_count, &field)),
+            'u' => out.push_str(&render_printf_unsigned(arg, long_count, &field)),
+            'x' => out.push_str(&render_printf_hex(arg, long_count, false, &field)),
+            'X' => out.push_str(&render_printf_hex(arg, long_count, true, &field)),
+            'p' => out.push_str(&apply_printf_width(format!("0x{:x}", arg), &field, true)),
             other => {
                 out.push('%');
                 out.push(other);
@@ -8177,6 +8312,38 @@ mod tests {
                 Some(&stack_args)
             ),
             "compat dlsym path\n"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn printf_renderer_honors_width_and_zero_padding() {
+        #[derive(Default)]
+        struct TestMemory;
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(
+                &mut self,
+                _addr: u64,
+                _size: usize,
+            ) -> Result<Vec<u8>, GuestMemoryError> {
+                Err(GuestMemoryError)
+            }
+
+            fn write_memory(&mut self, _addr: u64, _data: &[u8]) -> Result<(), GuestMemoryError> {
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory;
+        assert_eq!(
+            render_arm64_printf(
+                &mut memory,
+                "addr=0x%08x short=0x%04x ptr=%018p count=%5u left=%-4u\n",
+                &[0x0100007f, 0x5713, 0xabc, 7, 7],
+                None
+            ),
+            "addr=0x0100007f short=0x5713 ptr=0x0000000000000abc count=    7 left=7   \n"
         );
     }
 
