@@ -2,12 +2,66 @@ use machina::macos::{
     cpu_type_name, emulate_macos_binary_with_mode, macho_cputype, run_target_batch_with_mode,
     targets_from_args, MacosCpu, RuntimeMode,
 };
+#[cfg(target_os = "macos")]
+use machina::macos::{loader::consts::cpu_type, process_event, shared_trace_bus_for_mode_from_env};
 use machina::MachoBinary;
+
+#[cfg(target_os = "macos")]
+fn native_host_macho_cpu() -> Option<u32> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some(cpu_type::CPU_TYPE_X86_64),
+        "aarch64" => Some(cpu_type::CPU_TYPE_ARM64),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn file_has_execute_bit(binary_path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(binary_path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn native_fat_slice_is_runnable(raw_data: &[u8], binary_path: &str) -> bool {
+    let Some(cputype) = native_host_macho_cpu() else {
+        return false;
+    };
+    MachoBinary::is_fat(raw_data)
+        && MachoBinary::fat_contains_cpu(raw_data, cputype)
+        && file_has_execute_bit(binary_path)
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_compatible_fat(binary_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let trace_bus = shared_trace_bus_for_mode_from_env(RuntimeMode::Compat);
+    if let Some(bus) = &trace_bus {
+        let _ = bus.send(
+            process_event(&machina::macos::TraceMetadata::new(), "native-fat", "exec")
+                .arg("Path", binary_path.to_string())
+                .arg("HostArch", std::env::consts::ARCH.to_string()),
+        );
+    }
+    let status = std::process::Command::new(binary_path).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("native FAT slice exited with status {status}").into())
+    }
+}
 
 fn emulate_macos_binary_with_stub_resolver(
     binary_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let raw_data = std::fs::read(binary_path)?;
+    #[cfg(target_os = "macos")]
+    {
+        if native_fat_slice_is_runnable(&raw_data, binary_path) {
+            return run_native_compatible_fat(binary_path);
+        }
+    }
     let binary = MachoBinary::parse(&raw_data)?;
     let cputype = macho_cputype(&binary);
 

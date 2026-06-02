@@ -58,6 +58,10 @@ Runtime mode and Cargo features are related but not identical:
 - Compatibility mode is not a security boundary and does not add defensive
   isolation. It is a userland compatibility path that tries to proxy supported
   guest operations into host-backed helpers.
+- On macOS, compat mode treats FAT/universal binaries specially: if the file
+  contains a slice that the host can run natively, Machina runs that native
+  slice through the OS instead of emulating the arm64 slice. If no native slice
+  is available, the loader prefers the arm64 slice for emulation.
 
 ## Logging
 

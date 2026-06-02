@@ -1226,6 +1226,34 @@ mod tests {
         }
     }
 
+    fn minimal_macho64(cputype: u32, cpusubtype: u32) -> Vec<u8> {
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&magic::MH_MAGIC_64.to_le_bytes());
+        data[4..8].copy_from_slice(&cputype.to_le_bytes());
+        data[8..12].copy_from_slice(&cpusubtype.to_le_bytes());
+        data[12..16].copy_from_slice(&file_type::MH_EXECUTE.to_le_bytes());
+        data[16..20].copy_from_slice(&0u32.to_le_bytes());
+        data[20..24].copy_from_slice(&0u32.to_le_bytes());
+        data[24..28].copy_from_slice(&0u32.to_le_bytes());
+        data[28..32].copy_from_slice(&0u32.to_le_bytes());
+        data
+    }
+
+    fn write_fat_arch(
+        data: &mut [u8],
+        offset: usize,
+        cputype: u32,
+        cpusubtype: u32,
+        slice_offset: u32,
+        slice_size: u32,
+    ) {
+        data[offset..offset + 4].copy_from_slice(&cputype.to_be_bytes());
+        data[offset + 4..offset + 8].copy_from_slice(&cpusubtype.to_be_bytes());
+        data[offset + 8..offset + 12].copy_from_slice(&slice_offset.to_be_bytes());
+        data[offset + 12..offset + 16].copy_from_slice(&slice_size.to_be_bytes());
+        data[offset + 16..offset + 20].copy_from_slice(&12u32.to_be_bytes());
+    }
+
     #[test]
     fn test_macho_loader_creation() {
         let loader = MachOLoader::new(MachoBinary {
@@ -1332,6 +1360,51 @@ mod tests {
         assert!(!binary.is_driver);
         assert!(binary.header_64.is_some());
         assert_eq!(binary.commands.len(), 0);
+    }
+
+    #[test]
+    fn test_fat_parse_prefers_arm64_slice_over_x86_64() {
+        let x86 = minimal_macho64(cpu_type::CPU_TYPE_X86_64, cpu_type::CPU_SUBTYPE_X86_64_ALL);
+        let arm64 = minimal_macho64(cpu_type::CPU_TYPE_ARM64, cpu_type::CPU_SUBTYPE_ARM64_ALL);
+        let x86_offset = 0x100usize;
+        let arm64_offset = 0x200usize;
+        let mut fat = vec![0u8; arm64_offset + arm64.len()];
+        fat[0..4].copy_from_slice(&magic::FAT_CIGAM.to_be_bytes());
+        fat[4..8].copy_from_slice(&2u32.to_be_bytes());
+        write_fat_arch(
+            &mut fat,
+            8,
+            cpu_type::CPU_TYPE_X86_64,
+            cpu_type::CPU_SUBTYPE_X86_64_ALL,
+            x86_offset as u32,
+            x86.len() as u32,
+        );
+        write_fat_arch(
+            &mut fat,
+            28,
+            cpu_type::CPU_TYPE_ARM64,
+            cpu_type::CPU_SUBTYPE_ARM64_ALL,
+            arm64_offset as u32,
+            arm64.len() as u32,
+        );
+        fat[x86_offset..x86_offset + x86.len()].copy_from_slice(&x86);
+        fat[arm64_offset..arm64_offset + arm64.len()].copy_from_slice(&arm64);
+
+        assert!(MachoBinary::is_fat(&fat));
+        assert!(MachoBinary::fat_contains_cpu(
+            &fat,
+            cpu_type::CPU_TYPE_X86_64
+        ));
+        assert!(MachoBinary::fat_contains_cpu(
+            &fat,
+            cpu_type::CPU_TYPE_ARM64
+        ));
+
+        let binary = MachoBinary::parse(&fat).unwrap();
+        assert_eq!(
+            binary.header_64.as_ref().map(|header| header.cputype),
+            Some(cpu_type::CPU_TYPE_ARM64)
+        );
     }
 
     #[test]

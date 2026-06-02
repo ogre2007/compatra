@@ -194,6 +194,40 @@ impl MachoBinary {
         Self::parse(&data)
     }
 
+    pub fn is_fat(data: &[u8]) -> bool {
+        if data.len() < 4 {
+            return false;
+        }
+        let magic_le = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        MachOMagic::from_u32(magic_le) == MachOMagic::Fat
+    }
+
+    pub fn fat_architectures(data: &[u8]) -> Result<Vec<FatArch>, MacOsError> {
+        if !Self::is_fat(data) {
+            return Ok(Vec::new());
+        }
+        let fat_header = FatHeader::parse(data)?;
+        let mut architectures = Vec::new();
+        let arch_size = 20;
+
+        for i in 0..fat_header.nfat_arch {
+            let offset = 8 + (i as usize * arch_size);
+            if offset + arch_size <= data.len() {
+                if let Ok(arch) = FatArch::parse(&data[offset..]) {
+                    architectures.push(arch);
+                }
+            }
+        }
+
+        Ok(architectures)
+    }
+
+    pub fn fat_contains_cpu(data: &[u8], cputype: u32) -> bool {
+        Self::fat_architectures(data)
+            .map(|architectures| architectures.iter().any(|arch| arch.cputype == cputype))
+            .unwrap_or(false)
+    }
+
     pub fn parse(data: &[u8]) -> Result<Self, MacOsError> {
         if data.len() < 4 {
             return Err(MacOsError::LoaderError(
@@ -270,24 +304,15 @@ impl MachoBinary {
     }
 
     fn parse_fat(data: &[u8]) -> Result<Self, MacOsError> {
-        let fat_header = FatHeader::parse(data)?;
-
-        let mut architectures = Vec::new();
-        let arch_size = 20;
-
-        for i in 0..fat_header.nfat_arch {
-            let offset = 8 + (i as usize * arch_size);
-            if offset + arch_size <= data.len() {
-                if let Ok(arch) = FatArch::parse(&data[offset..]) {
-                    architectures.push(arch);
-                }
-            }
-        }
+        let architectures = Self::fat_architectures(data)?;
 
         let preferred_arch = architectures
             .iter()
-            .find(|a| {
-                a.cputype == cpu_type::CPU_TYPE_X86_64 || a.cputype == cpu_type::CPU_TYPE_ARM64
+            .find(|a| a.cputype == cpu_type::CPU_TYPE_ARM64)
+            .or_else(|| {
+                architectures
+                    .iter()
+                    .find(|a| a.cputype == cpu_type::CPU_TYPE_X86_64)
             })
             .or(architectures.first());
 
