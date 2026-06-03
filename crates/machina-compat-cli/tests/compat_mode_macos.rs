@@ -1350,7 +1350,6 @@ fn compile_arm64_fd_fixture() -> (PathBuf, PathBuf) {
             r#"#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mach-o/dyld.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -1409,36 +1408,29 @@ static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len)
     if (out_len == 0) {{
         return;
     }}
-    char executable[4096] = {{0}};
-    uint32_t executable_size = sizeof(executable);
-    const char *path = argv0;
-    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
-        path = executable;
+    (void)argv0;
+    snprintf(out, out_len, ".");
+}}
+
+static void join_path(const char *base, const char *name, char *out, size_t out_len) {{
+    if (strcmp(base, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", base, name);
     }}
-    const char *slash = path ? strrchr(path, '/') : 0;
-    if (!slash) {{
-        snprintf(out, out_len, ".");
-        return;
-    }}
-    size_t len = (size_t)(slash - path);
-    if (len == 0) {{
-        snprintf(out, out_len, "/");
-        return;
-    }}
-    if (len >= out_len) {{
-        len = out_len - 1;
-    }}
-    memcpy(out, path, len);
-    out[len] = 0;
 }}
 
 static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
     char dir[4096] = {{0}};
     fixture_dir_from_argv0(argv0, dir, sizeof(dir));
-    if (strcmp(dir, "/") == 0) {{
-        snprintf(out, out_len, "/%s", name);
+    join_path(dir, name, out, out_len);
+}}
+
+static void fixture_dir_from_optional_arg(int argc, char **argv, const char *argv0, char *out, size_t out_len) {{
+    if (argc > 1 && argv && argv[1] && argv[1][0]) {{
+        snprintf(out, out_len, "%s", argv[1]);
     }} else {{
-        snprintf(out, out_len, "%s/%s", dir, name);
+        fixture_dir_from_argv0(argv0, out, out_len);
     }}
 }}
 
@@ -1512,8 +1504,8 @@ int main(int argc, char **argv) {{
     const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
     char data_file[4096] = {{0}};
     char data_dir[4096] = {{0}};
-    fixture_path_from_argv0(argv0, "arm64_fd_compat.tmp", data_file, sizeof(data_file));
-    fixture_dir_from_argv0(argv0, data_dir, sizeof(data_dir));
+    fixture_dir_from_optional_arg(argc, argv, argv0, data_dir, sizeof(data_dir));
+    join_path(data_dir, "arm64_fd_compat.tmp", data_file, sizeof(data_file));
     failures += pipe_vec_roundtrip("static", pipe, writev, readv);
 
     int select_fds[2] = {{-1, -1}};
@@ -1760,7 +1752,6 @@ fn compile_arm64_stdio_fixture() -> (PathBuf, PathBuf) {
             r#"#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mach-o/dyld.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -1802,36 +1793,29 @@ static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len)
     if (out_len == 0) {{
         return;
     }}
-    char executable[4096] = {{0}};
-    uint32_t executable_size = sizeof(executable);
-    const char *path = argv0;
-    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
-        path = executable;
+    (void)argv0;
+    snprintf(out, out_len, ".");
+}}
+
+static void join_path(const char *base, const char *name, char *out, size_t out_len) {{
+    if (strcmp(base, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", base, name);
     }}
-    const char *slash = path ? strrchr(path, '/') : 0;
-    if (!slash) {{
-        snprintf(out, out_len, ".");
-        return;
-    }}
-    size_t len = (size_t)(slash - path);
-    if (len == 0) {{
-        snprintf(out, out_len, "/");
-        return;
-    }}
-    if (len >= out_len) {{
-        len = out_len - 1;
-    }}
-    memcpy(out, path, len);
-    out[len] = 0;
 }}
 
 static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
     char dir[4096] = {{0}};
     fixture_dir_from_argv0(argv0, dir, sizeof(dir));
-    if (strcmp(dir, "/") == 0) {{
-        snprintf(out, out_len, "/%s", name);
+    join_path(dir, name, out, out_len);
+}}
+
+static void fixture_dir_from_optional_arg(int argc, char **argv, const char *argv0, char *out, size_t out_len) {{
+    if (argc > 1 && argv && argv[1] && argv[1][0]) {{
+        snprintf(out, out_len, "%s", argv[1]);
     }} else {{
-        snprintf(out, out_len, "%s/%s", dir, name);
+        fixture_dir_from_argv0(argv0, out, out_len);
     }}
 }}
 
@@ -1937,8 +1921,10 @@ static int stdio_roundtrip(
 int main(int argc, char **argv) {{
     int failures = 0;
     const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
+    char data_dir[4096] = {{0}};
     char data_file[4096] = {{0}};
-    fixture_path_from_argv0(argv0, "arm64_stdio_compat.tmp", data_file, sizeof(data_file));
+    fixture_dir_from_optional_arg(argc, argv, argv0, data_dir, sizeof(data_dir));
+    join_path(data_dir, "arm64_stdio_compat.tmp", data_file, sizeof(data_file));
     failures += stdio_roundtrip("static", data_file, fopen, fdopen, fclose, fread, fwrite, fflush, fseek, ftell, fgets, fputs, feof, ferror, clearerr, fileno);
 
     void *self = dlopen(NULL, RTLD_NOW);
@@ -2018,7 +2004,6 @@ fn compile_arm64_path_fixture() -> (PathBuf, PathBuf) {
             r#"#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mach-o/dyld.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -2084,37 +2069,8 @@ static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len)
     if (out_len == 0) {{
         return;
     }}
-    char executable[4096] = {{0}};
-    uint32_t executable_size = sizeof(executable);
-    const char *path = argv0;
-    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
-        path = executable;
-    }}
-    const char *slash = path ? strrchr(path, '/') : 0;
-    if (!slash) {{
-        snprintf(out, out_len, ".");
-        return;
-    }}
-    size_t len = (size_t)(slash - path);
-    if (len == 0) {{
-        snprintf(out, out_len, "/");
-        return;
-    }}
-    if (len >= out_len) {{
-        len = out_len - 1;
-    }}
-    memcpy(out, path, len);
-    out[len] = 0;
-}}
-
-static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
-    char dir[4096] = {{0}};
-    fixture_dir_from_argv0(argv0, dir, sizeof(dir));
-    if (strcmp(dir, "/") == 0) {{
-        snprintf(out, out_len, "/%s", name);
-    }} else {{
-        snprintf(out, out_len, "%s/%s", dir, name);
-    }}
+    (void)argv0;
+    snprintf(out, out_len, ".");
 }}
 
 static void join_path(const char *base, const char *name, char *out, size_t out_len) {{
@@ -2122,6 +2078,14 @@ static void join_path(const char *base, const char *name, char *out, size_t out_
         snprintf(out, out_len, "/%s", name);
     }} else {{
         snprintf(out, out_len, "%s/%s", base, name);
+    }}
+}}
+
+static void fixture_dir_from_optional_arg(int argc, char **argv, const char *argv0, char *out, size_t out_len) {{
+    if (argc > 1 && argv && argv[1] && argv[1][0]) {{
+        snprintf(out, out_len, "%s", argv[1]);
+    }} else {{
+        fixture_dir_from_argv0(argv0, out, out_len);
     }}
 }}
 
@@ -2161,8 +2125,10 @@ static void cleanup_base(const char *base_dir) {{
 int main(int argc, char **argv) {{
     int failures = 0;
     const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
+    char fixture_dir[4096] = {{0}};
     char base_dir[4096] = {{0}};
-    fixture_path_from_argv0(argv0, "path-host-root", base_dir, sizeof(base_dir));
+    fixture_dir_from_optional_arg(argc, argv, argv0, fixture_dir, sizeof(fixture_dir));
+    join_path(fixture_dir, "path-host-root", base_dir, sizeof(base_dir));
     cleanup_base(base_dir);
     int mkdir_base = mkdir(base_dir, 0700);
     int chdir_base = chdir(base_dir);
@@ -2779,7 +2745,6 @@ fn compile_arm64_directory_entropy_fixture() -> (PathBuf, PathBuf) {
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mach-o/dyld.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -2836,37 +2801,8 @@ static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len)
     if (out_len == 0) {{
         return;
     }}
-    char executable[4096] = {{0}};
-    uint32_t executable_size = sizeof(executable);
-    const char *path = argv0;
-    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
-        path = executable;
-    }}
-    const char *slash = path ? strrchr(path, '/') : 0;
-    if (!slash) {{
-        snprintf(out, out_len, ".");
-        return;
-    }}
-    size_t len = (size_t)(slash - path);
-    if (len == 0) {{
-        snprintf(out, out_len, "/");
-        return;
-    }}
-    if (len >= out_len) {{
-        len = out_len - 1;
-    }}
-    memcpy(out, path, len);
-    out[len] = 0;
-}}
-
-static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
-    char dir[4096] = {{0}};
-    fixture_dir_from_argv0(argv0, dir, sizeof(dir));
-    if (strcmp(dir, "/") == 0) {{
-        snprintf(out, out_len, "/%s", name);
-    }} else {{
-        snprintf(out, out_len, "%s/%s", dir, name);
-    }}
+    (void)argv0;
+    snprintf(out, out_len, ".");
 }}
 
 static void join_path(const char *base, const char *name, char *out, size_t out_len) {{
@@ -2874,6 +2810,14 @@ static void join_path(const char *base, const char *name, char *out, size_t out_
         snprintf(out, out_len, "/%s", name);
     }} else {{
         snprintf(out, out_len, "%s/%s", base, name);
+    }}
+}}
+
+static void fixture_dir_from_optional_arg(int argc, char **argv, const char *argv0, char *out, size_t out_len) {{
+    if (argc > 1 && argv && argv[1] && argv[1][0]) {{
+        snprintf(out, out_len, "%s", argv[1]);
+    }} else {{
+        fixture_dir_from_argv0(argv0, out, out_len);
     }}
 }}
 
@@ -2946,10 +2890,12 @@ static int scan_with_readdir_r(const char *label, DIR *dir, readdir_r_fn read_di
 int main(int argc, char **argv) {{
     int failures = 0;
     const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
+    char fixture_dir[4096] = {{0}};
     char base_dir[4096] = {{0}};
     char alpha_file[4096] = {{0}};
     char beta_file[4096] = {{0}};
-    fixture_path_from_argv0(argv0, "dir-host-root", base_dir, sizeof(base_dir));
+    fixture_dir_from_optional_arg(argc, argv, argv0, fixture_dir, sizeof(fixture_dir));
+    join_path(fixture_dir, "dir-host-root", base_dir, sizeof(base_dir));
     join_path(base_dir, "alpha.txt", alpha_file, sizeof(alpha_file));
     join_path(base_dir, "beta.txt", beta_file, sizeof(beta_file));
     mkdir(base_dir, 0700);
@@ -4362,6 +4308,10 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
+        .env(
+            "MACHINA_ARGV_APPEND",
+            generated_fixture_dir().display().to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -4487,6 +4437,10 @@ fn compat_mode_proxies_stdio_file_imports() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
+        .env(
+            "MACHINA_ARGV_APPEND",
+            generated_fixture_dir().display().to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -4579,6 +4533,10 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
+        .env(
+            "MACHINA_ARGV_APPEND",
+            generated_fixture_dir().display().to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -4882,6 +4840,10 @@ fn compat_mode_proxies_directory_iteration_and_entropy() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
+        .env(
+            "MACHINA_ARGV_APPEND",
+            generated_fixture_dir().display().to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
