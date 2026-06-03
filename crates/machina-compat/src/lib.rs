@@ -4294,6 +4294,22 @@ const DARWIN_IOVEC_SIZE: usize = 16;
 const DARWIN_IOVEC_BASE: usize = 0;
 #[cfg(target_os = "macos")]
 const DARWIN_IOVEC_LEN: usize = 8;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_SIZE: usize = 48;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_NAME: usize = 0;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_NAMELEN: usize = 8;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_IOV: usize = 16;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_IOVLEN: usize = 24;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_CONTROL: usize = 32;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_CONTROLLEN: usize = 40;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_MSGHDR_FLAGS: usize = 44;
 #[cfg(target_os = "macos")]
 const DARWIN_STAT_SIZE_OFFSET: usize = 96;
 #[cfg(target_os = "macos")]
@@ -4441,13 +4457,13 @@ extern "C" {
     ) -> *const libc::c_char;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     let raw = <[u8; 4]>::try_from(bytes.get(offset..offset + 4)?).ok()?;
     Some(u32::from_le_bytes(raw))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn read_i32_at(bytes: &[u8], offset: usize) -> Option<i32> {
     Some(read_u32_at(bytes, offset)? as i32)
 }
@@ -4458,7 +4474,7 @@ fn read_i16_at(bytes: &[u8], offset: usize) -> Option<i16> {
     Some(i16::from_le_bytes(raw))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn read_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
     let raw = <[u8; 8]>::try_from(bytes.get(offset..offset + 8)?).ok()?;
     Some(u64::from_le_bytes(raw))
@@ -5840,16 +5856,61 @@ fn proxy_host_recvfrom<M: GuestMemory + ?Sized>(
     Some(host_io_result(ret, data))
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestMsghdr {
+    name: u64,
+    namelen: u32,
+    iov: u64,
+    iovlen: i32,
+    control: u64,
+    controllen: u32,
+    flags: i32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_darwin_msghdr(bytes: &[u8]) -> Option<GuestMsghdr> {
+    Some(GuestMsghdr {
+        name: read_u64_at(bytes, DARWIN_MSGHDR_NAME)?,
+        namelen: read_u32_at(bytes, DARWIN_MSGHDR_NAMELEN)?,
+        iov: read_u64_at(bytes, DARWIN_MSGHDR_IOV)?,
+        iovlen: read_i32_at(bytes, DARWIN_MSGHDR_IOVLEN)?,
+        control: read_u64_at(bytes, DARWIN_MSGHDR_CONTROL)?,
+        controllen: read_u32_at(bytes, DARWIN_MSGHDR_CONTROLLEN)?,
+        flags: read_i32_at(bytes, DARWIN_MSGHDR_FLAGS)?,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn read_guest_msghdr<M: GuestMemory + ?Sized>(
     memory: &mut M,
     msg_ptr: u64,
-) -> Result<libc::msghdr, u32> {
+) -> Result<GuestMsghdr, u32> {
     if msg_ptr == 0 {
         return Err(libc::EFAULT as u32);
     }
-    let msg = read_guest_host_struct::<_, libc::msghdr>(memory, msg_ptr)?;
-    Ok(unsafe { msg.assume_init() })
+    let bytes = memory
+        .read_memory(msg_ptr, DARWIN_MSGHDR_SIZE)
+        .map_err(|_| libc::EFAULT as u32)?;
+    parse_darwin_msghdr(&bytes).ok_or(libc::EFAULT as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn write_guest_msghdr_outputs<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    msg_ptr: u64,
+    msg: &GuestMsghdr,
+) -> Result<(), u32> {
+    write_guest_u32(memory, msg_ptr + DARWIN_MSGHDR_NAMELEN as u64, msg.namelen)
+        .map_err(|_| libc::EFAULT as u32)?;
+    write_guest_u32(
+        memory,
+        msg_ptr + DARWIN_MSGHDR_CONTROLLEN as u64,
+        msg.controllen,
+    )
+    .map_err(|_| libc::EFAULT as u32)?;
+    write_guest_i32(memory, msg_ptr + DARWIN_MSGHDR_FLAGS as u64, msg.flags)
+        .map_err(|_| libc::EFAULT as u32)
 }
 
 #[cfg(target_os = "macos")]
@@ -5906,11 +5967,11 @@ fn proxy_host_sendmsg<M: GuestMemory + ?Sized>(
         Ok(msg) => msg,
         Err(errno) => return Some(host_io_error(errno)),
     };
-    let iovcnt = match msg_iovcnt(guest_msg.msg_iovlen) {
+    let iovcnt = match msg_iovcnt(guest_msg.iovlen) {
         Ok(iovcnt) => iovcnt,
         Err(errno) => return Some(host_io_error(errno)),
     };
-    let iovecs = match read_guest_iovecs(memory, guest_msg.msg_iov as u64, iovcnt) {
+    let iovecs = match read_guest_iovecs(memory, guest_msg.iov, iovcnt) {
         Ok(iovecs) => iovecs,
         Err(errno) => return Some(host_io_error(errno)),
     };
@@ -5922,29 +5983,22 @@ fn proxy_host_sendmsg<M: GuestMemory + ?Sized>(
         .iter()
         .map(host_iovec_from_buffer)
         .collect::<Vec<_>>();
-    let mut name = match read_guest_side_bytes(
-        memory,
-        guest_msg.msg_name as u64,
-        guest_msg.msg_namelen as usize,
-    ) {
+    let mut name = match read_guest_side_bytes(memory, guest_msg.name, guest_msg.namelen as usize) {
         Ok(name) => name,
         Err(errno) => return Some(host_io_error(errno)),
     };
-    let mut control = match read_guest_side_bytes(
-        memory,
-        guest_msg.msg_control as u64,
-        guest_msg.msg_controllen as usize,
-    ) {
-        Ok(control) => control,
-        Err(errno) => return Some(host_io_error(errno)),
-    };
+    let mut control =
+        match read_guest_side_bytes(memory, guest_msg.control, guest_msg.controllen as usize) {
+            Ok(control) => control,
+            Err(errno) => return Some(host_io_error(errno)),
+        };
     let preview = preview_iovec_bytes(&buffers);
     let host_msg = libc::msghdr {
         msg_name: optional_vec_mut_ptr(&mut name),
         msg_namelen: if name.is_empty() {
             0
         } else {
-            guest_msg.msg_namelen
+            guest_msg.namelen as libc::socklen_t
         },
         msg_iov: host_iovecs.as_mut_ptr(),
         msg_iovlen: host_iovecs.len() as libc::c_int,
@@ -5952,9 +6006,9 @@ fn proxy_host_sendmsg<M: GuestMemory + ?Sized>(
         msg_controllen: if control.is_empty() {
             0
         } else {
-            guest_msg.msg_controllen
+            guest_msg.controllen as libc::socklen_t
         },
-        msg_flags: guest_msg.msg_flags,
+        msg_flags: guest_msg.flags,
     };
     clear_errno();
     let ret = unsafe { libc::sendmsg(fd as libc::c_int, &host_msg, flags as libc::c_int) };
@@ -5972,11 +6026,11 @@ fn proxy_host_recvmsg<M: GuestMemory + ?Sized>(
         Ok(msg) => msg,
         Err(errno) => return Some(host_io_error(errno)),
     };
-    let iovcnt = match msg_iovcnt(guest_msg.msg_iovlen) {
+    let iovcnt = match msg_iovcnt(guest_msg.iovlen) {
         Ok(iovcnt) => iovcnt,
         Err(errno) => return Some(host_io_error(errno)),
     };
-    let iovecs = match read_guest_iovecs(memory, guest_msg.msg_iov as u64, iovcnt) {
+    let iovecs = match read_guest_iovecs(memory, guest_msg.iov, iovcnt) {
         Ok(iovecs) => iovecs,
         Err(errno) => return Some(host_io_error(errno)),
     };
@@ -5988,24 +6042,21 @@ fn proxy_host_recvmsg<M: GuestMemory + ?Sized>(
         .iter_mut()
         .map(host_iovec_from_mut_buffer)
         .collect::<Vec<_>>();
-    let mut name =
-        match zeroed_guest_side_bytes(guest_msg.msg_name as u64, guest_msg.msg_namelen as usize) {
-            Ok(name) => name,
-            Err(errno) => return Some(host_io_error(errno)),
-        };
-    let mut control = match zeroed_guest_side_bytes(
-        guest_msg.msg_control as u64,
-        guest_msg.msg_controllen as usize,
-    ) {
-        Ok(control) => control,
+    let mut name = match zeroed_guest_side_bytes(guest_msg.name, guest_msg.namelen as usize) {
+        Ok(name) => name,
         Err(errno) => return Some(host_io_error(errno)),
     };
+    let mut control =
+        match zeroed_guest_side_bytes(guest_msg.control, guest_msg.controllen as usize) {
+            Ok(control) => control,
+            Err(errno) => return Some(host_io_error(errno)),
+        };
     let mut host_msg = libc::msghdr {
         msg_name: optional_vec_mut_ptr(&mut name),
         msg_namelen: if name.is_empty() {
             0
         } else {
-            guest_msg.msg_namelen
+            guest_msg.namelen as libc::socklen_t
         },
         msg_iov: host_iovecs.as_mut_ptr(),
         msg_iovlen: host_iovecs.len() as libc::c_int,
@@ -6013,9 +6064,9 @@ fn proxy_host_recvmsg<M: GuestMemory + ?Sized>(
         msg_controllen: if control.is_empty() {
             0
         } else {
-            guest_msg.msg_controllen
+            guest_msg.controllen as libc::socklen_t
         },
-        msg_flags: guest_msg.msg_flags,
+        msg_flags: guest_msg.flags,
     };
     clear_errno();
     let ret = unsafe { libc::recvmsg(fd as libc::c_int, &mut host_msg, flags as libc::c_int) };
@@ -6026,29 +6077,28 @@ fn proxy_host_recvmsg<M: GuestMemory + ?Sized>(
                 return Some(host_io_error(errno));
             }
         }
-        if guest_msg.msg_name as u64 != 0 && !name.is_empty() {
+        if guest_msg.name != 0 && !name.is_empty() {
             let name_len = (host_msg.msg_namelen as usize).min(name.len());
             if memory
-                .write_memory(guest_msg.msg_name as u64, &name[..name_len])
+                .write_memory(guest_msg.name, &name[..name_len])
                 .is_err()
             {
                 return Some(host_io_error(libc::EFAULT as u32));
             }
         }
-        if guest_msg.msg_control as u64 != 0 && !control.is_empty() {
+        if guest_msg.control != 0 && !control.is_empty() {
             let control_len = (host_msg.msg_controllen as usize).min(control.len());
             if memory
-                .write_memory(guest_msg.msg_control as u64, &control[..control_len])
+                .write_memory(guest_msg.control, &control[..control_len])
                 .is_err()
             {
                 return Some(host_io_error(libc::EFAULT as u32));
             }
         }
-        guest_msg.msg_namelen = host_msg.msg_namelen;
-        guest_msg.msg_controllen = host_msg.msg_controllen;
-        guest_msg.msg_flags = host_msg.msg_flags;
-        let updated_msg = MaybeUninit::new(guest_msg);
-        if let Err(errno) = write_guest_host_struct(memory, msg_ptr, &updated_msg) {
+        guest_msg.namelen = host_msg.msg_namelen as u32;
+        guest_msg.controllen = host_msg.msg_controllen as u32;
+        guest_msg.flags = host_msg.msg_flags;
+        if let Err(errno) = write_guest_msghdr_outputs(memory, msg_ptr, &guest_msg) {
             return Some(host_io_error(errno));
         }
     }
@@ -9130,6 +9180,104 @@ mod tests {
             ),
             "addr=0x0100007f short=0x5713 ptr=0x0000000000000abc count=    7 left=7   \n"
         );
+    }
+
+    fn darwin_msghdr_fixture_bytes() -> Vec<u8> {
+        fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn put_i32(bytes: &mut [u8], offset: usize, value: i32) {
+            put_u32(bytes, offset, value as u32);
+        }
+
+        fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let mut raw = vec![0u8; DARWIN_MSGHDR_SIZE];
+        put_u64(&mut raw, DARWIN_MSGHDR_NAME, 0x1111);
+        put_u32(&mut raw, DARWIN_MSGHDR_NAMELEN, 12);
+        put_u64(&mut raw, DARWIN_MSGHDR_IOV, 0x2222);
+        put_i32(&mut raw, DARWIN_MSGHDR_IOVLEN, 2);
+        put_u64(&mut raw, DARWIN_MSGHDR_CONTROL, 0x3333);
+        put_u32(&mut raw, DARWIN_MSGHDR_CONTROLLEN, 24);
+        put_i32(&mut raw, DARWIN_MSGHDR_FLAGS, 0x40);
+        raw
+    }
+
+    fn expected_darwin_msghdr() -> GuestMsghdr {
+        GuestMsghdr {
+            name: 0x1111,
+            namelen: 12,
+            iov: 0x2222,
+            iovlen: 2,
+            control: 0x3333,
+            controllen: 24,
+            flags: 0x40,
+        }
+    }
+
+    #[test]
+    fn msghdr_parser_uses_darwin_guest_layout() {
+        let raw = darwin_msghdr_fixture_bytes();
+        assert_eq!(parse_darwin_msghdr(&raw), Some(expected_darwin_msghdr()));
+        assert_eq!(parse_darwin_msghdr(&raw[..DARWIN_MSGHDR_SIZE - 1]), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn msghdr_output_write_preserves_darwin_pointer_fields() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        let raw = darwin_msghdr_fixture_bytes();
+        memory.write_guest(0x1000, &raw);
+
+        let mut msg = read_guest_msghdr(&mut memory, 0x1000).unwrap();
+        assert_eq!(msg, expected_darwin_msghdr());
+
+        msg.namelen = 8;
+        msg.controllen = 16;
+        msg.flags = 0x80;
+        write_guest_msghdr_outputs(&mut memory, 0x1000, &msg).unwrap();
+
+        let updated = memory.read_memory(0x1000, DARWIN_MSGHDR_SIZE).unwrap();
+        assert_eq!(read_u64_at(&updated, DARWIN_MSGHDR_NAME), Some(0x1111));
+        assert_eq!(read_u64_at(&updated, DARWIN_MSGHDR_IOV), Some(0x2222));
+        assert_eq!(read_u64_at(&updated, DARWIN_MSGHDR_CONTROL), Some(0x3333));
+        assert_eq!(read_u32_at(&updated, DARWIN_MSGHDR_NAMELEN), Some(8));
+        assert_eq!(read_u32_at(&updated, DARWIN_MSGHDR_CONTROLLEN), Some(16));
+        assert_eq!(read_i32_at(&updated, DARWIN_MSGHDR_FLAGS), Some(0x80));
     }
 
     #[cfg(target_os = "macos")]
