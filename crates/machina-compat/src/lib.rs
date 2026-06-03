@@ -810,6 +810,49 @@ impl CompatibilityServices {
         mode.is_compat().then_some(Self)
     }
 
+    pub fn log_unhandled_import(&self, symbol: &str, address: u64, lr: u64, reason: &str) {
+        let args = [
+            ("ImportSymbol", symbol.to_string()),
+            ("Address", hex_arg(address)),
+            ("Lr", hex_arg(lr)),
+        ];
+        let mut fields = [
+            ("status", Some("unhandled".to_string())),
+            ("reason", Some(reason.to_string())),
+        ];
+        emit_compat_log_line("diagnostic", "unhandled-import", &args, &mut fields, None);
+    }
+
+    pub fn log_unknown_import_address(&self, address: u64, lr: u64) {
+        let args = [("Address", hex_arg(address)), ("Lr", hex_arg(lr))];
+        let mut fields = [
+            ("status", Some("unhandled".to_string())),
+            (
+                "reason",
+                Some("no import stub symbol for address".to_string()),
+            ),
+        ];
+        emit_compat_log_line(
+            "diagnostic",
+            "unknown-import-address",
+            &args,
+            &mut fields,
+            None,
+        );
+    }
+
+    pub fn log_unresolved_dlsym(&self, handle: u64, symbol: &str, reason: &str) {
+        let args = [
+            ("Handle", hex_arg(handle)),
+            ("ImportSymbol", symbol.to_string()),
+        ];
+        let mut fields = [
+            ("status", Some("unhandled".to_string())),
+            ("reason", Some(reason.to_string())),
+        ];
+        emit_compat_log_line("diagnostic", "unresolved-dlsym", &args, &mut fields, None);
+    }
+
     pub fn should_proxy_import(&self, symbol: &str) -> bool {
         host_import_kind(symbol).is_some()
     }

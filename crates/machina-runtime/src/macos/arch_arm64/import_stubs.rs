@@ -4,10 +4,11 @@
 //! module owns the stub bytes, import-hit tracking, and arm64 ABI handoff into
 //! architecture-neutral compatibility services.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::macos::apple_imports::is_apple_import_symbol;
 use crate::macos::arm64_compat_memory::Arm64CompatGuestMemory;
 use crate::macos::arm64_state::Arm64SharedState;
 use crate::macos::compat::CompatibilityServices;
@@ -84,45 +85,146 @@ fn arm64_proxy_compat_host_import(
     };
 }
 
-fn arm64_static_symbol_has_exact_hook(symbol: &str) -> bool {
+fn arm64_import_has_runtime_hook(symbol: &str) -> bool {
+    if is_apple_import_symbol(symbol) {
+        return true;
+    }
     matches!(
         symbol,
-        "_pipe"
+        "___error"
+            | "__NSGetArgc"
+            | "__NSGetArgv"
+            | "__NSGetEnviron"
+            | "__Znwm"
+            | "__Znam"
+            | "__ZdlPv"
+            | "__ZdaPv"
+            | "__ZdlPvm"
+            | "__ZdaPvm"
+            | "__exit"
+            | "__tlv_atexit"
+            | "__tlv_bootstrap"
+            | "_atexit"
+            | "___cxa_atexit"
+            | "_calloc"
+            | "_cmalloc"
+            | "_clearerr"
+            | "_close"
+            | "_closedir"
+            | "_dispatch_release"
+            | "_dispatch_semaphore_create"
+            | "_dispatch_semaphore_signal"
+            | "_dispatch_semaphore_wait"
+            | "_dlclose"
+            | "_dlerror"
+            | "_dlopen"
+            | "_dlsym"
+            | "_dup2"
+            | "_execve"
+            | "_exit"
             | "_fcntl"
+            | "_fdopendir"
+            | "_feof"
+            | "_ferror"
+            | "_fgets"
+            | "_fork"
+            | "_free"
+            | "_fread"
+            | "_fstat"
+            | "_getcwd"
+            | "_getenv"
+            | "_getrlimit"
+            | "_kevent"
+            | "_kill"
+            | "_kqueue"
+            | "_lstat"
+            | "_mach_absolute_time"
+            | "_mach_timebase_info"
+            | "_malloc"
             | "_memcpy"
             | "_memmove"
             | "_memset"
             | "_memcmp"
-            | "_calloc"
-            | "_cmalloc"
-            | "_realloc"
-            | "_free"
-            | "_sysconf"
-            | "_getenv"
-            | "_strlen"
+            | "_mmap"
+            | "_mprotect"
+            | "_munmap"
+            | "_notify_is_valid_token"
             | "_open"
             | "_opendir"
-            | "_fdopendir"
-            | "_close"
-            | "_closedir"
-            | "_dup2"
+            | "_pclose"
+            | "_pipe"
+            | "_popen"
+            | "_posix_memalign"
+            | "_posix_spawn"
+            | "_posix_spawn_file_actions_adddup2"
+            | "_posix_spawn_file_actions_destroy"
+            | "_posix_spawn_file_actions_init"
+            | "_posix_spawnp"
+            | "_pthread_cond_broadcast"
+            | "_pthread_cond_init"
+            | "_pthread_cond_signal"
+            | "_pthread_cond_timedwait_relative_np"
+            | "_pthread_cond_wait"
+            | "_pthread_create"
+            | "_pthread_detach"
+            | "_pthread_exit"
+            | "_pthread_get_stackaddr_np"
+            | "_pthread_get_stacksize_np"
+            | "_pthread_getspecific"
+            | "_pthread_join"
+            | "_pthread_key_create"
+            | "_pthread_mutex_init"
+            | "_pthread_mutex_lock"
+            | "_pthread_mutex_unlock"
+            | "_pthread_self"
+            | "_pthread_setname_np"
+            | "_pthread_setspecific"
             | "_read"
             | "_readdir_r"
-            | "_stat"
-            | "_lstat"
-            | "_fstat"
-            | "_getcwd"
-            | "_getrlimit"
-            | "_malloc"
-            | "_posix_memalign"
-            | "_write"
-            | "_mach_absolute_time"
+            | "_realloc"
+            | "_sigaction"
+            | "_sigaltstack"
+            | "_signal"
             | "_sleep"
-            | "_usleep"
+            | "_stat"
+            | "_strlen"
+            | "_sysconf"
             | "_sysctl"
             | "_sysctlbyname"
-            | "_atexit"
-            | "___cxa_atexit"
+            | "_usleep"
+            | "_wait4"
+            | "_waitpid"
+            | "_write"
+            | "_xpc_date_create_from_current"
+            | "_CFArrayAppendValue"
+            | "_CFArrayCreate"
+            | "_CFArrayCreateMutable"
+            | "_CFArrayGetCount"
+            | "_CFArrayGetValueAtIndex"
+            | "_CFDataCreate"
+            | "_CFDataGetBytePtr"
+            | "_CFDataGetLength"
+            | "_CFDateCreate"
+            | "_CFDictionaryCreate"
+            | "_CFDictionaryGetValueIfPresent"
+            | "_CFErrorCopyDescription"
+            | "_CFErrorCreate"
+            | "_CFErrorGetCode"
+            | "_CFGetTypeID"
+            | "_CFNumberGetTypeID"
+            | "_CFNumberGetValue"
+            | "_CFRelease"
+            | "_CFRetain"
+            | "_CFStringCreateExternalRepresentation"
+            | "_CFStringCreateWithBytes"
+            | "_SecCertificateCopyData"
+            | "_SecCertificateCreateWithData"
+            | "_SecPolicyCreateSSL"
+            | "_SecTrustCreateWithCertificates"
+            | "_SecTrustEvaluateWithError"
+            | "_SecTrustGetCertificateAtIndex"
+            | "_SecTrustGetCertificateCount"
+            | "_SecTrustSetVerifyDate"
     )
 }
 
@@ -132,9 +234,19 @@ mod tests {
 
     #[test]
     fn static_stat_imports_are_handled_by_exact_hooks() {
-        assert!(arm64_static_symbol_has_exact_hook("_stat"));
-        assert!(arm64_static_symbol_has_exact_hook("_lstat"));
-        assert!(arm64_static_symbol_has_exact_hook("_fstat"));
+        assert!(arm64_import_has_runtime_hook("_stat"));
+        assert!(arm64_import_has_runtime_hook("_lstat"));
+        assert!(arm64_import_has_runtime_hook("_fstat"));
+    }
+
+    #[test]
+    fn runtime_hook_classifier_covers_non_generic_import_groups() {
+        assert!(arm64_import_has_runtime_hook("_dlsym"));
+        assert!(arm64_import_has_runtime_hook("_CFStringCreateWithBytes"));
+        assert!(arm64_import_has_runtime_hook("CFStringCreateWithCString"));
+        assert!(arm64_import_has_runtime_hook("_pthread_create"));
+        assert!(arm64_import_has_runtime_hook("__Znwm"));
+        assert!(!arm64_import_has_runtime_hook("_future_unhandled_import"));
     }
 }
 
@@ -194,6 +306,7 @@ pub fn install_arm64_return_stubs(
     let process_name_for_hook = process_name.to_string();
     let compat_for_hook = compat;
     let shared_state_for_hook = shared_state.clone();
+    let logged_unhandled_imports = Arc::new(Mutex::new(HashSet::<String>::new()));
     emulator.add_code_hook(
         stub_region.base,
         stub_region.base + stub_region.size,
@@ -220,16 +333,31 @@ pub fn install_arm64_return_stubs(
                     .arg("lr", format!("0x{:X}", emu.read_reg("lr").unwrap())),
                 );
                 if address == bucket {
+                    let has_runtime_hook = arm64_import_has_runtime_hook(&name);
                     if let Some(compat) = compat_for_hook {
-                        if compat.should_proxy_import(&name)
-                            && !arm64_static_symbol_has_exact_hook(&name)
-                        {
+                        let proxied_by_generic_import = compat.should_proxy_import(&name);
+                        if proxied_by_generic_import && !has_runtime_hook {
                             arm64_proxy_compat_host_import(
                                 emu,
                                 &name,
                                 &shared_state_for_hook,
                                 errno_ptr,
                             );
+                        } else if !proxied_by_generic_import && !has_runtime_hook {
+                            let lr = emu.read_reg("lr").unwrap_or(0);
+                            let log_key = format!("{name}@0x{bucket:X}");
+                            let should_log = logged_unhandled_imports
+                                .lock()
+                                .ok()
+                                .is_some_and(|mut seen| seen.insert(log_key));
+                            if should_log {
+                                compat.log_unhandled_import(
+                                    &name,
+                                    address,
+                                    lr,
+                                    "no compat proxy or exact runtime hook",
+                                );
+                            }
                         }
                     }
                 }
@@ -247,6 +375,19 @@ pub fn install_arm64_return_stubs(
                     .arg("Address", format!("0x{:X}", address))
                     .arg("lr", format!("0x{:X}", emu.read_reg("lr").unwrap())),
                 );
+                if address == bucket {
+                    if let Some(compat) = compat_for_hook {
+                        let lr = emu.read_reg("lr").unwrap_or(0);
+                        let log_key = format!("<unknown>@0x{bucket:X}");
+                        let should_log = logged_unhandled_imports
+                            .lock()
+                            .ok()
+                            .is_some_and(|mut seen| seen.insert(log_key));
+                        if should_log {
+                            compat.log_unknown_import_address(address, lr);
+                        }
+                    }
+                }
             }
         },
     )?;

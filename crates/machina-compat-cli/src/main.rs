@@ -111,7 +111,7 @@ fn emulate_macos_binary_with_stub_resolver(
 }
 
 fn usage() -> &'static str {
-    "Usage: machina-compat [--compat|--mode compat] [--compat-log off|summary|calls|verbose] [--compat-log-filter calls] [--compat-log-preview-bytes n] [targets...]\n\nRuns the macOS arm64 compatibility layer without analysis mode.\n\nCompat logs are JSONL lines written to stderr. Filters are comma-separated normalized call names such as write,open,getaddrinfo."
+    "Usage: machina-compat [--compat|--mode compat] [--compat-log off|summary|calls|verbose] [--compat-log-filter calls] [--compat-log-preview-bytes n] [targets...]\n\nRuns the macOS arm64 compatibility layer without analysis mode.\n\nCompat logs are JSONL lines written to stderr. Any non-off level reports unhandled imports and unresolved dlsym requests. Filters limit host-call logs to normalized call names such as write,open,getaddrinfo."
 }
 
 fn parse_compat_log_level(value: String) -> Result<String, String> {

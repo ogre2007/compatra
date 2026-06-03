@@ -4,7 +4,7 @@
 //! therefore returns guest arm64 trampoline addresses backed by Machina's
 //! import-stub dispatch table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::macos::apple_imports::is_apple_import_symbol;
@@ -34,6 +34,7 @@ pub fn install_arm64_dynamic_imports(
     let handles = Arc::new(Mutex::new(HashMap::<u64, Option<String>>::new()));
     let next_handle = Arc::new(Mutex::new(DYNAMIC_IMPORT_HANDLE_BASE));
     let dynamic_symbols = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+    let unresolved_symbols = Arc::new(Mutex::new(HashSet::<String>::new()));
 
     if let Some(&addr) = stub_map.get("_dlopen") {
         let handles = handles.clone();
@@ -88,6 +89,7 @@ pub fn install_arm64_dynamic_imports(
     if let Some(&addr) = stub_map.get("_dlsym") {
         let handles = handles.clone();
         let dynamic_symbols = dynamic_symbols.clone();
+        let unresolved_symbols = unresolved_symbols.clone();
         let next_dynamic_stub_addr = next_dynamic_stub_addr.clone();
         let stub_name_map = stub_name_map.clone();
         let import_tracker = import_tracker.clone();
@@ -136,6 +138,21 @@ pub fn install_arm64_dynamic_imports(
                 } else {
                     0
                 };
+                if result == 0 {
+                    let reason = if handle_known {
+                        "no compat proxy or Apple dynamic dispatcher"
+                    } else {
+                        "unknown dlopen handle"
+                    };
+                    let log_key = format!("0x{handle:X}:{symbol}");
+                    let should_log = unresolved_symbols
+                        .lock()
+                        .ok()
+                        .is_some_and(|mut seen| seen.insert(log_key));
+                    if should_log {
+                        compat.log_unresolved_dlsym(handle, &symbol, reason);
+                    }
+                }
                 let lr = emu.read_reg("lr").unwrap_or(0);
                 let _ = emu.write_reg("x0", result);
                 if lr != 0 {

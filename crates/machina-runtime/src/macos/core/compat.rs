@@ -46,6 +46,18 @@ impl CompatibilityServices {
         machina_compat::CompatibilityServices.should_proxy_import(symbol)
     }
 
+    pub fn log_unhandled_import(&self, symbol: &str, address: u64, lr: u64, reason: &str) {
+        machina_compat::CompatibilityServices.log_unhandled_import(symbol, address, lr, reason);
+    }
+
+    pub fn log_unknown_import_address(&self, address: u64, lr: u64) {
+        machina_compat::CompatibilityServices.log_unknown_import_address(address, lr);
+    }
+
+    pub fn log_unresolved_dlsym(&self, handle: u64, symbol: &str, reason: &str) {
+        machina_compat::CompatibilityServices.log_unresolved_dlsym(handle, symbol, reason);
+    }
+
     pub fn proxy_cstring_arg0_import(
         &self,
         emu: &mut dyn Emulator,

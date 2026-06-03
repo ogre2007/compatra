@@ -120,10 +120,14 @@ add new ones):
 - `MACHINA_TRACE_FORMAT` — `jsonl` (default) or `human`.
 - `MACHINA_TRACE_PROFILE` — `compact` (default), `full`, or `debug`.
 - `MACHINA_COMPAT_LOG` — compat-only JSONL logs to stderr: `off`
-  (default), `summary`, `calls`, or `verbose`. The `machina` and
+  (default), `summary`, `calls`, or `verbose`. Any non-`off` level also
+  reports unhandled import-stub hits and unresolved `dlsym` requests so
+  missing compatibility glue is visible in a concrete run. The `machina` and
   `machina-compat` CLIs also expose this as `--compat-log`.
 - `MACHINA_COMPAT_LOG_FILTER` — comma-separated normalized compat call names
-  such as `write,open,getaddrinfo`; CLI form is `--compat-log-filter`.
+  such as `write,open,getaddrinfo`; this limits host-call logs, while
+  missing-import diagnostics still emit at any non-`off` log level. CLI form
+  is `--compat-log-filter`.
 - `MACHINA_COMPAT_LOG_PREVIEW_BYTES` — byte cap for escaped text/hex previews
   in compat I/O logs; CLI form is `--compat-log-preview-bytes`.
 - `MACHINA_TRACE_WINDOW_START` / `_END` / `_HITS` — bounded instruction trace

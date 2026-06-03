@@ -78,8 +78,8 @@ Useful knobs:
 - `MACHINA_PLUGIN_TRACE=1`: enable plugin trace bus
 - `MACHINA_TRACE_FORMAT=jsonl`: force JSONL output
 - `MACHINA_TRACE_FORMAT=human`: legacy human-readable sink for debugging
-- `MACHINA_COMPAT_LOG=off|summary|calls|verbose`: emit compatibility-layer JSONL logs to stderr; default is `off`
-- `MACHINA_COMPAT_LOG_FILTER=write,open,getaddrinfo`: limit compat logs to comma-separated normalized call names
+- `MACHINA_COMPAT_LOG=off|summary|calls|verbose`: emit compatibility-layer JSONL logs to stderr; default is `off`. Any non-`off` level also reports unhandled import-stub hits and unresolved `dlsym` requests.
+- `MACHINA_COMPAT_LOG_FILTER=write,open,getaddrinfo`: limit compat host-call logs to comma-separated normalized call names; missing-import diagnostics still emit at any non-`off` log level
 - `MACHINA_COMPAT_LOG_PREVIEW_BYTES=96`: cap escaped text/hex previews for host-proxied I/O payloads
 - `MACHINA_INDIRECT_BRANCH_MODE=fast`: default; skip expensive indirect-branch sanitizers
 - `MACHINA_INDIRECT_BRANCH_MODE=sanitize`: enable indirect-branch sanitizers for debugging signed or tagged branch targets
@@ -124,7 +124,9 @@ cargo run -p machina-compat-cli --no-default-features --bin machina-compat -- fi
 ```
 
 Compat runs can also emit focused host-proxy logs without enabling analysis
-plugins:
+plugins. Use `summary` when you mainly want stderr diagnostics for missing
+compat imports, or `calls`/`verbose` when you also want successful host-proxy
+calls:
 
 ```powershell
 cargo run -p machina-compat-cli --no-default-features --bin machina-compat -- --compat-log calls --compat-log-filter write,getaddrinfo --compat-log-preview-bytes 96 fixtures\macos\bin\arm64_hello
