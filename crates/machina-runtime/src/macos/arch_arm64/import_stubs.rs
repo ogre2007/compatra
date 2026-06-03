@@ -233,6 +233,10 @@ fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> boo
     )
 }
 
+fn arm64_stub_bucket_is_reserved(stub_region: StubRegion, bucket: u64) -> bool {
+    bucket == stub_region.done_addr || Some(bucket) == stub_region.thread_exit_stub
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +276,33 @@ mod tests {
             assert!(arm64_import_has_runtime_hook(symbol, RuntimeMode::Analysis));
             assert!(!arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat));
         }
+    }
+
+    #[test]
+    fn reserved_terminal_stub_buckets_are_not_import_misses() {
+        let stub_region = StubRegion {
+            base: 0x2000_0000,
+            size: 0x10000,
+            done_addr: 0x2000_0800,
+            thread_exit_stub: Some(0x2000_0900),
+        };
+
+        assert!(arm64_stub_bucket_is_reserved(
+            stub_region,
+            stub_region.bucket(stub_region.done_addr)
+        ));
+        assert!(arm64_stub_bucket_is_reserved(
+            stub_region,
+            stub_region.bucket(stub_region.done_addr + 4)
+        ));
+        assert!(arm64_stub_bucket_is_reserved(
+            stub_region,
+            stub_region.bucket(stub_region.thread_exit_stub.unwrap())
+        ));
+        assert!(!arm64_stub_bucket_is_reserved(
+            stub_region,
+            stub_region.bucket(0x2000_0A00)
+        ));
     }
 }
 
@@ -390,6 +421,9 @@ pub fn install_arm64_return_stubs(
                     *slot = Some(format!("{} @ 0x{:X}", name, address));
                 }
             } else {
+                if arm64_stub_bucket_is_reserved(stub_region, bucket) {
+                    return;
+                }
                 emit_arm64_event(
                     &trace_bus_for_hook,
                     process_event(

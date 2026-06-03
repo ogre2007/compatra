@@ -1,6 +1,6 @@
 [package]
 name = "machina"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 description = "Machina - macOS-focused Mach-O emulation in Rust"
 license = "GPL-2.0"

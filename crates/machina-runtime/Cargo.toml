@@ -1,6 +1,6 @@
 [package]
 name = "machina-runtime"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 description = "Machina macOS arm64 emulation runtime"
 license = "GPL-2.0"
