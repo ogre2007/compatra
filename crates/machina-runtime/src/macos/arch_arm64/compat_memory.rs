@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::macos::arm64_state::Arm64SharedState;
-use crate::macos::{align_up, Emulator};
+use crate::macos::{align_up, read_cstring, Emulator};
 use crate::UnicornEmulator;
 
 const ARM64_MALLOC_CHUNK_SIZE: u64 = 0x10_0000;
@@ -124,5 +124,48 @@ impl machina_compat::GuestMemory for Arm64CompatGuestMemory<'_> {
             .ok()
             .and_then(|allocations| allocations.get(&addr).copied())
             .map(|size| size as usize)
+    }
+
+    fn guest_executable_path(&mut self) -> Option<String> {
+        let addr = self.shared_state.process_bootstrap.apple0_addr;
+        (addr != 0)
+            .then(|| read_cstring(self.emulator, addr, 4096).ok())
+            .flatten()
+    }
+
+    fn guest_executable_path_ptr(&mut self) -> Option<u64> {
+        let addr = self.shared_state.process_bootstrap.apple0_addr;
+        (addr != 0).then_some(addr)
+    }
+
+    fn guest_program_name_ptr(&mut self) -> Option<u64> {
+        self.shared_state
+            .program_name_ptr
+            .lock()
+            .ok()
+            .map(|ptr| *ptr)
+            .filter(|ptr| *ptr != 0)
+            .or_else(|| {
+                let addr = self.shared_state.process_bootstrap.arg0_addr;
+                (addr != 0).then_some(addr)
+            })
+    }
+
+    fn set_guest_program_name_ptr(
+        &mut self,
+        addr: u64,
+    ) -> Result<(), machina_compat::GuestMemoryError> {
+        if let Ok(mut ptr) = self.shared_state.program_name_ptr.lock() {
+            *ptr = addr;
+        }
+        Ok(())
+    }
+
+    fn guest_main_image_header(&mut self) -> Option<u64> {
+        (self.shared_state.main_image_header != 0).then_some(self.shared_state.main_image_header)
+    }
+
+    fn guest_main_image_slide(&mut self) -> i64 {
+        self.shared_state.main_image_slide
     }
 }

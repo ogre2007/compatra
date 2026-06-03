@@ -50,6 +50,30 @@ pub trait GuestMemory {
     fn allocation_size(&mut self, _addr: u64) -> Option<usize> {
         None
     }
+
+    fn guest_executable_path(&mut self) -> Option<String> {
+        None
+    }
+
+    fn guest_executable_path_ptr(&mut self) -> Option<u64> {
+        None
+    }
+
+    fn guest_program_name_ptr(&mut self) -> Option<u64> {
+        None
+    }
+
+    fn set_guest_program_name_ptr(&mut self, _addr: u64) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
+
+    fn guest_main_image_header(&mut self) -> Option<u64> {
+        None
+    }
+
+    fn guest_main_image_slide(&mut self) -> i64 {
+        0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -805,6 +829,50 @@ enum HostImportKind {
     GetEntropy,
     #[cfg(target_os = "macos")]
     PthreadThreadingNp,
+    #[cfg(target_os = "macos")]
+    NSGetExecutablePath,
+    #[cfg(target_os = "macos")]
+    GetProgName,
+    #[cfg(target_os = "macos")]
+    SetProgName,
+    #[cfg(target_os = "macos")]
+    DyldImageCount,
+    #[cfg(target_os = "macos")]
+    DyldGetImageName,
+    #[cfg(target_os = "macos")]
+    DyldGetImageHeader,
+    #[cfg(target_os = "macos")]
+    DyldGetImageVmaddrSlide,
+    #[cfg(target_os = "macos")]
+    Dladdr,
+    #[cfg(target_os = "macos")]
+    PthreadOnce,
+    #[cfg(target_os = "macos")]
+    PthreadMutexAttrInit,
+    #[cfg(target_os = "macos")]
+    PthreadMutexAttrSetType,
+    #[cfg(target_os = "macos")]
+    PthreadMutexAttrDestroy,
+    #[cfg(target_os = "macos")]
+    PthreadAttrInit,
+    #[cfg(target_os = "macos")]
+    PthreadAttrDestroy,
+    #[cfg(target_os = "macos")]
+    PthreadAttrGetStackSize,
+    #[cfg(target_os = "macos")]
+    PthreadAttrSetStackSize,
+    #[cfg(target_os = "macos")]
+    PthreadAttrSetDetachState,
+    #[cfg(target_os = "macos")]
+    OsUnfairLockLock,
+    #[cfg(target_os = "macos")]
+    OsUnfairLockTryLock,
+    #[cfg(target_os = "macos")]
+    OsUnfairLockUnlock,
+    #[cfg(target_os = "macos")]
+    OsUnfairLockAssertOwner,
+    #[cfg(target_os = "macos")]
+    OsUnfairLockAssertNotOwner,
 }
 
 impl CompatibilityServices {
@@ -1232,6 +1300,62 @@ impl CompatibilityServices {
                     Some(self.getentropy(memory, args[0], args[1] as usize)?.into())
                 }
                 HostImportKind::PthreadThreadingNp => Some(proxy_host_pthread_threading_np()),
+                HostImportKind::NSGetExecutablePath => Some(proxy_guest_ns_get_executable_path(
+                    memory, args[0], args[1],
+                )?),
+                HostImportKind::GetProgName => Some(host_call_value(
+                    memory
+                        .guest_program_name_ptr()
+                        .or_else(|| memory.guest_executable_path_ptr())
+                        .unwrap_or(0),
+                )),
+                HostImportKind::SetProgName => {
+                    let _ = memory.set_guest_program_name_ptr(args[0]);
+                    Some(host_call_value(0))
+                }
+                HostImportKind::DyldImageCount => Some(host_call_value(1)),
+                HostImportKind::DyldGetImageName => {
+                    Some(proxy_guest_dyld_get_image_name(memory, args[0]))
+                }
+                HostImportKind::DyldGetImageHeader => {
+                    Some(proxy_guest_dyld_get_image_header(memory, args[0]))
+                }
+                HostImportKind::DyldGetImageVmaddrSlide => {
+                    Some(proxy_guest_dyld_get_image_vmaddr_slide(memory, args[0]))
+                }
+                HostImportKind::Dladdr => Some(proxy_guest_dladdr(memory, args[0], args[1])?),
+                HostImportKind::PthreadOnce => {
+                    Some(proxy_guest_pthread_once(memory, args[0], args[1])?)
+                }
+                HostImportKind::PthreadMutexAttrInit => {
+                    Some(proxy_guest_pthread_attr_init(memory, args[0], 16)?)
+                }
+                HostImportKind::PthreadMutexAttrSetType => Some(host_call_value(0)),
+                HostImportKind::PthreadMutexAttrDestroy => {
+                    Some(proxy_guest_pthread_attr_destroy(memory, args[0], 16)?)
+                }
+                HostImportKind::PthreadAttrInit => {
+                    Some(proxy_guest_pthread_attr_init(memory, args[0], 64)?)
+                }
+                HostImportKind::PthreadAttrDestroy => {
+                    Some(proxy_guest_pthread_attr_destroy(memory, args[0], 64)?)
+                }
+                HostImportKind::PthreadAttrGetStackSize => {
+                    Some(proxy_guest_pthread_attr_getstacksize(memory, args[1])?)
+                }
+                HostImportKind::PthreadAttrSetStackSize => Some(host_call_value(0)),
+                HostImportKind::PthreadAttrSetDetachState => Some(host_call_value(0)),
+                HostImportKind::OsUnfairLockLock => {
+                    Some(proxy_guest_os_unfair_lock_lock(memory, args[0], false)?)
+                }
+                HostImportKind::OsUnfairLockTryLock => {
+                    Some(proxy_guest_os_unfair_lock_lock(memory, args[0], true)?)
+                }
+                HostImportKind::OsUnfairLockUnlock => {
+                    Some(proxy_guest_os_unfair_lock_unlock(memory, args[0])?)
+                }
+                HostImportKind::OsUnfairLockAssertOwner
+                | HostImportKind::OsUnfairLockAssertNotOwner => Some(host_call_value(0)),
             };
             let mut log_arg_pairs = args
                 .iter()
@@ -4048,6 +4172,230 @@ fn proxy_host_pthread_threading_np() -> HostCallResult {
     }
 }
 
+#[cfg(target_os = "macos")]
+const DEFAULT_GUEST_PTHREAD_STACK_SIZE: u64 = 0x20_0000;
+
+#[cfg(target_os = "macos")]
+fn host_call_minus_one() -> HostCallResult {
+    HostCallResult {
+        return_value: u64::MAX,
+        errno: None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_guest_cstring_bytes<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    bytes: &[u8],
+) -> Result<(), GuestMemoryError> {
+    let mut out = Vec::with_capacity(bytes.len().saturating_add(1));
+    out.extend_from_slice(bytes);
+    out.push(0);
+    memory.write_memory(addr, &out)
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_guest_cstring<M: GuestMemory + ?Sized>(memory: &mut M, text: &str) -> Option<u64> {
+    let len = text.len().saturating_add(1).max(1);
+    let addr = memory.allocate_memory(len, 1).ok()?;
+    write_guest_cstring_bytes(memory, addr, text.as_bytes()).ok()?;
+    Some(addr)
+}
+
+#[cfg(target_os = "macos")]
+fn guest_executable_path_ptr_or_alloc<M: GuestMemory + ?Sized>(memory: &mut M) -> Option<u64> {
+    if let Some(ptr) = memory.guest_executable_path_ptr().filter(|ptr| *ptr != 0) {
+        return Some(ptr);
+    }
+    let path = memory
+        .guest_executable_path()
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| "program".to_string());
+    allocate_guest_cstring(memory, &path)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_ns_get_executable_path<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    buf_ptr: u64,
+    size_ptr: u64,
+) -> Option<HostCallResult> {
+    if size_ptr == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    let path = memory
+        .guest_executable_path()
+        .filter(|path| !path.is_empty())
+        .or_else(|| {
+            memory
+                .guest_program_name_ptr()
+                .and_then(|ptr| read_cstring(memory, ptr, 4096).ok())
+        })
+        .unwrap_or_else(|| "program".to_string());
+    let required = path.len().saturating_add(1).min(u32::MAX as usize) as u32;
+    let size_bytes = memory.read_memory(size_ptr, 4).ok()?;
+    let capacity = read_u32_at(&size_bytes, 0)?;
+    write_guest_u32(memory, size_ptr, required).ok()?;
+    if buf_ptr == 0 || capacity < required {
+        return Some(host_call_minus_one());
+    }
+    write_guest_cstring_bytes(memory, buf_ptr, path.as_bytes()).ok()?;
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_dyld_get_image_name<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    index: u64,
+) -> HostCallResult {
+    if index == 0 {
+        host_call_value(guest_executable_path_ptr_or_alloc(memory).unwrap_or(0))
+    } else {
+        host_call_value(0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_dyld_get_image_header<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    index: u64,
+) -> HostCallResult {
+    host_call_value(
+        (index == 0)
+            .then(|| memory.guest_main_image_header())
+            .flatten()
+            .unwrap_or(0),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_dyld_get_image_vmaddr_slide<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    index: u64,
+) -> HostCallResult {
+    if index == 0 {
+        HostCallResult {
+            return_value: memory.guest_main_image_slide() as u64,
+            errno: None,
+        }
+    } else {
+        host_call_value(0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_dladdr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    info_ptr: u64,
+) -> Option<HostCallResult> {
+    if addr == 0 || info_ptr == 0 {
+        return Some(host_call_value(0));
+    }
+    let fname = guest_executable_path_ptr_or_alloc(memory).unwrap_or(0);
+    let fbase = memory.guest_main_image_header().unwrap_or(0);
+    if fname == 0 || fbase == 0 {
+        return Some(host_call_value(0));
+    }
+    write_guest_u64(memory, info_ptr, fname).ok()?;
+    write_guest_u64(memory, info_ptr + 8, fbase).ok()?;
+    write_guest_u64(memory, info_ptr + 16, 0).ok()?;
+    write_guest_u64(memory, info_ptr + 24, 0).ok()?;
+    Some(host_call_value(1))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_pthread_once<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    once_ptr: u64,
+    init_routine: u64,
+) -> Option<HostCallResult> {
+    if once_ptr == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    let state = memory
+        .read_memory(once_ptr, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .unwrap_or(0);
+    if state == 0 {
+        write_guest_u64(memory, once_ptr, 1).ok()?;
+    }
+    let _ = init_routine;
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_pthread_attr_init<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    attr_ptr: u64,
+    size: usize,
+) -> Option<HostCallResult> {
+    if attr_ptr == 0 {
+        return Some(host_call_error(libc::EINVAL as u32));
+    }
+    memory.write_memory(attr_ptr, &vec![0u8; size]).ok()?;
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_pthread_attr_destroy<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    attr_ptr: u64,
+    size: usize,
+) -> Option<HostCallResult> {
+    if attr_ptr != 0 {
+        let _ = memory.write_memory(attr_ptr, &vec![0u8; size]);
+    }
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_pthread_attr_getstacksize<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    size_ptr: u64,
+) -> Option<HostCallResult> {
+    if size_ptr == 0 {
+        return Some(host_call_error(libc::EINVAL as u32));
+    }
+    write_guest_u64(memory, size_ptr, DEFAULT_GUEST_PTHREAD_STACK_SIZE).ok()?;
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_os_unfair_lock_lock<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    lock_ptr: u64,
+    try_only: bool,
+) -> Option<HostCallResult> {
+    if lock_ptr == 0 {
+        return Some(host_call_error(libc::EINVAL as u32));
+    }
+    let state = memory
+        .read_memory(lock_ptr, 4)
+        .ok()
+        .and_then(|bytes| read_u32_at(&bytes, 0))
+        .unwrap_or(0);
+    if try_only && state != 0 {
+        return Some(host_call_value(0));
+    }
+    write_guest_u32(memory, lock_ptr, 1).ok()?;
+    Some(host_call_value(if try_only { 1 } else { 0 }))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_os_unfair_lock_unlock<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    lock_ptr: u64,
+) -> Option<HostCallResult> {
+    if lock_ptr == 0 {
+        return Some(host_call_error(libc::EINVAL as u32));
+    }
+    write_guest_u32(memory, lock_ptr, 0).ok()?;
+    Some(host_call_value(0))
+}
+
 fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
     #[cfg(target_os = "macos")]
     {
@@ -4198,6 +4546,36 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "seekdir" => Some(HostImportKind::Seekdir),
             "getentropy" => Some(HostImportKind::GetEntropy),
             "pthread_threading_np" => Some(HostImportKind::PthreadThreadingNp),
+            "_NSGetExecutablePath" | "NSGetExecutablePath" => {
+                Some(HostImportKind::NSGetExecutablePath)
+            }
+            "getprogname" => Some(HostImportKind::GetProgName),
+            "setprogname" => Some(HostImportKind::SetProgName),
+            "_dyld_image_count" | "dyld_image_count" => Some(HostImportKind::DyldImageCount),
+            "_dyld_get_image_name" | "dyld_get_image_name" => {
+                Some(HostImportKind::DyldGetImageName)
+            }
+            "_dyld_get_image_header" | "dyld_get_image_header" => {
+                Some(HostImportKind::DyldGetImageHeader)
+            }
+            "_dyld_get_image_vmaddr_slide" | "dyld_get_image_vmaddr_slide" => {
+                Some(HostImportKind::DyldGetImageVmaddrSlide)
+            }
+            "dladdr" => Some(HostImportKind::Dladdr),
+            "pthread_once" => Some(HostImportKind::PthreadOnce),
+            "pthread_mutexattr_init" => Some(HostImportKind::PthreadMutexAttrInit),
+            "pthread_mutexattr_settype" => Some(HostImportKind::PthreadMutexAttrSetType),
+            "pthread_mutexattr_destroy" => Some(HostImportKind::PthreadMutexAttrDestroy),
+            "pthread_attr_init" => Some(HostImportKind::PthreadAttrInit),
+            "pthread_attr_destroy" => Some(HostImportKind::PthreadAttrDestroy),
+            "pthread_attr_getstacksize" => Some(HostImportKind::PthreadAttrGetStackSize),
+            "pthread_attr_setstacksize" => Some(HostImportKind::PthreadAttrSetStackSize),
+            "pthread_attr_setdetachstate" => Some(HostImportKind::PthreadAttrSetDetachState),
+            "os_unfair_lock_lock" => Some(HostImportKind::OsUnfairLockLock),
+            "os_unfair_lock_trylock" => Some(HostImportKind::OsUnfairLockTryLock),
+            "os_unfair_lock_unlock" => Some(HostImportKind::OsUnfairLockUnlock),
+            "os_unfair_lock_assert_owner" => Some(HostImportKind::OsUnfairLockAssertOwner),
+            "os_unfair_lock_assert_not_owner" => Some(HostImportKind::OsUnfairLockAssertNotOwner),
             _ => None,
         }
     }
@@ -9127,6 +9505,33 @@ mod tests {
             assert!(compat.should_proxy_import("_seekdir"));
             assert!(compat.should_proxy_import("_getentropy"));
             assert!(compat.should_proxy_import("_pthread_threading_np"));
+            assert!(compat.should_proxy_import("__NSGetExecutablePath"));
+            assert!(compat.should_proxy_import("_NSGetExecutablePath"));
+            assert!(compat.should_proxy_import("_getprogname"));
+            assert!(compat.should_proxy_import("_setprogname"));
+            assert!(compat.should_proxy_import("__dyld_image_count"));
+            assert!(compat.should_proxy_import("_dyld_image_count"));
+            assert!(compat.should_proxy_import("__dyld_get_image_name"));
+            assert!(compat.should_proxy_import("_dyld_get_image_name"));
+            assert!(compat.should_proxy_import("__dyld_get_image_header"));
+            assert!(compat.should_proxy_import("_dyld_get_image_header"));
+            assert!(compat.should_proxy_import("__dyld_get_image_vmaddr_slide"));
+            assert!(compat.should_proxy_import("_dyld_get_image_vmaddr_slide"));
+            assert!(compat.should_proxy_import("_dladdr"));
+            assert!(compat.should_proxy_import("_pthread_once"));
+            assert!(compat.should_proxy_import("_pthread_mutexattr_init"));
+            assert!(compat.should_proxy_import("_pthread_mutexattr_settype"));
+            assert!(compat.should_proxy_import("_pthread_mutexattr_destroy"));
+            assert!(compat.should_proxy_import("_pthread_attr_init"));
+            assert!(compat.should_proxy_import("_pthread_attr_destroy"));
+            assert!(compat.should_proxy_import("_pthread_attr_getstacksize"));
+            assert!(compat.should_proxy_import("_pthread_attr_setstacksize"));
+            assert!(compat.should_proxy_import("_pthread_attr_setdetachstate"));
+            assert!(compat.should_proxy_import("_os_unfair_lock_lock"));
+            assert!(compat.should_proxy_import("_os_unfair_lock_trylock"));
+            assert!(compat.should_proxy_import("_os_unfair_lock_unlock"));
+            assert!(compat.should_proxy_import("_os_unfair_lock_assert_owner"));
+            assert!(compat.should_proxy_import("_os_unfair_lock_assert_not_owner"));
         }
         #[cfg(not(target_os = "macos"))]
         assert!(!compat.should_proxy_import("_puts"));

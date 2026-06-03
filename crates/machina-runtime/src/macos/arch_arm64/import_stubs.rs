@@ -181,6 +181,7 @@ fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> boo
             | "_pthread_mutex_init"
             | "_pthread_mutex_lock"
             | "_pthread_mutex_unlock"
+            | "_pthread_once"
             | "_pthread_self"
             | "_pthread_setname_np"
             | "_pthread_setspecific"
@@ -263,11 +264,66 @@ mod tests {
             "_pthread_create",
             RuntimeMode::Compat
         ));
+        assert!(arm64_import_has_runtime_hook(
+            "_pthread_once",
+            RuntimeMode::Compat
+        ));
         assert!(arm64_import_has_runtime_hook("__Znwm", RuntimeMode::Compat));
         assert!(!arm64_import_has_runtime_hook(
             "_future_unhandled_import",
             RuntimeMode::Compat
         ));
+    }
+
+    #[test]
+    fn runtime_hook_classifier_covers_cf_bundle_and_iokit_compat_imports() {
+        for symbol in [
+            "_CFStringGetCStringPtr",
+            "_CFStringCreateCopy",
+            "_CFStringCompare",
+            "_CFURLCreateWithFileSystemPath",
+            "_CFURLCopyFileSystemPath",
+            "_CFBundleGetMainBundle",
+            "_CFBundleCopyBundleURL",
+            "_IONotificationPortDestroy",
+            "_IOServiceMatching",
+            "_IOServiceGetMatchingService",
+            "_IOServiceGetMatchingServices",
+            "_IOIteratorNext",
+            "_IORegistryEntryCreateCFProperty",
+            "_IOObjectRelease",
+        ] {
+            assert!(
+                arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
+                "{symbol} should be dispatched by the arm64 compat runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_hook_classifier_covers_objc_compat_imports() {
+        for symbol in [
+            "_objc_getClass",
+            "_objc_lookUpClass",
+            "_objc_getMetaClass",
+            "_object_getClass",
+            "_class_getName",
+            "_sel_registerName",
+            "_sel_getName",
+            "_objc_msgSend",
+            "_objc_alloc",
+            "_objc_alloc_init",
+            "_objc_autoreleasePoolPush",
+            "_objc_retain",
+            "_objc_release",
+            "_objc_storeStrong",
+            "_objc_loadWeakRetained",
+        ] {
+            assert!(
+                arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
+                "{symbol} should be dispatched by the arm64 compat runtime"
+            );
+        }
     }
 
     #[test]

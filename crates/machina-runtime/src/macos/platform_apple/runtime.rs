@@ -7,23 +7,74 @@ use crate::macos::Emulator;
 
 #[derive(Clone, Debug)]
 pub enum AppleObject {
-    String { data: Vec<u8>, encoding: u64 },
-    Data { data: Vec<u8> },
-    Array { values: Vec<u64> },
-    Dictionary { entries: Vec<(u64, u64)> },
-    Number { value: i64 },
-    Certificate { data_ref: u64 },
-    PolicySsl { server: bool, hostname: u64 },
-    Trust { certificates: u64, policies: u64 },
-    Date { absolute_time: f64 },
-    Error { code: i64, description: String },
-    Opaque { kind: String, host_ptr: Option<u64> },
+    String {
+        data: Vec<u8>,
+        encoding: u64,
+    },
+    Data {
+        data: Vec<u8>,
+    },
+    Array {
+        values: Vec<u64>,
+        host_ptr: Option<u64>,
+    },
+    Dictionary {
+        entries: Vec<(u64, u64)>,
+        host_ptr: Option<u64>,
+    },
+    Number {
+        value: i64,
+    },
+    Certificate {
+        data_ref: u64,
+    },
+    PolicySsl {
+        server: bool,
+        hostname: u64,
+    },
+    Trust {
+        certificates: u64,
+        policies: u64,
+    },
+    Date {
+        absolute_time: f64,
+    },
+    Error {
+        code: i64,
+        description: String,
+    },
+    Url {
+        path: Vec<u8>,
+        host_ptr: Option<u64>,
+    },
+    Bundle {
+        path: Vec<u8>,
+        host_ptr: Option<u64>,
+    },
+    ObjcClass {
+        name: String,
+        host_ptr: Option<u64>,
+    },
+    ObjcSelector {
+        name: String,
+        host_ptr: Option<u64>,
+    },
+    ObjcObject {
+        kind: String,
+        host_ptr: Option<u64>,
+    },
+    Opaque {
+        kind: String,
+        host_ptr: Option<u64>,
+    },
 }
 
 #[derive(Debug)]
 pub struct AppleRuntime {
     next_handle: u64,
     next_guest_buffer: u64,
+    process_name: Option<String>,
+    singletons: HashMap<String, u64>,
     pub objects: HashMap<u64, AppleObject>,
 }
 
@@ -32,6 +83,8 @@ impl Default for AppleRuntime {
         Self {
             next_handle: 0x6A11_0000_0000,
             next_guest_buffer: 0x5000_0000,
+            process_name: None,
+            singletons: HashMap::new(),
             objects: HashMap::new(),
         }
     }
@@ -59,6 +112,14 @@ impl AppleRuntime {
         // synthetic deallocation makes control flow less realistic than a leak.
     }
 
+    pub fn set_process_name(&mut self, process_name: impl Into<String>) {
+        self.process_name = Some(process_name.into());
+    }
+
+    pub fn process_name(&self) -> Option<&str> {
+        self.process_name.as_deref()
+    }
+
     pub fn alloc_string(&mut self, data: Vec<u8>, encoding: u64) -> u64 {
         self.alloc(AppleObject::String { data, encoding })
     }
@@ -68,23 +129,84 @@ impl AppleRuntime {
     }
 
     pub fn alloc_array(&mut self) -> u64 {
-        self.alloc(AppleObject::Array { values: Vec::new() })
+        self.alloc(AppleObject::Array {
+            values: Vec::new(),
+            host_ptr: None,
+        })
     }
 
     pub fn alloc_array_with_values(&mut self, values: Vec<u64>) -> u64 {
-        self.alloc(AppleObject::Array { values })
+        self.alloc_array_with_values_and_host(values, None)
+    }
+
+    pub fn alloc_array_with_values_and_host(
+        &mut self,
+        values: Vec<u64>,
+        host_ptr: Option<u64>,
+    ) -> u64 {
+        if let Some(host_ptr) = host_ptr.filter(|host_ptr| *host_ptr != 0) {
+            self.objects.insert(
+                host_ptr,
+                AppleObject::Array {
+                    values,
+                    host_ptr: Some(host_ptr),
+                },
+            );
+            host_ptr
+        } else {
+            self.alloc(AppleObject::Array {
+                values,
+                host_ptr: None,
+            })
+        }
     }
 
     pub fn alloc_dictionary(&mut self, entries: Vec<(u64, u64)>) -> u64 {
-        self.alloc(AppleObject::Dictionary { entries })
+        self.alloc_dictionary_with_host(entries, None)
+    }
+
+    pub fn alloc_dictionary_with_host(
+        &mut self,
+        entries: Vec<(u64, u64)>,
+        host_ptr: Option<u64>,
+    ) -> u64 {
+        if let Some(host_ptr) = host_ptr.filter(|host_ptr| *host_ptr != 0) {
+            self.objects.insert(
+                host_ptr,
+                AppleObject::Dictionary {
+                    entries,
+                    host_ptr: Some(host_ptr),
+                },
+            );
+            host_ptr
+        } else {
+            self.alloc(AppleObject::Dictionary {
+                entries,
+                host_ptr: None,
+            })
+        }
     }
 
     pub fn dictionary_get(&self, dict_ref: u64, key_ref: u64) -> Option<u64> {
         match self.objects.get(&dict_ref) {
-            Some(AppleObject::Dictionary { entries }) => entries
+            Some(AppleObject::Dictionary { entries, .. }) => entries
                 .iter()
                 .find(|(key, _)| *key == key_ref)
                 .map(|(_, value)| *value),
+            _ => None,
+        }
+    }
+
+    pub fn dictionary_entries(&self, dict_ref: u64) -> Option<Vec<(u64, u64)>> {
+        match self.objects.get(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, .. }) => Some(entries.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn dictionary_len(&self, dict_ref: u64) -> Option<usize> {
+        match self.objects.get(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, .. }) => Some(entries.len()),
             _ => None,
         }
     }
@@ -102,7 +224,7 @@ impl AppleRuntime {
 
     pub fn array_append(&mut self, array_ref: u64, value: u64) -> bool {
         match self.objects.get_mut(&array_ref) {
-            Some(AppleObject::Array { values }) => {
+            Some(AppleObject::Array { values, .. }) => {
                 values.push(value);
                 true
             }
@@ -112,14 +234,14 @@ impl AppleRuntime {
 
     pub fn array_len(&self, array_ref: u64) -> Option<usize> {
         match self.objects.get(&array_ref) {
-            Some(AppleObject::Array { values }) => Some(values.len()),
+            Some(AppleObject::Array { values, .. }) => Some(values.len()),
             _ => None,
         }
     }
 
     pub fn array_get(&self, array_ref: u64, index: usize) -> Option<u64> {
         match self.objects.get(&array_ref) {
-            Some(AppleObject::Array { values }) => values.get(index).copied(),
+            Some(AppleObject::Array { values, .. }) => values.get(index).copied(),
             _ => None,
         }
     }
@@ -152,7 +274,7 @@ impl AppleRuntime {
             _ => return None,
         };
         match self.objects.get(&certificates) {
-            Some(AppleObject::Array { values }) => Some(values.len()),
+            Some(AppleObject::Array { values, .. }) => Some(values.len()),
             Some(AppleObject::Certificate { .. }) => Some(1),
             _ if certificates != 0 => Some(1),
             _ => Some(0),
@@ -165,7 +287,7 @@ impl AppleRuntime {
             _ => return None,
         };
         match self.objects.get(&certificates) {
-            Some(AppleObject::Array { values }) => values.get(index).copied(),
+            Some(AppleObject::Array { values, .. }) => values.get(index).copied(),
             Some(AppleObject::Certificate { .. }) if index == 0 => Some(certificates),
             _ if certificates != 0 && index == 0 => Some(certificates),
             _ => None,
@@ -181,6 +303,49 @@ impl AppleRuntime {
             code,
             description: description.into(),
         })
+    }
+
+    pub fn alloc_url(&mut self, path: Vec<u8>, host_ptr: Option<u64>) -> u64 {
+        if let Some(host_ptr) = host_ptr.filter(|host_ptr| *host_ptr != 0) {
+            self.objects.insert(
+                host_ptr,
+                AppleObject::Url {
+                    path,
+                    host_ptr: Some(host_ptr),
+                },
+            );
+            host_ptr
+        } else {
+            self.alloc(AppleObject::Url {
+                path,
+                host_ptr: None,
+            })
+        }
+    }
+
+    pub fn alloc_bundle(&mut self, path: Vec<u8>, host_ptr: Option<u64>) -> u64 {
+        if let Some(host_ptr) = host_ptr.filter(|host_ptr| *host_ptr != 0) {
+            self.objects.insert(
+                host_ptr,
+                AppleObject::Bundle {
+                    path,
+                    host_ptr: Some(host_ptr),
+                },
+            );
+            host_ptr
+        } else {
+            self.alloc(AppleObject::Bundle {
+                path,
+                host_ptr: None,
+            })
+        }
+    }
+
+    pub fn bundle_path(&self, handle: u64) -> Option<Vec<u8>> {
+        match self.objects.get(&handle) {
+            Some(AppleObject::Bundle { path, .. }) => Some(path.clone()),
+            _ => None,
+        }
     }
 
     pub fn alloc_opaque(&mut self, kind: impl Into<String>) -> u64 {
@@ -204,12 +369,164 @@ impl AppleRuntime {
         host_ptr
     }
 
+    pub fn register_host_objc_class(&mut self, name: impl Into<String>, host_ptr: u64) -> u64 {
+        let name = name.into();
+        if host_ptr == 0 {
+            return self.alloc(AppleObject::ObjcClass {
+                name,
+                host_ptr: None,
+            });
+        }
+        if self.objects.contains_key(&host_ptr) {
+            return host_ptr;
+        }
+        self.objects.insert(
+            host_ptr,
+            AppleObject::ObjcClass {
+                name,
+                host_ptr: Some(host_ptr),
+            },
+        );
+        host_ptr
+    }
+
+    pub fn register_host_objc_selector(&mut self, name: impl Into<String>, host_ptr: u64) -> u64 {
+        let name = name.into();
+        if host_ptr == 0 {
+            return self.alloc(AppleObject::ObjcSelector {
+                name,
+                host_ptr: None,
+            });
+        }
+        if self.objects.contains_key(&host_ptr) {
+            return host_ptr;
+        }
+        self.objects.insert(
+            host_ptr,
+            AppleObject::ObjcSelector {
+                name,
+                host_ptr: Some(host_ptr),
+            },
+        );
+        host_ptr
+    }
+
+    pub fn register_host_objc_object(&mut self, kind: impl Into<String>, host_ptr: u64) -> u64 {
+        let kind = kind.into();
+        if host_ptr == 0 {
+            return 0;
+        }
+        if self.objects.contains_key(&host_ptr) {
+            return host_ptr;
+        }
+        self.objects.insert(
+            host_ptr,
+            AppleObject::ObjcObject {
+                kind,
+                host_ptr: Some(host_ptr),
+            },
+        );
+        host_ptr
+    }
+
+    pub fn alloc_objc_object(&mut self, kind: impl Into<String>) -> u64 {
+        self.alloc(AppleObject::ObjcObject {
+            kind: kind.into(),
+            host_ptr: None,
+        })
+    }
+
+    pub fn objc_singleton(&mut self, kind: impl Into<String>) -> u64 {
+        let kind = kind.into();
+        if let Some(handle) = self.singletons.get(&kind) {
+            return *handle;
+        }
+        let handle = self.alloc_objc_object(kind.clone());
+        self.singletons.insert(kind, handle);
+        handle
+    }
+
+    pub fn objc_class_name(&self, handle: u64) -> Option<String> {
+        match self.objects.get(&handle) {
+            Some(AppleObject::ObjcClass { name, .. }) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn objc_selector_name(&self, handle: u64) -> Option<String> {
+        match self.objects.get(&handle) {
+            Some(AppleObject::ObjcSelector { name, .. }) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn objc_object_kind(&self, handle: u64) -> Option<String> {
+        match self.objects.get(&handle) {
+            Some(AppleObject::ObjcObject { kind, .. }) => Some(kind.clone()),
+            Some(AppleObject::ObjcClass { name, .. }) => Some(name.clone()),
+            Some(AppleObject::String { .. }) => Some("NSString".to_string()),
+            Some(AppleObject::Data { .. }) => Some("NSData".to_string()),
+            Some(AppleObject::Array { .. }) => Some("NSArray".to_string()),
+            Some(AppleObject::Dictionary { .. }) => Some("NSDictionary".to_string()),
+            Some(AppleObject::Url { .. }) => Some("NSURL".to_string()),
+            Some(AppleObject::Bundle { .. }) => Some("NSBundle".to_string()),
+            _ => None,
+        }
+    }
+
     pub fn opaque_host_ptr(&self, handle: u64) -> Option<u64> {
+        self.host_ptr(handle)
+    }
+
+    pub fn host_ptr(&self, handle: u64) -> Option<u64> {
         match self.objects.get(&handle) {
             Some(AppleObject::Opaque {
                 host_ptr: Some(host_ptr),
                 ..
+            })
+            | Some(AppleObject::Url {
+                host_ptr: Some(host_ptr),
+                ..
+            })
+            | Some(AppleObject::Bundle {
+                host_ptr: Some(host_ptr),
+                ..
+            })
+            | Some(AppleObject::ObjcClass {
+                host_ptr: Some(host_ptr),
+                ..
+            })
+            | Some(AppleObject::ObjcSelector {
+                host_ptr: Some(host_ptr),
+                ..
+            })
+            | Some(AppleObject::ObjcObject {
+                host_ptr: Some(host_ptr),
+                ..
+            })
+            | Some(AppleObject::Array {
+                host_ptr: Some(host_ptr),
+                ..
+            })
+            | Some(AppleObject::Dictionary {
+                host_ptr: Some(host_ptr),
+                ..
             }) => Some(*host_ptr),
+            _ => None,
+        }
+    }
+
+    pub fn host_ptr_or_raw_unknown(&self, handle: u64) -> Option<u64> {
+        if handle == 0 {
+            return None;
+        }
+        self.host_ptr(handle)
+            .or_else(|| (!self.objects.contains_key(&handle)).then_some(handle))
+    }
+
+    pub fn url_path(&self, handle: u64) -> Option<Vec<u8>> {
+        match self.objects.get(&handle) {
+            Some(AppleObject::Url { path, .. }) => Some(path.clone()),
             _ => None,
         }
     }
@@ -226,6 +543,11 @@ impl AppleRuntime {
             Some(AppleObject::Trust { .. }) => Self::TYPE_ID_TRUST,
             Some(AppleObject::Date { .. }) => Self::TYPE_ID_DATE,
             Some(AppleObject::Error { .. }) => Self::TYPE_ID_ERROR,
+            Some(AppleObject::Url { .. }) => 0,
+            Some(AppleObject::Bundle { .. }) => 0,
+            Some(AppleObject::ObjcClass { .. }) => 0,
+            Some(AppleObject::ObjcSelector { .. }) => 0,
+            Some(AppleObject::ObjcObject { .. }) => 0,
             Some(AppleObject::Opaque { .. }) => 0,
             None => 0,
         }
@@ -254,6 +576,8 @@ impl AppleRuntime {
             Some(AppleObject::String { data, .. }) => Some(data.clone()),
             Some(AppleObject::Data { data }) => Some(data.clone()),
             Some(AppleObject::Certificate { data_ref }) => self.object_data(*data_ref),
+            Some(AppleObject::Url { path, .. }) => Some(path.clone()),
+            Some(AppleObject::Bundle { path, .. }) => Some(path.clone()),
             _ => None,
         }
     }
@@ -289,10 +613,20 @@ impl AppleRuntime {
                 data.len(),
                 lossy_data_preview(data, 64)
             ),
-            Some(AppleObject::Array { values }) => format!("CFArray(count={})", values.len()),
-            Some(AppleObject::Dictionary { entries }) => {
-                format!("CFDictionary(count={})", entries.len())
-            }
+            Some(AppleObject::Array { values, host_ptr }) => match host_ptr {
+                Some(host_ptr) => format!("CFArray(count={}, host=0x{:X})", values.len(), host_ptr),
+                None => format!("CFArray(count={})", values.len()),
+            },
+            Some(AppleObject::Dictionary { entries, host_ptr }) => match host_ptr {
+                Some(host_ptr) => {
+                    format!(
+                        "CFDictionary(count={}, host=0x{:X})",
+                        entries.len(),
+                        host_ptr
+                    )
+                }
+                None => format!("CFDictionary(count={})", entries.len()),
+            },
             Some(AppleObject::Number { value }) => format!("CFNumber({})", value),
             Some(AppleObject::Certificate { data_ref }) => {
                 format!("SecCertificate(data=0x{:X})", data_ref)
@@ -313,6 +647,32 @@ impl AppleRuntime {
             Some(AppleObject::Error { code, description }) => {
                 format!("CFError(code={}, desc={})", code, description)
             }
+            Some(AppleObject::Url { path, host_ptr }) => {
+                let preview = lossy_data_preview(path, 64);
+                match host_ptr {
+                    Some(host_ptr) => format!("CFURL(path={}, host=0x{:X})", preview, host_ptr),
+                    None => format!("CFURL(path={})", preview),
+                }
+            }
+            Some(AppleObject::Bundle { path, host_ptr }) => {
+                let preview = lossy_data_preview(path, 64);
+                match host_ptr {
+                    Some(host_ptr) => format!("NSBundle(path={}, host=0x{:X})", preview, host_ptr),
+                    None => format!("NSBundle(path={})", preview),
+                }
+            }
+            Some(AppleObject::ObjcClass { name, host_ptr }) => match host_ptr {
+                Some(host_ptr) => format!("ObjCClass({}, host=0x{:X})", name, host_ptr),
+                None => format!("ObjCClass({})", name),
+            },
+            Some(AppleObject::ObjcSelector { name, host_ptr }) => match host_ptr {
+                Some(host_ptr) => format!("ObjCSelector({}, host=0x{:X})", name, host_ptr),
+                None => format!("ObjCSelector({})", name),
+            },
+            Some(AppleObject::ObjcObject { kind, host_ptr }) => match host_ptr {
+                Some(host_ptr) => format!("ObjCObject({}, host=0x{:X})", kind, host_ptr),
+                None => format!("ObjCObject({})", kind),
+            },
             Some(AppleObject::Opaque { kind, host_ptr }) => match host_ptr {
                 Some(host_ptr) => format!("Opaque({}, host=0x{:X})", kind, host_ptr),
                 None => format!("Opaque({})", kind),
@@ -326,5 +686,146 @@ impl AppleRuntime {
         self.next_handle = self.next_handle.saturating_add(0x100);
         self.objects.insert(handle, object);
         handle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_objects_are_not_exposed_as_host_pointers() {
+        let mut runtime = AppleRuntime::default();
+
+        let opaque_ref = runtime.alloc_opaque("SyntheticBundle");
+        let url_ref = runtime.alloc_url(b"/tmp/synthetic.app".to_vec(), None);
+        let bundle_ref = runtime.alloc_bundle(b"/tmp/Test.app".to_vec(), None);
+
+        assert_eq!(runtime.host_ptr(opaque_ref), None);
+        assert_eq!(runtime.host_ptr_or_raw_unknown(opaque_ref), None);
+        assert_eq!(runtime.host_ptr(url_ref), None);
+        assert_eq!(runtime.host_ptr_or_raw_unknown(url_ref), None);
+        assert_eq!(runtime.host_ptr(bundle_ref), None);
+        assert_eq!(runtime.host_ptr_or_raw_unknown(bundle_ref), None);
+        assert_eq!(
+            runtime.bundle_path(bundle_ref),
+            Some(b"/tmp/Test.app".to_vec())
+        );
+
+        let class_ref = runtime.register_host_objc_class("SyntheticClass", 0);
+        let selector_ref = runtime.register_host_objc_selector("init", 0);
+        assert_eq!(runtime.host_ptr(class_ref), None);
+        assert_eq!(runtime.host_ptr_or_raw_unknown(class_ref), None);
+        assert_eq!(runtime.host_ptr(selector_ref), None);
+        assert_eq!(runtime.host_ptr_or_raw_unknown(selector_ref), None);
+    }
+
+    #[test]
+    fn synthetic_objc_singletons_are_stable() {
+        let mut runtime = AppleRuntime::default();
+
+        runtime.set_process_name("guest-main");
+        let process_info = runtime.objc_singleton("NSProcessInfo");
+        let process_info_again = runtime.objc_singleton("NSProcessInfo");
+        let file_manager = runtime.objc_singleton("NSFileManager");
+
+        assert_eq!(runtime.process_name(), Some("guest-main"));
+        assert_eq!(process_info, process_info_again);
+        assert_ne!(process_info, file_manager);
+        assert_eq!(
+            runtime.objc_object_kind(process_info),
+            Some("NSProcessInfo".to_string())
+        );
+        assert_eq!(runtime.host_ptr(process_info), None);
+        assert_eq!(runtime.host_ptr_or_raw_unknown(process_info), None);
+    }
+
+    #[test]
+    fn host_backed_objects_keep_real_host_pointer_visible() {
+        let mut runtime = AppleRuntime::default();
+
+        let opaque_ref = runtime.register_host_opaque("HostBundle", 0x1234_5000);
+        let url_ref = runtime.alloc_url(b"/Applications/Test.app".to_vec(), Some(0x1234_6000));
+        let bundle_ref =
+            runtime.alloc_bundle(b"/Applications/Test.app".to_vec(), Some(0x1234_6500));
+
+        assert_eq!(opaque_ref, 0x1234_5000);
+        assert_eq!(runtime.host_ptr(opaque_ref), Some(0x1234_5000));
+        assert_eq!(
+            runtime.host_ptr_or_raw_unknown(opaque_ref),
+            Some(0x1234_5000)
+        );
+
+        assert_eq!(url_ref, 0x1234_6000);
+        assert_eq!(runtime.host_ptr(url_ref), Some(0x1234_6000));
+        assert_eq!(
+            runtime.url_path(url_ref),
+            Some(b"/Applications/Test.app".to_vec())
+        );
+        assert_eq!(
+            runtime.object_data(url_ref),
+            Some(b"/Applications/Test.app".to_vec())
+        );
+        assert_eq!(bundle_ref, 0x1234_6500);
+        assert_eq!(runtime.host_ptr(bundle_ref), Some(0x1234_6500));
+        assert_eq!(
+            runtime.objc_object_kind(bundle_ref),
+            Some("NSBundle".to_string())
+        );
+        assert_eq!(
+            runtime.bundle_path(bundle_ref),
+            Some(b"/Applications/Test.app".to_vec())
+        );
+
+        let class_ref = runtime.register_host_objc_class("NSString", 0x1234_7000);
+        let selector_ref =
+            runtime.register_host_objc_selector("stringWithUTF8String:", 0x1234_8000);
+        let object_ref = runtime.register_host_objc_object("NSString", 0x1234_9000);
+
+        assert_eq!(class_ref, 0x1234_7000);
+        assert_eq!(runtime.host_ptr(class_ref), Some(0x1234_7000));
+        assert_eq!(
+            runtime.objc_class_name(class_ref),
+            Some("NSString".to_string())
+        );
+
+        assert_eq!(selector_ref, 0x1234_8000);
+        assert_eq!(runtime.host_ptr(selector_ref), Some(0x1234_8000));
+        assert_eq!(
+            runtime.objc_selector_name(selector_ref),
+            Some("stringWithUTF8String:".to_string())
+        );
+
+        assert_eq!(object_ref, 0x1234_9000);
+        assert_eq!(runtime.host_ptr(object_ref), Some(0x1234_9000));
+    }
+
+    #[test]
+    fn host_backed_collections_keep_guest_values_and_host_pointer() {
+        let mut runtime = AppleRuntime::default();
+
+        let array_ref =
+            runtime.alloc_array_with_values_and_host(vec![0x10, 0x20], Some(0x1234_A000));
+        assert_eq!(array_ref, 0x1234_A000);
+        assert_eq!(runtime.host_ptr(array_ref), Some(0x1234_A000));
+        assert_eq!(runtime.array_len(array_ref), Some(2));
+        assert_eq!(runtime.array_get(array_ref, 1), Some(0x20));
+
+        let dict_ref = runtime.alloc_dictionary_with_host(vec![(0x30, 0x40)], Some(0x1234_B000));
+        assert_eq!(dict_ref, 0x1234_B000);
+        assert_eq!(runtime.host_ptr(dict_ref), Some(0x1234_B000));
+        assert_eq!(runtime.dictionary_len(dict_ref), Some(1));
+        assert_eq!(runtime.dictionary_get(dict_ref, 0x30), Some(0x40));
+    }
+
+    #[test]
+    fn unknown_nonzero_handles_can_be_treated_as_raw_host_pointers() {
+        let runtime = AppleRuntime::default();
+
+        assert_eq!(runtime.host_ptr_or_raw_unknown(0), None);
+        assert_eq!(
+            runtime.host_ptr_or_raw_unknown(0x7FFF_0000_1000),
+            Some(0x7FFF_0000_1000)
+        );
     }
 }

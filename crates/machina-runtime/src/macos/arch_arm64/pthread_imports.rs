@@ -23,6 +23,24 @@ use crate::macos::{
 use crate::UnicornEmulator;
 use machina_threading::GuestThreadExitAction;
 
+const PTHREAD_ONCE_DONE_SENTINEL: u64 = 0x4D41_4348_4F4E_4345;
+const PTHREAD_ONCE_TRAMPOLINE_ADDR: u64 = 0x6D16_0000_0000;
+const PTHREAD_ONCE_TRAMPOLINE_LR_SLOT: u64 = PTHREAD_ONCE_TRAMPOLINE_ADDR + 0x10;
+
+fn install_pthread_once_trampoline(
+    emulator: &mut UnicornEmulator,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&0xD2800000u32.to_le_bytes()); // mov x0, #0
+    bytes.extend_from_slice(&0x58000070u32.to_le_bytes()); // ldr x16, #0xC
+    bytes.extend_from_slice(&0xD61F0200u32.to_le_bytes()); // br x16
+    bytes.extend_from_slice(&0xD503201Fu32.to_le_bytes()); // nop / align literal
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    emulator.map_writable_code_memory(PTHREAD_ONCE_TRAMPOLINE_ADDR, 0x1000)?;
+    emulator.write_memory(PTHREAD_ONCE_TRAMPOLINE_ADDR, &bytes)?;
+    Ok(PTHREAD_ONCE_TRAMPOLINE_ADDR)
+}
+
 pub fn install_arm64_pthread_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
@@ -32,6 +50,12 @@ pub fn install_arm64_pthread_imports(
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let pthread_once_trampoline = if stub_map.contains_key("_pthread_once") {
+        Some(install_pthread_once_trampoline(emulator)?)
+    } else {
+        None
+    };
+
     if let Some(&addr) = stub_map.get("_pthread_get_stackaddr_np") {
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
@@ -366,6 +390,62 @@ pub fn install_arm64_pthread_imports(
                     "[IMPORT][arm64] _pthread_getspecific key={} -> 0x{:X}",
                     key, value
                 );
+            },
+        )?;
+    }
+
+    if let (Some(&addr), Some(trampoline_addr)) =
+        (stub_map.get("_pthread_once"), pthread_once_trampoline)
+    {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let once_ptr = emu.read_reg("x0").unwrap_or(0);
+                let init_routine = emu.read_reg("x1").unwrap_or(0);
+                let state = if once_ptr == 0 {
+                    PTHREAD_ONCE_DONE_SENTINEL
+                } else {
+                    emu.read_memory(once_ptr, 8)
+                        .ok()
+                        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+                        .map(u64::from_le_bytes)
+                        .unwrap_or(0)
+                };
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let should_call =
+                    once_ptr != 0 && init_routine != 0 && state != PTHREAD_ONCE_DONE_SENTINEL;
+                if once_ptr != 0 && state != PTHREAD_ONCE_DONE_SENTINEL {
+                    let _ = emu.write_memory(once_ptr, &PTHREAD_ONCE_DONE_SENTINEL.to_le_bytes());
+                }
+                let _ = emu.write_reg("x0", 0u64);
+                if should_call {
+                    let _ = emu.write_memory(PTHREAD_ONCE_TRAMPOLINE_LR_SLOT, &lr.to_le_bytes());
+                    let _ = emu.write_reg("lr", trampoline_addr);
+                    let _ = emu.write_reg("pc", init_routine);
+                } else if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_once(control=0x{:X}, init=0x{:X}) -> 0 call={}",
+                        once_ptr, init_routine, should_call
+                    ),
+                );
+                let event = arm64_thread_event(thread_id, "pthread-once", "pthread_once")
+                    .arg("Control", format!("0x{:X}", once_ptr))
+                    .arg("InitRoutine", format!("0x{:X}", init_routine))
+                    .arg("CalledInit", should_call.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
     }

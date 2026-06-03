@@ -598,6 +598,7 @@ fn is_compact_covered_import_hit(event: &TraceEvent) -> bool {
             | "_pthread_setspecific"
             | "_pthread_getspecific"
             | "_pthread_self"
+            | "_pthread_once"
             | "_pthread_create"
             | "_pthread_mutex_lock"
             | "_pthread_mutex_unlock"
@@ -611,12 +612,61 @@ fn is_compact_covered_import_hit(event: &TraceEvent) -> bool {
             | "_sysctlbyname"
             | "_notify_is_valid_token"
             | "_CFStringCreateWithBytes"
+            | "_CFStringCreateWithCString"
+            | "_CFStringGetCString"
+            | "_CFStringGetLength"
+            | "_CFStringGetCStringPtr"
+            | "_CFStringCreateCopy"
+            | "_CFStringCompare"
+            | "_CFURLCreateWithFileSystemPath"
+            | "_CFURLCopyFileSystemPath"
+            | "_CFBundleGetMainBundle"
+            | "_CFBundleCopyBundleURL"
             | "_CFDataCreate"
             | "_CFDataGetBytePtr"
             | "_CFArrayCreateMutable"
             | "_CFArrayAppendValue"
             | "_CFRelease"
             | "_CFRetain"
+            | "_IONotificationPortCreate"
+            | "_IONotificationPortDestroy"
+            | "_IOServiceMatching"
+            | "_IOServiceGetMatchingService"
+            | "_IOServiceGetMatchingServices"
+            | "_IOIteratorNext"
+            | "_IORegistryEntryCreateCFProperty"
+            | "_IOObjectRelease"
+            | "_objc_getClass"
+            | "_objc_lookUpClass"
+            | "_objc_getRequiredClass"
+            | "_objc_getMetaClass"
+            | "_object_getClass"
+            | "_class_getName"
+            | "_sel_registerName"
+            | "_sel_getUid"
+            | "_sel_getName"
+            | "_sel_isEqual"
+            | "_objc_msgSend"
+            | "_objc_alloc"
+            | "_objc_alloc_init"
+            | "_objc_opt_self"
+            | "_objc_opt_class"
+            | "_objc_opt_new"
+            | "_objc_autoreleasePoolPush"
+            | "_objc_autoreleasePoolPop"
+            | "_objc_retain"
+            | "_objc_release"
+            | "_objc_autorelease"
+            | "_objc_storeStrong"
+            | "_objc_storeWeak"
+            | "_objc_initWeak"
+            | "_objc_destroyWeak"
+            | "_objc_loadWeakRetained"
+            | "_objc_retainAutorelease"
+            | "_objc_retainAutoreleasedReturnValue"
+            | "_objc_retainAutoreleaseReturnValue"
+            | "_objc_autoreleaseReturnValue"
+            | "_objc_unsafeClaimAutoreleasedReturnValue"
             | "_SecPolicyCreateBasicX509"
             | "_SecTrustCreateWithCertificates"
             | "_SecTrustEvaluateWithError"
@@ -963,6 +1013,48 @@ mod tests {
 
         assert!(is_compact_suppressed(&import_hit));
         assert!(!is_compact_suppressed(&import_hit_unknown));
+    }
+
+    #[test]
+    fn compact_suppresses_covered_cf_bundle_and_iokit_import_hits() {
+        for symbol in [
+            "_CFURLCreateWithFileSystemPath",
+            "_CFBundleCopyBundleURL",
+            "_IOServiceMatching",
+            "_IORegistryEntryCreateCFProperty",
+            "_IOObjectRelease",
+        ] {
+            let import_hit = TraceEvent::new(TraceCategory::Import, symbol)
+                .plugin("imports")
+                .call("import-hit")
+                .arg("Address", "0x200004000");
+
+            assert!(
+                is_compact_suppressed(&import_hit),
+                "{symbol} should stay quiet in compact trace once covered"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_suppresses_covered_objc_import_hits() {
+        for symbol in [
+            "_objc_getClass",
+            "_sel_registerName",
+            "_objc_msgSend",
+            "_objc_autoreleasePoolPush",
+            "_objc_storeStrong",
+        ] {
+            let import_hit = TraceEvent::new(TraceCategory::Import, symbol)
+                .plugin("imports")
+                .call("import-hit")
+                .arg("Address", "0x200005000");
+
+            assert!(
+                is_compact_suppressed(&import_hit),
+                "{symbol} should stay quiet in compact trace once covered"
+            );
+        }
     }
 
     #[test]

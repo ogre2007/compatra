@@ -362,11 +362,13 @@ pub fn emulate_macos_arm64_binary_with_mode(
         );
     }
 
-    let shared_state = initialize_shared_state_with_mode(
+    let mut shared_state = initialize_shared_state_with_mode(
         default_guest_fs_base(std::path::Path::new(binary_path), "arm64_ios"),
         process_bootstrap.clone(),
         runtime_mode,
     );
+    shared_state.main_image_header = binary.header_address();
+    shared_state.main_image_slide = 0;
 
     let import_tracker = initialize_import_tracker();
     let (mut stub_map, stub_name_map, next_dynamic_stub_addr) = install_return_stubs(
