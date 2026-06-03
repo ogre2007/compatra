@@ -47,6 +47,13 @@ fn generated_fixture_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
+fn generated_fixture_dir_arg() -> String {
+    let dir = generated_fixture_dir();
+    fs::create_dir_all(&dir).expect("failed to create generated fixture directory");
+    fs::canonicalize(&dir).unwrap_or(dir).display().to_string()
+}
+
+#[cfg(target_os = "macos")]
 fn text_excerpt(value: &str, max_chars: usize) -> String {
     let mut out = value.chars().take(max_chars).collect::<String>();
     if value.chars().count() > max_chars {
@@ -1506,6 +1513,13 @@ int main(int argc, char **argv) {{
     char data_dir[4096] = {{0}};
     fixture_dir_from_optional_arg(argc, argv, argv0, data_dir, sizeof(data_dir));
     join_path(data_dir, "arm64_fd_compat.tmp", data_file, sizeof(data_file));
+    printf(
+        "compat fd paths argc=%d argv1=%s data_dir=%s data_file=%s\n",
+        argc,
+        (argc > 1 && argv && argv[1]) ? argv[1] : "<none>",
+        data_dir,
+        data_file
+    );
     failures += pipe_vec_roundtrip("static", pipe, writev, readv);
 
     int select_fds[2] = {{-1, -1}};
@@ -1925,6 +1939,13 @@ int main(int argc, char **argv) {{
     char data_file[4096] = {{0}};
     fixture_dir_from_optional_arg(argc, argv, argv0, data_dir, sizeof(data_dir));
     join_path(data_dir, "arm64_stdio_compat.tmp", data_file, sizeof(data_file));
+    printf(
+        "compat stdio paths argc=%d argv1=%s data_dir=%s data_file=%s\n",
+        argc,
+        (argc > 1 && argv && argv[1]) ? argv[1] : "<none>",
+        data_dir,
+        data_file
+    );
     failures += stdio_roundtrip("static", data_file, fopen, fdopen, fclose, fread, fwrite, fflush, fseek, ftell, fgets, fputs, feof, ferror, clearerr, fileno);
 
     void *self = dlopen(NULL, RTLD_NOW);
@@ -2129,6 +2150,13 @@ int main(int argc, char **argv) {{
     char base_dir[4096] = {{0}};
     fixture_dir_from_optional_arg(argc, argv, argv0, fixture_dir, sizeof(fixture_dir));
     join_path(fixture_dir, "path-host-root", base_dir, sizeof(base_dir));
+    printf(
+        "compat path base argc=%d argv1=%s fixture_dir=%s base=%s\n",
+        argc,
+        (argc > 1 && argv && argv[1]) ? argv[1] : "<none>",
+        fixture_dir,
+        base_dir
+    );
     cleanup_base(base_dir);
     int mkdir_base = mkdir(base_dir, 0700);
     int chdir_base = chdir(base_dir);
@@ -2898,6 +2926,15 @@ int main(int argc, char **argv) {{
     join_path(fixture_dir, "dir-host-root", base_dir, sizeof(base_dir));
     join_path(base_dir, "alpha.txt", alpha_file, sizeof(alpha_file));
     join_path(base_dir, "beta.txt", beta_file, sizeof(beta_file));
+    printf(
+        "compat dir paths argc=%d argv1=%s fixture_dir=%s base=%s alpha=%s beta=%s\n",
+        argc,
+        (argc > 1 && argv && argv[1]) ? argv[1] : "<none>",
+        fixture_dir,
+        base_dir,
+        alpha_file,
+        beta_file
+    );
     mkdir(base_dir, 0700);
     write_file(alpha_file, "a");
     write_file(beta_file, "b");
@@ -4300,6 +4337,7 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
     let (fixture, data_file) = compile_arm64_fd_fixture();
     let _ = fs::remove_file(&data_file);
     let machina = machina_binary();
+    let scratch_root = generated_fixture_dir_arg();
     let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
@@ -4308,10 +4346,7 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
-        .env(
-            "MACHINA_ARGV_APPEND",
-            generated_fixture_dir().display().to_string(),
-        )
+        .env("MACHINA_ARGV_APPEND", &scratch_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -4335,6 +4370,7 @@ fn compat_mode_proxies_fd_vector_and_positioned_imports() {
         fixture.display()
     );
     eprintln!("compat proof(fd): status={status}");
+    eprintln!("compat proof(fd): scratch root={scratch_root}");
     eprintln!("compat proof(fd): data file={}", data_file.display());
     eprintln!("compat proof(fd): guest stdout={guest_stdout:?}");
     if !stderr.trim().is_empty() {
@@ -4429,6 +4465,7 @@ fn compat_mode_proxies_stdio_file_imports() {
     let (fixture, data_file) = compile_arm64_stdio_fixture();
     let _ = fs::remove_file(&data_file);
     let machina = machina_binary();
+    let scratch_root = generated_fixture_dir_arg();
     let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
@@ -4437,10 +4474,7 @@ fn compat_mode_proxies_stdio_file_imports() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
-        .env(
-            "MACHINA_ARGV_APPEND",
-            generated_fixture_dir().display().to_string(),
-        )
+        .env("MACHINA_ARGV_APPEND", &scratch_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -4464,6 +4498,7 @@ fn compat_mode_proxies_stdio_file_imports() {
         fixture.display()
     );
     eprintln!("compat proof(stdio): status={status}");
+    eprintln!("compat proof(stdio): scratch root={scratch_root}");
     eprintln!("compat proof(stdio): data file={}", data_file.display());
     eprintln!("compat proof(stdio): guest stdout={guest_stdout:?}");
     if !stderr.trim().is_empty() {
@@ -4525,6 +4560,7 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
     let (fixture, base_dir) = compile_arm64_path_fixture();
     let _ = fs::remove_dir_all(&base_dir);
     let machina = machina_binary();
+    let scratch_root = generated_fixture_dir_arg();
     let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
@@ -4533,10 +4569,7 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
-        .env(
-            "MACHINA_ARGV_APPEND",
-            generated_fixture_dir().display().to_string(),
-        )
+        .env("MACHINA_ARGV_APPEND", &scratch_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -4560,6 +4593,7 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         fixture.display()
     );
     eprintln!("compat proof(path): status={status}");
+    eprintln!("compat proof(path): scratch root={scratch_root}");
     eprintln!("compat proof(path): base dir={}", base_dir.display());
     eprintln!("compat proof(path): guest stdout={guest_stdout:?}");
     if !stderr.trim().is_empty() {
@@ -4832,6 +4866,7 @@ fn compat_mode_proxies_directory_iteration_and_entropy() {
     let (fixture, base_dir) = compile_arm64_directory_entropy_fixture();
     let _ = fs::remove_dir_all(&base_dir);
     let machina = machina_binary();
+    let scratch_root = generated_fixture_dir_arg();
     let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
@@ -4840,10 +4875,7 @@ fn compat_mode_proxies_directory_iteration_and_entropy() {
         .env("MACHINA_TRACE_FORMAT", "jsonl")
         .env("MACHINA_PROFILE", "short")
         .env("MACHINA_DEBUG_STDOUT", "1")
-        .env(
-            "MACHINA_ARGV_APPEND",
-            generated_fixture_dir().display().to_string(),
-        )
+        .env("MACHINA_ARGV_APPEND", &scratch_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -4867,6 +4899,7 @@ fn compat_mode_proxies_directory_iteration_and_entropy() {
         fixture.display()
     );
     eprintln!("compat proof(directory/entropy): status={status}");
+    eprintln!("compat proof(directory/entropy): scratch root={scratch_root}");
     eprintln!(
         "compat proof(directory/entropy): base dir={}",
         base_dir.display()
