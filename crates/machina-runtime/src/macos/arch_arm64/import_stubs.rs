@@ -85,7 +85,17 @@ fn arm64_proxy_compat_host_import(
     };
 }
 
-fn arm64_import_has_runtime_hook(symbol: &str) -> bool {
+fn arm64_import_has_analysis_runtime_hook(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "_clearerr" | "_feof" | "_ferror" | "_fgets" | "_fread"
+    )
+}
+
+fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> bool {
+    if arm64_import_has_analysis_runtime_hook(symbol) {
+        return runtime_mode.is_analysis();
+    }
     if is_apple_import_symbol(symbol) {
         return true;
     }
@@ -108,7 +118,6 @@ fn arm64_import_has_runtime_hook(symbol: &str) -> bool {
             | "___cxa_atexit"
             | "_calloc"
             | "_cmalloc"
-            | "_clearerr"
             | "_close"
             | "_closedir"
             | "_dispatch_release"
@@ -124,12 +133,8 @@ fn arm64_import_has_runtime_hook(symbol: &str) -> bool {
             | "_exit"
             | "_fcntl"
             | "_fdopendir"
-            | "_feof"
-            | "_ferror"
-            | "_fgets"
             | "_fork"
             | "_free"
-            | "_fread"
             | "_fstat"
             | "_getcwd"
             | "_getenv"
@@ -234,19 +239,39 @@ mod tests {
 
     #[test]
     fn static_stat_imports_are_handled_by_exact_hooks() {
-        assert!(arm64_import_has_runtime_hook("_stat"));
-        assert!(arm64_import_has_runtime_hook("_lstat"));
-        assert!(arm64_import_has_runtime_hook("_fstat"));
+        assert!(arm64_import_has_runtime_hook("_stat", RuntimeMode::Compat));
+        assert!(arm64_import_has_runtime_hook("_lstat", RuntimeMode::Compat));
+        assert!(arm64_import_has_runtime_hook("_fstat", RuntimeMode::Compat));
     }
 
     #[test]
     fn runtime_hook_classifier_covers_non_generic_import_groups() {
-        assert!(arm64_import_has_runtime_hook("_dlsym"));
-        assert!(arm64_import_has_runtime_hook("_CFStringCreateWithBytes"));
-        assert!(arm64_import_has_runtime_hook("CFStringCreateWithCString"));
-        assert!(arm64_import_has_runtime_hook("_pthread_create"));
-        assert!(arm64_import_has_runtime_hook("__Znwm"));
-        assert!(!arm64_import_has_runtime_hook("_future_unhandled_import"));
+        assert!(arm64_import_has_runtime_hook("_dlsym", RuntimeMode::Compat));
+        assert!(arm64_import_has_runtime_hook(
+            "_CFStringCreateWithBytes",
+            RuntimeMode::Compat
+        ));
+        assert!(arm64_import_has_runtime_hook(
+            "CFStringCreateWithCString",
+            RuntimeMode::Compat
+        ));
+        assert!(arm64_import_has_runtime_hook(
+            "_pthread_create",
+            RuntimeMode::Compat
+        ));
+        assert!(arm64_import_has_runtime_hook("__Znwm", RuntimeMode::Compat));
+        assert!(!arm64_import_has_runtime_hook(
+            "_future_unhandled_import",
+            RuntimeMode::Compat
+        ));
+    }
+
+    #[test]
+    fn analysis_stdio_hooks_do_not_block_compat_host_proxy() {
+        for symbol in ["_fgets", "_fread", "_feof", "_ferror", "_clearerr"] {
+            assert!(arm64_import_has_runtime_hook(symbol, RuntimeMode::Analysis));
+            assert!(!arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat));
+        }
     }
 }
 
@@ -333,7 +358,7 @@ pub fn install_arm64_return_stubs(
                     .arg("lr", format!("0x{:X}", emu.read_reg("lr").unwrap())),
                 );
                 if address == bucket {
-                    let has_runtime_hook = arm64_import_has_runtime_hook(&name);
+                    let has_runtime_hook = arm64_import_has_runtime_hook(&name, runtime_mode);
                     if let Some(compat) = compat_for_hook {
                         let proxied_by_generic_import = compat.should_proxy_import(&name);
                         if proxied_by_generic_import && !has_runtime_hook {
