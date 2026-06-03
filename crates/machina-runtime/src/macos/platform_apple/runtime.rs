@@ -17,6 +17,7 @@ pub enum AppleObject {
     Trust { certificates: u64, policies: u64 },
     Date { absolute_time: f64 },
     Error { code: i64, description: String },
+    Opaque { kind: String, host_ptr: Option<u64> },
 }
 
 #[derive(Debug)]
@@ -182,6 +183,37 @@ impl AppleRuntime {
         })
     }
 
+    pub fn alloc_opaque(&mut self, kind: impl Into<String>) -> u64 {
+        self.alloc(AppleObject::Opaque {
+            kind: kind.into(),
+            host_ptr: None,
+        })
+    }
+
+    pub fn register_host_opaque(&mut self, kind: impl Into<String>, host_ptr: u64) -> u64 {
+        if host_ptr == 0 {
+            return self.alloc_opaque(kind);
+        }
+        self.objects.insert(
+            host_ptr,
+            AppleObject::Opaque {
+                kind: kind.into(),
+                host_ptr: Some(host_ptr),
+            },
+        );
+        host_ptr
+    }
+
+    pub fn opaque_host_ptr(&self, handle: u64) -> Option<u64> {
+        match self.objects.get(&handle) {
+            Some(AppleObject::Opaque {
+                host_ptr: Some(host_ptr),
+                ..
+            }) => Some(*host_ptr),
+            _ => None,
+        }
+    }
+
     pub fn type_id(&self, handle: u64) -> u64 {
         match self.objects.get(&handle) {
             Some(AppleObject::String { .. }) => Self::TYPE_ID_STRING,
@@ -194,6 +226,7 @@ impl AppleRuntime {
             Some(AppleObject::Trust { .. }) => Self::TYPE_ID_TRUST,
             Some(AppleObject::Date { .. }) => Self::TYPE_ID_DATE,
             Some(AppleObject::Error { .. }) => Self::TYPE_ID_ERROR,
+            Some(AppleObject::Opaque { .. }) => 0,
             None => 0,
         }
     }
@@ -280,6 +313,10 @@ impl AppleRuntime {
             Some(AppleObject::Error { code, description }) => {
                 format!("CFError(code={}, desc={})", code, description)
             }
+            Some(AppleObject::Opaque { kind, host_ptr }) => match host_ptr {
+                Some(host_ptr) => format!("Opaque({}, host=0x{:X})", kind, host_ptr),
+                None => format!("Opaque({})", kind),
+            },
             None => format!("0x{:X}", handle),
         }
     }

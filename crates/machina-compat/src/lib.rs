@@ -803,6 +803,8 @@ enum HostImportKind {
     Seekdir,
     #[cfg(target_os = "macos")]
     GetEntropy,
+    #[cfg(target_os = "macos")]
+    PthreadThreadingNp,
 }
 
 impl CompatibilityServices {
@@ -1229,6 +1231,7 @@ impl CompatibilityServices {
                 HostImportKind::GetEntropy => {
                     Some(self.getentropy(memory, args[0], args[1] as usize)?.into())
                 }
+                HostImportKind::PthreadThreadingNp => Some(proxy_host_pthread_threading_np()),
             };
             let mut log_arg_pairs = args
                 .iter()
@@ -4017,6 +4020,34 @@ impl From<HostIoResult> for HostCallResult {
     }
 }
 
+#[cfg(target_os = "macos")]
+type PthreadThreadingNpFn = unsafe extern "C" fn() -> libc::c_int;
+
+#[cfg(target_os = "macos")]
+fn host_pthread_threading_np_fn() -> Option<PthreadThreadingNpFn> {
+    static SYMBOL: OnceLock<Option<PthreadThreadingNpFn>> = OnceLock::new();
+    *SYMBOL.get_or_init(|| {
+        let symbol = CString::new("pthread_threading_np").ok()?;
+        let ptr = unsafe { libc::dlsym((-2isize) as *mut libc::c_void, symbol.as_ptr()) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { mem::transmute::<*mut libc::c_void, PthreadThreadingNpFn>(ptr) })
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_pthread_threading_np() -> HostCallResult {
+    let return_value = host_pthread_threading_np_fn()
+        .map(|func| unsafe { func() as i64 as u64 })
+        .unwrap_or(1);
+    HostCallResult {
+        return_value,
+        errno: None,
+    }
+}
+
 fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
     #[cfg(target_os = "macos")]
     {
@@ -4166,6 +4197,7 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "telldir" => Some(HostImportKind::Telldir),
             "seekdir" => Some(HostImportKind::Seekdir),
             "getentropy" => Some(HostImportKind::GetEntropy),
+            "pthread_threading_np" => Some(HostImportKind::PthreadThreadingNp),
             _ => None,
         }
     }
@@ -9094,6 +9126,7 @@ mod tests {
             assert!(compat.should_proxy_import("_telldir"));
             assert!(compat.should_proxy_import("_seekdir"));
             assert!(compat.should_proxy_import("_getentropy"));
+            assert!(compat.should_proxy_import("_pthread_threading_np"));
         }
         #[cfg(not(target_os = "macos"))]
         assert!(!compat.should_proxy_import("_puts"));

@@ -63,6 +63,43 @@ jobs:
         fi
     - name: Build and test compat utility with proof output
       run: cargo test -p machina-compat-cli --release --no-default-features --test compat_mode_macos --verbose -- --include-ignored --nocapture
+    - name: Package macOS arm64 compatibility test fixtures
+      if: always()
+      run: |
+        mkdir -p dist
+        if [ ! -d target/machina-compat-fixtures ]; then
+          echo "target/machina-compat-fixtures was not generated"
+          exit 0
+        fi
+        {
+          echo "Machina macOS arm64 compatibility test fixtures"
+          echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "runner=$(uname -s) $(uname -m)"
+          echo
+          find target/machina-compat-fixtures -type f -print | sort | while read -r file_path; do
+            echo "## ${file_path#target/machina-compat-fixtures/}"
+            file "$file_path"
+            if lipo -info "$file_path" >/dev/null 2>&1; then
+              lipo -info "$file_path"
+            fi
+            shasum -a 256 "$file_path"
+            echo
+          done
+        } > dist/machina-compat-test-fixtures-macos-arm64.manifest.txt
+        tar -czf dist/machina-compat-test-fixtures-macos-arm64.tar.gz -C target machina-compat-fixtures
+        shasum -a 256 dist/machina-compat-test-fixtures-macos-arm64.tar.gz > dist/machina-compat-test-fixtures-macos-arm64.tar.gz.sha256
+        ls -lh dist
+    - name: Upload macOS arm64 compatibility test fixtures
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: machina-compat-test-fixtures-macos-arm64
+        path: |
+          dist/machina-compat-test-fixtures-macos-arm64.tar.gz
+          dist/machina-compat-test-fixtures-macos-arm64.tar.gz.sha256
+          dist/machina-compat-test-fixtures-macos-arm64.manifest.txt
+        if-no-files-found: warn
+        retention-days: 14
     - name: Package Intel macOS compatibility utility
       run: |
         test -x target/release/machina-compat

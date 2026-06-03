@@ -27,6 +27,7 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "CFDataGetBytePtr"
             | "CFRelease"
             | "CFRetain"
+            | "IONotificationPortCreate"
             | "SecRandomCopyBytes"
             | "SecCopyErrorMessageString"
     )
@@ -142,6 +143,22 @@ fn host_sec_error_message(status: i32) -> Option<Vec<u8>> {
 #[cfg(not(target_os = "macos"))]
 fn host_sec_error_message(status: i32) -> Option<Vec<u8>> {
     Some(format!("OSStatus {}", status).into_bytes())
+}
+
+#[cfg(target_os = "macos")]
+fn host_io_notification_port_create(master_port: u64) -> Option<u64> {
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IONotificationPortCreate(master_port: std::ffi::c_uint) -> *mut std::ffi::c_void;
+    }
+
+    let port = unsafe { IONotificationPortCreate(master_port as std::ffi::c_uint) };
+    (!port.is_null()).then_some(port as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_io_notification_port_create(_master_port: u64) -> Option<u64> {
+    None
 }
 
 fn install_returning_hook<F>(
@@ -353,6 +370,33 @@ fn dispatch_apple_import(
             );
             Some(string_ref)
         }
+        "IONotificationPortCreate" => {
+            let master_port = emu.read_reg("x0").unwrap_or(0);
+            let host_ptr = host_io_notification_port_create(master_port);
+            let port_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                match host_ptr {
+                    Some(host_ptr) => runtime.register_host_opaque("IONotificationPort", host_ptr),
+                    None => runtime.alloc_opaque("IONotificationPort"),
+                }
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_IONotificationPortCreate(master=0x{:X}) -> 0x{:X}",
+                    master_port, port_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "iokit", "IONotificationPortCreate")
+                    .arg("MasterPort", format!("0x{:X}", master_port))
+                    .arg("Result", format!("0x{:X}", port_ref))
+                    .arg("HostProxy", host_ptr.is_some().to_string())
+                    .arg("Synthetic", host_ptr.is_none().to_string()),
+            );
+            Some(port_ref)
+        }
         "CFRelease" => {
             let object_ref = emu.read_reg("x0").unwrap_or(0);
             if let Ok(mut runtime) = apple_runtime.lock() {
@@ -488,6 +532,7 @@ pub fn install_apple_imports(
         "_CFStringCreateWithCString",
         "_CFStringGetCString",
         "_CFStringGetLength",
+        "_IONotificationPortCreate",
         "_SecRandomCopyBytes",
         "_SecCopyErrorMessageString",
     ] {
@@ -1476,4 +1521,15 @@ pub fn install_apple_imports(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iokit_notification_port_import_is_apple_dispatched() {
+        assert!(is_apple_import_symbol("_IONotificationPortCreate"));
+        assert!(is_apple_import_symbol("IONotificationPortCreate"));
+    }
 }
