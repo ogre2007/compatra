@@ -544,6 +544,8 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     SnPrintf,
     #[cfg(target_os = "macos")]
+    SnPrintfChk,
+    #[cfg(target_os = "macos")]
     Putchar,
     #[cfg(target_os = "macos")]
     Open,
@@ -989,6 +991,10 @@ impl CompatibilityServices {
                 HostImportKind::SnPrintf => {
                     let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 64));
                     proxy_host_snprintf(memory, args, stack_args.as_deref())
+                }
+                HostImportKind::SnPrintfChk => {
+                    let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 64));
+                    proxy_host_snprintf_chk(memory, args, stack_args.as_deref())
                 }
                 HostImportKind::Putchar => proxy_host_putchar(args[0]),
                 HostImportKind::Open => {
@@ -4415,6 +4421,7 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "puts" => Some(HostImportKind::Puts),
             "printf" => Some(HostImportKind::Printf),
             "snprintf" => Some(HostImportKind::SnPrintf),
+            "__snprintf_chk" => Some(HostImportKind::SnPrintfChk),
             "putchar" => Some(HostImportKind::Putchar),
             "open" | "open$NOCANCEL" => Some(HostImportKind::Open),
             "openat" => Some(HostImportKind::OpenAt),
@@ -5097,11 +5104,31 @@ fn proxy_host_snprintf<M: GuestMemory + ?Sized>(
     args: &[u64; 8],
     stack_args: Option<&[u64]>,
 ) -> Option<HostCallResult> {
-    let dst_ptr = args[0];
-    let size = usize::try_from(args[1]).unwrap_or(usize::MAX);
     let format = read_cstring(memory, args[2], 4096).ok()?;
-    let rendered = render_arm64_printf(memory, &format, &args[3..], stack_args);
+    proxy_host_rendered_snprintf(memory, args[0], args[1], &format, &args[3..], stack_args)
+}
 
+#[cfg(target_os = "macos")]
+fn proxy_host_snprintf_chk<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    args: &[u64; 8],
+    stack_args: Option<&[u64]>,
+) -> Option<HostCallResult> {
+    let format = read_cstring(memory, args[4], 4096).ok()?;
+    proxy_host_rendered_snprintf(memory, args[0], args[1], &format, &args[5..], stack_args)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_rendered_snprintf<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    dst_ptr: u64,
+    size: u64,
+    format: &str,
+    register_args: &[u64],
+    stack_args: Option<&[u64]>,
+) -> Option<HostCallResult> {
+    let size = usize::try_from(size).unwrap_or(usize::MAX);
+    let rendered = render_arm64_printf(memory, format, register_args, stack_args);
     if size > 0 {
         if dst_ptr == 0 {
             return Some(host_call_error(libc::EFAULT as u32));
@@ -9413,6 +9440,7 @@ mod tests {
             assert!(compat.should_proxy_import("_puts"));
             assert!(compat.should_proxy_import("_printf"));
             assert!(compat.should_proxy_import("_snprintf"));
+            assert!(compat.should_proxy_import("___snprintf_chk"));
             assert!(compat.should_proxy_import("_putchar"));
             assert!(compat.should_proxy_import("_open"));
             assert!(compat.should_proxy_import("_openat"));
@@ -9822,6 +9850,64 @@ mod tests {
             .expect("_snprintf null destination should return an errno result");
         assert_eq!(null_dst.return_value, u64::MAX);
         assert_eq!(null_dst.errno, Some(libc::EFAULT as u32));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snprintf_chk_proxy_uses_darwin_stack_varargs() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"%s/%s\0");
+        memory.write_guest(0x2000, b"root\0");
+        memory.write_guest(0x3000, b"leaf\0");
+        memory.write_guest(0x5000, &0x2000u64.to_le_bytes());
+        memory.write_guest(0x5008, &0x3000u64.to_le_bytes());
+
+        let result = CompatibilityServices
+            .proxy_arm64_import_with_stack(
+                &mut memory,
+                "___snprintf_chk",
+                &[0x4000, 32, 0, 32, 0x1000, 0, 0, 0],
+                Some(0x5000),
+            )
+            .expect("___snprintf_chk should be proxied");
+
+        assert_eq!(result.return_value, 9);
+        assert_eq!(result.errno, None);
+        assert_eq!(
+            memory.read_memory(0x4000, 10).unwrap(),
+            b"root/leaf\0".to_vec()
+        );
     }
 
     fn darwin_msghdr_fixture_bytes() -> Vec<u8> {
