@@ -47,11 +47,6 @@ fn generated_fixture_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn c_string_literal(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-#[cfg(target_os = "macos")]
 fn text_excerpt(value: &str, max_chars: usize) -> String {
     let mut out = value.chars().take(max_chars).collect::<String>();
     if value.chars().count() > max_chars {
@@ -354,6 +349,7 @@ fn compile_arm64_memory_string_fixture() -> PathBuf {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 typedef void *(*malloc_fn)(size_t);
 typedef void *(*calloc_fn)(size_t, size_t);
@@ -363,6 +359,7 @@ typedef int (*posix_memalign_fn)(void **, size_t, size_t);
 typedef void *(*memcpy_fn)(void *, const void *, size_t);
 typedef void *(*memmove_fn)(void *, const void *, size_t);
 typedef void *(*memset_fn)(void *, int, size_t);
+typedef void (*bzero_fn)(void *, size_t);
 typedef int (*memcmp_fn)(const void *, const void *, size_t);
 typedef size_t (*strlen_fn)(const char *);
 typedef int (*strcmp_fn)(const char *, const char *);
@@ -401,6 +398,7 @@ static int exercise_memstr(
     memcpy_fn memcpy_impl,
     memmove_fn memmove_impl,
     memset_fn memset_impl,
+    bzero_fn bzero_impl,
     memcmp_fn memcmp_impl,
     strlen_fn strlen_impl,
     strcmp_fn strcmp_impl,
@@ -446,6 +444,10 @@ static int exercise_memstr(
     if (aligned) {
         memset_impl(aligned, 'A', 24);
     }
+    unsigned char wiped[8];
+    memset_impl(wiped, 0xCC, sizeof(wiped));
+    bzero_impl(wiped + 1, 6);
+    int bzero_ok = wiped[0] == 0xCC && all_zero(wiped + 1, 6) && wiped[7] == 0xCC;
 
     int memcmp_eq = memcmp_impl(dst, "alpha", 5);
     unsigned long len = (unsigned long)strlen_impl(dst);
@@ -465,6 +467,7 @@ static int exercise_memstr(
         && pa == 0
         && aligned
         && (((uintptr_t)aligned) % 32) == 0
+        && bzero_ok
         && memcmp_eq == 0
         && len == 5
         && cmp_eq == 0
@@ -474,7 +477,7 @@ static int exercise_memstr(
         && last_off == 9;
 
     printf(
-        "compat memstr %s dst=%s overlap=%s copy=%s dup=%s heap=%s zero_ok=%d pa=%d aligned_mod=%lu memcmp=%d len=%lu cmp=%d cmp_lt=%d ncmp=%d hit=%ld last=%ld ok=%d\n",
+        "compat memstr %s dst=%s overlap=%s copy=%s dup=%s heap=%s zero_ok=%d bzero_ok=%d pa=%d aligned_mod=%lu memcmp=%d len=%lu cmp=%d cmp_lt=%d ncmp=%d hit=%ld last=%ld ok=%d\n",
         label,
         dst,
         overlap,
@@ -482,6 +485,7 @@ static int exercise_memstr(
         dup ? dup : "<null>",
         heap ? heap : "<null>",
         zero_ok,
+        bzero_ok,
         pa,
         aligned ? (unsigned long)(((uintptr_t)aligned) % 32) : 999UL,
         memcmp_eq,
@@ -521,6 +525,7 @@ int main(void) {
         memcpy,
         memmove,
         memset,
+        bzero,
         memcmp,
         strlen,
         strcmp,
@@ -542,6 +547,7 @@ int main(void) {
     memcpy_fn dyn_memcpy = (memcpy_fn)dlsym(self, "memcpy");
     memmove_fn dyn_memmove = (memmove_fn)dlsym(self, "memmove");
     memset_fn dyn_memset = (memset_fn)dlsym(self, "memset");
+    bzero_fn dyn_bzero = (bzero_fn)dlsym(self, "bzero");
     memcmp_fn dyn_memcmp = (memcmp_fn)dlsym(self, "memcmp");
     strlen_fn dyn_strlen = (strlen_fn)dlsym(self, "strlen");
     strcmp_fn dyn_strcmp = (strcmp_fn)dlsym(self, "strcmp");
@@ -553,17 +559,18 @@ int main(void) {
     strrchr_fn dyn_strrchr = (strrchr_fn)dlsym(self, "strrchr");
     strdup_fn dyn_strdup = (strdup_fn)dlsym(self, "strdup");
     printf(
-        "compat memstr dlsym ptrs malloc=%p free=%p memcpy=%p strcmp=%p strcpy=%p strchr=%p strdup=%p posix_memalign=%p\n",
+        "compat memstr dlsym ptrs malloc=%p free=%p memcpy=%p bzero=%p strcmp=%p strcpy=%p strchr=%p strdup=%p posix_memalign=%p\n",
         (void *)dyn_malloc,
         (void *)dyn_free,
         (void *)dyn_memcpy,
+        (void *)dyn_bzero,
         (void *)dyn_strcmp,
         (void *)dyn_strcpy,
         (void *)dyn_strchr,
         (void *)dyn_strdup,
         (void *)dyn_posix_memalign
     );
-    if (!dyn_malloc || !dyn_calloc || !dyn_realloc || !dyn_free || !dyn_posix_memalign || !dyn_memcpy || !dyn_memmove || !dyn_memset || !dyn_memcmp || !dyn_strlen || !dyn_strcmp || !dyn_strncmp || !dyn_strcpy || !dyn_strncpy || !dyn_strcat || !dyn_strchr || !dyn_strrchr || !dyn_strdup) {
+    if (!dyn_malloc || !dyn_calloc || !dyn_realloc || !dyn_free || !dyn_posix_memalign || !dyn_memcpy || !dyn_memmove || !dyn_memset || !dyn_bzero || !dyn_memcmp || !dyn_strlen || !dyn_strcmp || !dyn_strncmp || !dyn_strcpy || !dyn_strncpy || !dyn_strcat || !dyn_strchr || !dyn_strrchr || !dyn_strdup) {
         return 2;
     }
     failures += exercise_memstr(
@@ -576,6 +583,7 @@ int main(void) {
         dyn_memcpy,
         dyn_memmove,
         dyn_memset,
+        dyn_bzero,
         dyn_memcmp,
         dyn_strlen,
         dyn_strcmp,
@@ -1336,25 +1344,18 @@ fn compile_arm64_fd_fixture() -> (PathBuf, PathBuf) {
     let source = out_dir.join("arm64_fd_compat.c");
     let binary = out_dir.join("arm64_fd_compat");
     let data_file = out_dir.join("arm64_fd_compat.tmp");
-    let data_dir_literal = c_string_literal(&out_dir.display().to_string());
-    let data_file_literal = c_string_literal(&data_file.display().to_string());
-    let data_name_literal = c_string_literal(
-        data_file
-            .file_name()
-            .expect("generated data file has a file name")
-            .to_string_lossy()
-            .as_ref(),
-    );
     fs::write(
         &source,
         format!(
             r#"#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -1368,9 +1369,6 @@ fn compile_arm64_fd_fixture() -> (PathBuf, PathBuf) {
 #define SYS_OPENAT 0x20001CF
 #define SYS_FACCESSAT 0x20001D2
 #define SYS_FSTATAT 0x20001D5
-#define DATA_DIR "{data_dir_literal}"
-#define DATA_FILE "{data_file_literal}"
-#define DATA_NAME "{data_name_literal}"
 #define SYS_READ_NOCANCEL 0x200018C
 #define SYS_WRITE_NOCANCEL 0x200018D
 #define SYS_OPEN_NOCANCEL 0x200018E
@@ -1405,6 +1403,43 @@ static int text_is(const char *text, const char *expected, unsigned long len) {{
         }}
     }}
     return 1;
+}}
+
+static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len) {{
+    if (out_len == 0) {{
+        return;
+    }}
+    char executable[4096] = {{0}};
+    uint32_t executable_size = sizeof(executable);
+    const char *path = argv0;
+    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
+        path = executable;
+    }}
+    const char *slash = path ? strrchr(path, '/') : 0;
+    if (!slash) {{
+        snprintf(out, out_len, ".");
+        return;
+    }}
+    size_t len = (size_t)(slash - path);
+    if (len == 0) {{
+        snprintf(out, out_len, "/");
+        return;
+    }}
+    if (len >= out_len) {{
+        len = out_len - 1;
+    }}
+    memcpy(out, path, len);
+    out[len] = 0;
+}}
+
+static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
+    char dir[4096] = {{0}};
+    fixture_dir_from_argv0(argv0, dir, sizeof(dir));
+    if (strcmp(dir, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", dir, name);
+    }}
 }}
 
 static long machina_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {{
@@ -1472,8 +1507,13 @@ static int pipe_vec_roundtrip(const char *label, pipe_fn pipe_impl, writev_fn wr
     return 0;
 }}
 
-int main(void) {{
+int main(int argc, char **argv) {{
     int failures = 0;
+    const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
+    char data_file[4096] = {{0}};
+    char data_dir[4096] = {{0}};
+    fixture_path_from_argv0(argv0, "arm64_fd_compat.tmp", data_file, sizeof(data_file));
+    fixture_dir_from_argv0(argv0, data_dir, sizeof(data_dir));
     failures += pipe_vec_roundtrip("static", pipe, writev, readv);
 
     int select_fds[2] = {{-1, -1}};
@@ -1516,7 +1556,7 @@ int main(void) {{
     close(dup_fds[0]);
     close(dup_fds[1]);
 
-    int file_fd = open(DATA_FILE, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    int file_fd = open(data_file, O_CREAT | O_TRUNC | O_RDWR, 0600);
     long pwrite_count = (long)pwrite(file_fd, "pos-ok", 6, 2);
     long seek_pos = (long)lseek(file_fd, 2, SEEK_SET);
     char positioned[16] = {{0}};
@@ -1542,7 +1582,7 @@ int main(void) {{
     int fsync_ret = file_fd >= 0 ? fsync(file_fd) : -1;
     struct statfs path_fs = {{0}};
     struct statfs fd_fs = {{0}};
-    int statfs_ret = statfs(DATA_FILE, &path_fs);
+    int statfs_ret = statfs(data_file, &path_fs);
     int fstatfs_ret = file_fd >= 0 ? fstatfs(file_fd, &fd_fs) : -1;
     printf("compat fd metadata fsync=%d ioctl=%d avail=%d statfs=%d bsize=%u fstatfs=%d fbsize=%u errno=%d\n",
         fsync_ret,
@@ -1557,7 +1597,7 @@ int main(void) {{
         failures += 42;
     }}
 
-    long raw_fd = machina_syscall6(SYS_OPEN_NOCANCEL, (long)DATA_FILE, O_RDWR, 0600, 0, 0, 0);
+    long raw_fd = machina_syscall6(SYS_OPEN_NOCANCEL, (long)data_file, O_RDWR, 0600, 0, 0, 0);
     const char raw_text[] = "nc-ok";
     long raw_write = raw_fd >= 0 ? machina_syscall6(SYS_WRITE_NOCANCEL, raw_fd, (long)raw_text, 5, 0, 0, 0) : -1;
     long raw_seek = raw_fd >= 0 ? (long)lseek((int)raw_fd, 0, SEEK_SET) : -1;
@@ -1587,7 +1627,7 @@ int main(void) {{
     long raw_fsync = file_fd >= 0 ? machina_syscall6(SYS_FSYNC, file_fd, 0, 0, 0, 0, 0) : -1;
     struct statfs raw_path_fs = {{0}};
     struct statfs raw_fd_fs = {{0}};
-    long raw_statfs = machina_syscall6(SYS_STATFS64, (long)DATA_FILE, (long)&raw_path_fs, 0, 0, 0, 0);
+    long raw_statfs = machina_syscall6(SYS_STATFS64, (long)data_file, (long)&raw_path_fs, 0, 0, 0, 0);
     long raw_fstatfs = file_fd >= 0 ? machina_syscall6(SYS_FSTATFS64, file_fd, (long)&raw_fd_fs, 0, 0, 0, 0) : -1;
     printf("compat fd raw syscalls pipe=%ld fds=%d,%d ioctl=%ld avail=%d text=%s fsync=%ld statfs=%ld bsize=%u fstatfs=%ld fbsize=%u errno=%d\n",
         raw_pipe,
@@ -1606,11 +1646,11 @@ int main(void) {{
         failures += 47;
     }}
 
-    int dir_fd = open(DATA_DIR, O_RDONLY);
-    long raw_openat = dir_fd >= 0 ? machina_syscall6(SYS_OPENAT, dir_fd, (long)DATA_NAME, O_RDONLY, 0, 0, 0) : -1;
-    long raw_faccessat = dir_fd >= 0 ? machina_syscall6(SYS_FACCESSAT, dir_fd, (long)DATA_NAME, R_OK, 0, 0, 0) : -1;
+    int dir_fd = open(data_dir, O_RDONLY);
+    long raw_openat = dir_fd >= 0 ? machina_syscall6(SYS_OPENAT, dir_fd, (long)"arm64_fd_compat.tmp", O_RDONLY, 0, 0, 0) : -1;
+    long raw_faccessat = dir_fd >= 0 ? machina_syscall6(SYS_FACCESSAT, dir_fd, (long)"arm64_fd_compat.tmp", R_OK, 0, 0, 0) : -1;
     struct stat raw_at_stat = {{0}};
-    long raw_fstatat = dir_fd >= 0 ? machina_syscall6(SYS_FSTATAT, dir_fd, (long)DATA_NAME, (long)&raw_at_stat, 0, 0, 0) : -1;
+    long raw_fstatat = dir_fd >= 0 ? machina_syscall6(SYS_FSTATAT, dir_fd, (long)"arm64_fd_compat.tmp", (long)&raw_at_stat, 0, 0, 0) : -1;
     char raw_at_byte = 0;
     long raw_at_read = raw_openat >= 0 ? (long)read((int)raw_openat, &raw_at_byte, 1) : -1;
     if (raw_openat >= 0) {{
@@ -1652,7 +1692,7 @@ int main(void) {{
     }}
     failures += pipe_vec_roundtrip("dlsym", dyn_pipe, dyn_writev, dyn_readv);
 
-    int dyn_rw_fd = dyn_open(DATA_FILE, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    int dyn_rw_fd = dyn_open(data_file, O_CREAT | O_TRUNC | O_RDWR, 0600);
     long dyn_write_count = dyn_rw_fd >= 0 ? (long)dyn_write(dyn_rw_fd, "rw-ok", 5) : -1;
     long dyn_rw_seek = dyn_rw_fd >= 0 ? (long)dyn_lseek(dyn_rw_fd, 0, SEEK_SET) : -1;
     char dyn_rw_buf[8] = {{0}};
@@ -1714,18 +1754,17 @@ fn compile_arm64_stdio_fixture() -> (PathBuf, PathBuf) {
     let source = out_dir.join("arm64_stdio_compat.c");
     let binary = out_dir.join("arm64_stdio_compat");
     let data_file = out_dir.join("arm64_stdio_compat.tmp");
-    let data_file_literal = c_string_literal(&data_file.display().to_string());
     fs::write(
         &source,
         format!(
             r#"#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-
-#define DATA_FILE "{data_file_literal}"
 
 typedef FILE *(*fopen_fn)(const char *, const char *);
 typedef FILE *(*fdopen_fn)(int, const char *);
@@ -1759,8 +1798,46 @@ static void strip_newline(char *text) {{
     }}
 }}
 
+static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len) {{
+    if (out_len == 0) {{
+        return;
+    }}
+    char executable[4096] = {{0}};
+    uint32_t executable_size = sizeof(executable);
+    const char *path = argv0;
+    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
+        path = executable;
+    }}
+    const char *slash = path ? strrchr(path, '/') : 0;
+    if (!slash) {{
+        snprintf(out, out_len, ".");
+        return;
+    }}
+    size_t len = (size_t)(slash - path);
+    if (len == 0) {{
+        snprintf(out, out_len, "/");
+        return;
+    }}
+    if (len >= out_len) {{
+        len = out_len - 1;
+    }}
+    memcpy(out, path, len);
+    out[len] = 0;
+}}
+
+static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
+    char dir[4096] = {{0}};
+    fixture_dir_from_argv0(argv0, dir, sizeof(dir));
+    if (strcmp(dir, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", dir, name);
+    }}
+}}
+
 static int stdio_roundtrip(
     const char *label,
+    const char *data_file,
     fopen_fn fopen_impl,
     fdopen_fn fdopen_impl,
     fclose_fn fclose_impl,
@@ -1776,7 +1853,7 @@ static int stdio_roundtrip(
     clearerr_fn clearerr_impl,
     fileno_fn fileno_impl
 ) {{
-    FILE *stream = fopen_impl(DATA_FILE, "w+");
+    FILE *stream = fopen_impl(data_file, "w+");
     const char payload[] = "stdio-one\nstdio-two\n";
     size_t wrote = stream ? fwrite_impl(payload, 1, sizeof(payload) - 1, stream) : 0;
     int puts_ret = stream ? fputs_impl("tail\n", stream) : -1;
@@ -1835,7 +1912,7 @@ static int stdio_roundtrip(
         errno
     );
 
-    int raw_fd = open(DATA_FILE, O_RDONLY);
+    int raw_fd = open(data_file, O_RDONLY);
     FILE *fd_stream = raw_fd >= 0 ? fdopen_impl(raw_fd, "r") : 0;
     char fd_buf[16] = {{0}};
     size_t fd_read = fd_stream ? fread_impl(fd_buf, 1, 5, fd_stream) : 0;
@@ -1857,9 +1934,12 @@ static int stdio_roundtrip(
     return 0;
 }}
 
-int main(void) {{
+int main(int argc, char **argv) {{
     int failures = 0;
-    failures += stdio_roundtrip("static", fopen, fdopen, fclose, fread, fwrite, fflush, fseek, ftell, fgets, fputs, feof, ferror, clearerr, fileno);
+    const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
+    char data_file[4096] = {{0}};
+    fixture_path_from_argv0(argv0, "arm64_stdio_compat.tmp", data_file, sizeof(data_file));
+    failures += stdio_roundtrip("static", data_file, fopen, fdopen, fclose, fread, fwrite, fflush, fseek, ftell, fgets, fputs, feof, ferror, clearerr, fileno);
 
     void *self = dlopen(NULL, RTLD_NOW);
     fopen_fn dyn_fopen = (fopen_fn)dlsym(self, "fopen");
@@ -1890,9 +1970,9 @@ int main(void) {{
     if (!dyn_fopen || !dyn_fdopen || !dyn_fclose || !dyn_fread || !dyn_fwrite || !dyn_fflush || !dyn_fseek || !dyn_ftell || !dyn_fgets || !dyn_fputs || !dyn_feof || !dyn_ferror || !dyn_clearerr || !dyn_fileno) {{
         return 3;
     }}
-    failures += stdio_roundtrip("dlsym", dyn_fopen, dyn_fdopen, dyn_fclose, dyn_fread, dyn_fwrite, dyn_fflush, dyn_fseek, dyn_ftell, dyn_fgets, dyn_fputs, dyn_feof, dyn_ferror, dyn_clearerr, dyn_fileno);
+    failures += stdio_roundtrip("dlsym", data_file, dyn_fopen, dyn_fdopen, dyn_fclose, dyn_fread, dyn_fwrite, dyn_fflush, dyn_fseek, dyn_ftell, dyn_fgets, dyn_fputs, dyn_feof, dyn_ferror, dyn_clearerr, dyn_fileno);
     dlclose(self);
-    unlink(DATA_FILE);
+    unlink(data_file);
     return failures == 0 ? 0 : 1;
 }}
 "#
@@ -1932,19 +2012,19 @@ fn compile_arm64_path_fixture() -> (PathBuf, PathBuf) {
     let source = out_dir.join("arm64_path_compat.c");
     let binary = out_dir.join("arm64_path_compat");
     let base_dir = out_dir.join("path-host-root");
-    let base_dir_literal = c_string_literal(&base_dir.display().to_string());
     fs::write(
         &source,
         format!(
             r#"#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define BASE_DIR "{base_dir_literal}"
 #define SYS_CHMOD 0x200000F
 #define SYS_FCHMOD 0x200007C
 #define SYS_TRUNCATE 0x20000C8
@@ -2000,32 +2080,92 @@ static int text_is(const char *text, const char *expected) {{
     return strcmp(text, expected) == 0;
 }}
 
-static void cleanup_base(void) {{
-    unlink(BASE_DIR "/alpha.txt");
-    unlink(BASE_DIR "/beta.txt");
-    unlink(BASE_DIR "/alpha.link");
-    unlink(BASE_DIR "/raw-at.txt");
-    unlink(BASE_DIR "/raw-new.txt");
-    unlink(BASE_DIR "/raw.link");
-    unlink(BASE_DIR "/dyn-old.txt");
-    unlink(BASE_DIR "/dyn-new.txt");
-    unlink(BASE_DIR "/dyn.link");
-    unlink(BASE_DIR "/dyn-mode.txt");
-    unlink(BASE_DIR "/dyn-at.txt");
-    unlink(BASE_DIR "/dyn-at-new.txt");
-    unlink(BASE_DIR "/dyn-at.link");
-    rmdir(BASE_DIR "/raw-dir");
-    rmdir(BASE_DIR "/dyn-dir");
-    rmdir(BASE_DIR "/dyn-at-dir");
-    rmdir(BASE_DIR "/empty");
-    rmdir(BASE_DIR);
+static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len) {{
+    if (out_len == 0) {{
+        return;
+    }}
+    char executable[4096] = {{0}};
+    uint32_t executable_size = sizeof(executable);
+    const char *path = argv0;
+    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
+        path = executable;
+    }}
+    const char *slash = path ? strrchr(path, '/') : 0;
+    if (!slash) {{
+        snprintf(out, out_len, ".");
+        return;
+    }}
+    size_t len = (size_t)(slash - path);
+    if (len == 0) {{
+        snprintf(out, out_len, "/");
+        return;
+    }}
+    if (len >= out_len) {{
+        len = out_len - 1;
+    }}
+    memcpy(out, path, len);
+    out[len] = 0;
 }}
 
-int main(void) {{
+static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
+    char dir[4096] = {{0}};
+    fixture_dir_from_argv0(argv0, dir, sizeof(dir));
+    if (strcmp(dir, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", dir, name);
+    }}
+}}
+
+static void join_path(const char *base, const char *name, char *out, size_t out_len) {{
+    if (strcmp(base, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", base, name);
+    }}
+}}
+
+static void unlink_child(const char *base, const char *name) {{
+    char path[4096] = {{0}};
+    join_path(base, name, path, sizeof(path));
+    unlink(path);
+}}
+
+static void rmdir_child(const char *base, const char *name) {{
+    char path[4096] = {{0}};
+    join_path(base, name, path, sizeof(path));
+    rmdir(path);
+}}
+
+static void cleanup_base(const char *base_dir) {{
+    unlink_child(base_dir, "alpha.txt");
+    unlink_child(base_dir, "beta.txt");
+    unlink_child(base_dir, "alpha.link");
+    unlink_child(base_dir, "raw-at.txt");
+    unlink_child(base_dir, "raw-new.txt");
+    unlink_child(base_dir, "raw.link");
+    unlink_child(base_dir, "dyn-old.txt");
+    unlink_child(base_dir, "dyn-new.txt");
+    unlink_child(base_dir, "dyn.link");
+    unlink_child(base_dir, "dyn-mode.txt");
+    unlink_child(base_dir, "dyn-at.txt");
+    unlink_child(base_dir, "dyn-at-new.txt");
+    unlink_child(base_dir, "dyn-at.link");
+    rmdir_child(base_dir, "raw-dir");
+    rmdir_child(base_dir, "dyn-dir");
+    rmdir_child(base_dir, "dyn-at-dir");
+    rmdir_child(base_dir, "empty");
+    rmdir(base_dir);
+}}
+
+int main(int argc, char **argv) {{
     int failures = 0;
-    cleanup_base();
-    int mkdir_base = mkdir(BASE_DIR, 0700);
-    int chdir_base = chdir(BASE_DIR);
+    const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
+    char base_dir[4096] = {{0}};
+    fixture_path_from_argv0(argv0, "path-host-root", base_dir, sizeof(base_dir));
+    cleanup_base(base_dir);
+    int mkdir_base = mkdir(base_dir, 0700);
+    int chdir_base = chdir(base_dir);
     char cwd[4096] = {{0}};
     char *cwd_ret = getcwd(cwd, sizeof(cwd));
     printf("compat path cwd mkdir=%d chdir=%d ret=%p cwd=%s errno=%d\n", mkdir_base, chdir_base, (void *)cwd_ret, cwd, errno);
@@ -2267,7 +2407,7 @@ int main(void) {{
 
     dyn_chdir("..");
     dlclose(self);
-    rmdir(BASE_DIR);
+    rmdir(base_dir);
     return failures == 0 ? 0 : 1;
 }}
 "#
@@ -2632,9 +2772,6 @@ fn compile_arm64_directory_entropy_fixture() -> (PathBuf, PathBuf) {
     let source = out_dir.join("arm64_directory_entropy_compat.c");
     let binary = out_dir.join("arm64_directory_entropy_compat");
     let base_dir = out_dir.join("dir-host-root");
-    let base_dir_literal = c_string_literal(&base_dir.display().to_string());
-    let alpha_file_literal = c_string_literal(&base_dir.join("alpha.txt").display().to_string());
-    let beta_file_literal = c_string_literal(&base_dir.join("beta.txt").display().to_string());
     fs::write(
         &source,
         format!(
@@ -2642,14 +2779,12 @@ fn compile_arm64_directory_entropy_fixture() -> (PathBuf, PathBuf) {
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#define BASE_DIR "{base_dir_literal}"
-#define ALPHA_FILE "{alpha_file_literal}"
-#define BETA_FILE "{beta_file_literal}"
 
 typedef DIR *(*opendir_fn)(const char *);
 typedef DIR *(*fdopendir_fn)(int);
@@ -2695,6 +2830,51 @@ static int any_nonzero(const unsigned char *buf, unsigned long len) {{
         }}
     }}
     return 0;
+}}
+
+static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len) {{
+    if (out_len == 0) {{
+        return;
+    }}
+    char executable[4096] = {{0}};
+    uint32_t executable_size = sizeof(executable);
+    const char *path = argv0;
+    if (_NSGetExecutablePath(executable, &executable_size) == 0 && executable[0] != 0) {{
+        path = executable;
+    }}
+    const char *slash = path ? strrchr(path, '/') : 0;
+    if (!slash) {{
+        snprintf(out, out_len, ".");
+        return;
+    }}
+    size_t len = (size_t)(slash - path);
+    if (len == 0) {{
+        snprintf(out, out_len, "/");
+        return;
+    }}
+    if (len >= out_len) {{
+        len = out_len - 1;
+    }}
+    memcpy(out, path, len);
+    out[len] = 0;
+}}
+
+static void fixture_path_from_argv0(const char *argv0, const char *name, char *out, size_t out_len) {{
+    char dir[4096] = {{0}};
+    fixture_dir_from_argv0(argv0, dir, sizeof(dir));
+    if (strcmp(dir, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", dir, name);
+    }}
+}}
+
+static void join_path(const char *base, const char *name, char *out, size_t out_len) {{
+    if (strcmp(base, "/") == 0) {{
+        snprintf(out, out_len, "/%s", name);
+    }} else {{
+        snprintf(out, out_len, "%s/%s", base, name);
+    }}
 }}
 
 static void write_file(const char *path, const char *text) {{
@@ -2763,13 +2943,20 @@ static int scan_with_readdir_r(const char *label, DIR *dir, readdir_r_fn read_di
     return last_ret == 0 && alpha && beta ? 0 : 1;
 }}
 
-int main(void) {{
+int main(int argc, char **argv) {{
     int failures = 0;
-    mkdir(BASE_DIR, 0700);
-    write_file(ALPHA_FILE, "a");
-    write_file(BETA_FILE, "b");
+    const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
+    char base_dir[4096] = {{0}};
+    char alpha_file[4096] = {{0}};
+    char beta_file[4096] = {{0}};
+    fixture_path_from_argv0(argv0, "dir-host-root", base_dir, sizeof(base_dir));
+    join_path(base_dir, "alpha.txt", alpha_file, sizeof(alpha_file));
+    join_path(base_dir, "beta.txt", beta_file, sizeof(beta_file));
+    mkdir(base_dir, 0700);
+    write_file(alpha_file, "a");
+    write_file(beta_file, "b");
 
-    DIR *dir = opendir(BASE_DIR);
+    DIR *dir = opendir(base_dir);
     int static_fd = dir ? dirfd(dir) : -1;
     printf("compat dir static opendir=%p dirfd=%d errno=%d\n", dir, static_fd, errno);
     if (!dir || static_fd < 0) {{
@@ -2778,7 +2965,7 @@ int main(void) {{
     failures += scan_with_readdir("static", dir, readdir, rewinddir, telldir, seekdir);
     closedir(dir);
 
-    int fd = open(BASE_DIR, O_RDONLY);
+    int fd = open(base_dir, O_RDONLY);
     DIR *fd_dir = fdopendir(fd);
     printf("compat dir fdopendir fd=%d dir=%p errno=%d\n", fd, fd_dir, errno);
     if (!fd_dir) {{
@@ -2791,7 +2978,7 @@ int main(void) {{
         closedir(fd_dir);
     }}
 
-    DIR *rr_dir = opendir(BASE_DIR);
+    DIR *rr_dir = opendir(base_dir);
     failures += rr_dir ? scan_with_readdir_r("static", rr_dir, readdir_r) : 30;
     if (rr_dir) {{
         closedir(rr_dir);
@@ -2822,7 +3009,7 @@ int main(void) {{
         return 50;
     }}
 
-    DIR *dyn_dir = dyn_opendir(BASE_DIR);
+    DIR *dyn_dir = dyn_opendir(base_dir);
     int dyn_fd = dyn_dir ? dyn_dirfd(dyn_dir) : -1;
     printf("compat dir dlsym opendir=%p dirfd=%d errno=%d\n", dyn_dir, dyn_fd, errno);
     failures += dyn_dir ? scan_with_readdir("dlsym", dyn_dir, dyn_readdir, dyn_rewinddir, dyn_telldir, dyn_seekdir) : 60;
@@ -2830,7 +3017,7 @@ int main(void) {{
         dyn_closedir(dyn_dir);
     }}
 
-    int dyn_raw_fd = open(BASE_DIR, O_RDONLY);
+    int dyn_raw_fd = open(base_dir, O_RDONLY);
     DIR *dyn_fd_dir = dyn_fdopendir(dyn_raw_fd);
     failures += dyn_fd_dir ? scan_with_readdir_r("dlsym", dyn_fd_dir, dyn_readdir_r) : 70;
     if (dyn_fd_dir) {{
@@ -2847,9 +3034,9 @@ int main(void) {{
     }}
 
     dlclose(self);
-    unlink(ALPHA_FILE);
-    unlink(BETA_FILE);
-    rmdir(BASE_DIR);
+    unlink(alpha_file);
+    unlink(beta_file);
+    rmdir(base_dir);
     return failures == 0 ? 0 : 1;
 }}
 "#
@@ -3772,6 +3959,7 @@ fn compat_mode_proxies_memory_and_string_imports() {
             && stdout.contains("overlap=ababcd")
             && stdout.contains("heap=heap-ok")
             && stdout.contains("zero_ok=1")
+            && stdout.contains("bzero_ok=1")
             && stdout.contains("aligned_mod=0")
             && stdout.contains("hit=4 last=9 ok=1"),
         "memory/string fixture did not complete static import roundtrip; stdout:\n{stdout}"
@@ -3779,6 +3967,7 @@ fn compat_mode_proxies_memory_and_string_imports() {
     assert!(
         stdout.contains("compat memstr dlsym ptrs malloc=0x")
             && stdout.contains(" memcpy=0x")
+            && stdout.contains(" bzero=0x")
             && stdout.contains(" strcmp=0x")
             && stdout.contains(" strdup=0x")
             && stdout.contains(" posix_memalign=0x"),
@@ -3789,6 +3978,7 @@ fn compat_mode_proxies_memory_and_string_imports() {
             && stdout.contains("overlap=ababcd")
             && stdout.contains("heap=heap-ok")
             && stdout.contains("zero_ok=1")
+            && stdout.contains("bzero_ok=1")
             && stdout.contains("aligned_mod=0")
             && stdout.contains("hit=4 last=9 ok=1"),
         "memory/string fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"

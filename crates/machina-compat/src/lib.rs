@@ -616,6 +616,8 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     DarwinCheckFdSetOverflow,
     #[cfg(target_os = "macos")]
+    DarwinChkstk,
+    #[cfg(target_os = "macos")]
     Access,
     #[cfg(target_os = "macos")]
     FAccessAt,
@@ -787,6 +789,8 @@ enum HostImportKind {
     Memmove,
     #[cfg(target_os = "macos")]
     Memset,
+    #[cfg(target_os = "macos")]
+    BZero,
     #[cfg(target_os = "macos")]
     Memcmp,
     #[cfg(target_os = "macos")]
@@ -1118,6 +1122,7 @@ impl CompatibilityServices {
                     return_value: 1,
                     errno: Some(0),
                 }),
+                HostImportKind::DarwinChkstk => Some(host_call_value(args[0])),
                 HostImportKind::Access => Some(self.access_path(memory, args[0], args[1])?.into()),
                 HostImportKind::FAccessAt => Some(
                     self.faccessat_path(memory, args[0], args[1], args[2], args[3])?
@@ -1275,6 +1280,7 @@ impl CompatibilityServices {
                 HostImportKind::Memcpy => Some(self.memcpy(memory, args[0], args[1], args[2])?),
                 HostImportKind::Memmove => Some(self.memmove(memory, args[0], args[1], args[2])?),
                 HostImportKind::Memset => Some(self.memset(memory, args[0], args[1], args[2])?),
+                HostImportKind::BZero => Some(self.memset(memory, args[0], 0, args[1])?),
                 HostImportKind::Memcmp => Some(self.memcmp(memory, args[0], args[1], args[2])?),
                 HostImportKind::Strlen => Some(self.strlen(memory, args[0])?),
                 HostImportKind::Strcmp => Some(self.strcmp(memory, args[0], args[1])?),
@@ -4439,6 +4445,9 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "pipe" => Some(HostImportKind::Pipe),
             "select" | "select$NOCANCEL" => Some(HostImportKind::Select),
             "__darwin_check_fd_set_overflow" => Some(HostImportKind::DarwinCheckFdSetOverflow),
+            "__chkstk_darwin" | "_chkstk_darwin" | "chkstk_darwin" => {
+                Some(HostImportKind::DarwinChkstk)
+            }
             "access" => Some(HostImportKind::Access),
             "faccessat" => Some(HostImportKind::FAccessAt),
             "chmod" => Some(HostImportKind::Chmod),
@@ -4525,6 +4534,7 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "memcpy" | "__memcpy_chk" => Some(HostImportKind::Memcpy),
             "memmove" | "__memmove_chk" => Some(HostImportKind::Memmove),
             "memset" | "__memset_chk" => Some(HostImportKind::Memset),
+            "bzero" => Some(HostImportKind::BZero),
             "memcmp" => Some(HostImportKind::Memcmp),
             "strlen" => Some(HostImportKind::Strlen),
             "strcmp" => Some(HostImportKind::Strcmp),
@@ -9410,6 +9420,7 @@ mod tests {
             assert!(compat.should_proxy_import("_select$NOCANCEL"));
             assert!(compat.should_proxy_import("_select$1050"));
             assert!(compat.should_proxy_import("___darwin_check_fd_set_overflow"));
+            assert!(compat.should_proxy_import("___chkstk_darwin"));
             assert!(compat.should_proxy_import("_access"));
             assert!(compat.should_proxy_import("_access$UNIX2003"));
             assert!(compat.should_proxy_import("_faccessat"));
@@ -9484,6 +9495,7 @@ mod tests {
             assert!(compat.should_proxy_import("_memcpy"));
             assert!(compat.should_proxy_import("_memmove"));
             assert!(compat.should_proxy_import("_memset"));
+            assert!(compat.should_proxy_import("_bzero"));
             assert!(compat.should_proxy_import("_memcmp"));
             assert!(compat.should_proxy_import("_strlen"));
             assert!(compat.should_proxy_import("_strcmp"));
@@ -9535,6 +9547,87 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert!(!compat.should_proxy_import("_puts"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bzero_proxy_zeros_guest_memory() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"abcdef");
+        let result = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_bzero", &[0x1001, 3, 0, 0, 0, 0, 0, 0])
+            .expect("_bzero should be proxied");
+
+        assert_eq!(result.return_value, 0x1001);
+        assert_eq!(result.errno, None);
+        assert_eq!(
+            memory.read_memory(0x1000, 6).unwrap(),
+            vec![b'a', 0, 0, 0, b'e', b'f']
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chkstk_darwin_proxy_is_non_mutating_noop() {
+        #[derive(Default)]
+        struct TestMemory;
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(
+                &mut self,
+                _addr: u64,
+                _size: usize,
+            ) -> Result<Vec<u8>, GuestMemoryError> {
+                Err(GuestMemoryError)
+            }
+
+            fn write_memory(&mut self, _addr: u64, _data: &[u8]) -> Result<(), GuestMemoryError> {
+                Err(GuestMemoryError)
+            }
+        }
+
+        let mut memory = TestMemory;
+        let result = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "___chkstk_darwin",
+                &[0x1234, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("___chkstk_darwin should be proxied");
+
+        assert_eq!(result.return_value, 0x1234);
+        assert_eq!(result.errno, None);
     }
 
     #[cfg(target_os = "macos")]

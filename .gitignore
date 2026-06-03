@@ -39,3 +39,4 @@ venv/
 # multi-megabyte reverse-engineered text we treat as scratch.
 fixtures/**/*.macho.c
 fixtures/**/*.bndb
+Archive.zip
