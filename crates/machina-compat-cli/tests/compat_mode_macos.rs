@@ -2882,6 +2882,131 @@ int main(void) {{
     (binary, base_dir)
 }
 
+#[cfg(target_os = "macos")]
+fn compile_arm64_apple_framework_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_apple_framework_compat.c");
+    let binary = out_dir.join("arm64_apple_framework_compat");
+    fs::write(
+        &source,
+        r#"#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef CFStringRef (*cf_create_cstr_fn)(CFAllocatorRef, const char *, CFStringEncoding);
+typedef Boolean (*cf_get_cstr_fn)(CFStringRef, char *, CFIndex, CFStringEncoding);
+typedef CFIndex (*cf_get_len_fn)(CFStringRef);
+typedef int (*sec_random_fn)(void *, size_t, uint8_t *);
+typedef CFStringRef (*sec_error_fn)(OSStatus, void *);
+
+static int any_nonzero(const unsigned char *buf, unsigned long len) {
+    for (unsigned long i = 0; i < len; i++) {
+        if (buf[i] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int main(void) {
+    char static_buf[64] = {0};
+    CFStringRef s = CFStringCreateWithCString(0, "static-cf", kCFStringEncodingUTF8);
+    Boolean s_ok = s ? CFStringGetCString(s, static_buf, sizeof(static_buf), kCFStringEncodingUTF8) : 0;
+    CFIndex s_len = s ? CFStringGetLength(s) : -1;
+    unsigned char rnd[16] = {0};
+    int rnd_ret = SecRandomCopyBytes(0, sizeof(rnd), rnd);
+    CFStringRef err = SecCopyErrorMessageString(-50, 0);
+    char err_buf[128] = {0};
+    Boolean err_ok = err ? CFStringGetCString(err, err_buf, sizeof(err_buf), kCFStringEncodingUTF8) : 0;
+    int static_ok = s_ok && s_len == 9 && strcmp(static_buf, "static-cf") == 0 && rnd_ret == 0 && any_nonzero(rnd, sizeof(rnd)) && err_ok;
+    printf(
+        "compat apple static cf ok=%d len=%ld text=%s random=%d nonzero=%d err=%d errtext=%s pass=%d\n",
+        s_ok,
+        (long)s_len,
+        static_buf,
+        rnd_ret,
+        any_nonzero(rnd, sizeof(rnd)),
+        err_ok,
+        err_buf,
+        static_ok
+    );
+
+    void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
+    cf_create_cstr_fn dyn_create = (cf_create_cstr_fn)dlsym(cf, "CFStringCreateWithCString");
+    cf_get_cstr_fn dyn_get = (cf_get_cstr_fn)dlsym(cf, "CFStringGetCString");
+    cf_get_len_fn dyn_len = (cf_get_len_fn)dlsym(cf, "CFStringGetLength");
+    sec_random_fn dyn_random = (sec_random_fn)dlsym(sec, "SecRandomCopyBytes");
+    sec_error_fn dyn_error = (sec_error_fn)dlsym(sec, "SecCopyErrorMessageString");
+    printf(
+        "compat apple dlsym ptrs create=%p get=%p len=%p random=%p error=%p\n",
+        (void *)dyn_create,
+        (void *)dyn_get,
+        (void *)dyn_len,
+        (void *)dyn_random,
+        (void *)dyn_error
+    );
+
+    char dyn_buf[64] = {0};
+    CFStringRef ds = dyn_create ? dyn_create(0, "dyn-cf", kCFStringEncodingUTF8) : 0;
+    Boolean d_ok = dyn_get && ds ? dyn_get(ds, dyn_buf, sizeof(dyn_buf), kCFStringEncodingUTF8) : 0;
+    CFIndex d_len = dyn_len && ds ? dyn_len(ds) : -1;
+    unsigned char dyn_rnd[16] = {0};
+    int dyn_rnd_ret = dyn_random ? dyn_random(0, sizeof(dyn_rnd), dyn_rnd) : -1;
+    CFStringRef derr = dyn_error ? dyn_error(-50, 0) : 0;
+    char derr_buf[128] = {0};
+    Boolean derr_ok = dyn_get && derr ? dyn_get(derr, derr_buf, sizeof(derr_buf), kCFStringEncodingUTF8) : 0;
+    int dyn_ok = d_ok && d_len == 6 && strcmp(dyn_buf, "dyn-cf") == 0 && dyn_rnd_ret == 0 && any_nonzero(dyn_rnd, sizeof(dyn_rnd)) && derr_ok;
+    printf(
+        "compat apple dlsym cf ok=%d len=%ld text=%s random=%d nonzero=%d err=%d errtext=%s pass=%d\n",
+        d_ok,
+        (long)d_len,
+        dyn_buf,
+        dyn_rnd_ret,
+        any_nonzero(dyn_rnd, sizeof(dyn_rnd)),
+        derr_ok,
+        derr_buf,
+        dyn_ok
+    );
+    return static_ok && dyn_ok ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 Apple framework fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-framework")
+        .arg("CoreFoundation")
+        .arg("-framework")
+        .arg("Security")
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 Apple framework fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 Apple framework fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn compat_mode_smoke_is_macos_only() {
@@ -3451,6 +3576,84 @@ fn compat_mode_proxies_memory_and_string_imports() {
             && stdout.contains("aligned_mod=0")
             && stdout.contains("hit=4 last=9 ok=1"),
         "memory/string fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_proxies_corefoundation_and_security_imports() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode Apple framework test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_apple_framework_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(apple frameworks): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(apple frameworks): status={status}");
+    eprintln!("compat proof(apple frameworks): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(apple frameworks): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains(
+            "compat apple static cf ok=1 len=9 text=static-cf random=0 nonzero=1 err=1"
+        ) && line.contains(" pass=1")),
+        "Apple framework fixture did not complete static CoreFoundation/Security calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat apple dlsym ptrs create=0x")
+            && stdout.contains(" get=0x")
+            && stdout.contains(" len=0x")
+            && stdout.contains(" random=0x")
+            && stdout.contains(" error=0x"),
+        "Apple framework fixture did not receive dlsym Apple trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains(
+            "compat apple dlsym cf ok=1 len=6 text=dyn-cf random=0 nonzero=1 err=1"
+        ) && line.contains(" pass=1")),
+        "Apple framework fixture did not complete dlsym CoreFoundation/Security calls; stdout:\n{stdout}"
     );
 }
 

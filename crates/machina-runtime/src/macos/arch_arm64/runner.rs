@@ -485,6 +485,9 @@ pub fn emulate_macos_arm64_binary_with_mode(
     install_apple_imports(
         &mut emulator,
         &stub_map,
+        stub_region,
+        stub_name_map.clone(),
+        next_dynamic_stub_addr.clone(),
         &trace_bus,
         &shared_state,
         &import_tracker,

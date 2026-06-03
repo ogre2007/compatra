@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::macos::apple_imports::is_apple_import_symbol;
 use crate::macos::arm64_import_stubs::{allocate_arm64_dynamic_import_stub, Arm64ImportTracker};
 use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64SharedState,
@@ -105,7 +106,9 @@ pub fn install_arm64_dynamic_imports(
                         .lock()
                         .ok()
                         .is_some_and(|handles| handles.contains_key(&handle));
-                let result = if handle_known && compat.should_proxy_import(&symbol) {
+                let result = if handle_known
+                    && (compat.should_proxy_import(&symbol) || is_apple_import_symbol(&symbol))
+                {
                     if let Some(existing) = dynamic_symbols
                         .lock()
                         .ok()

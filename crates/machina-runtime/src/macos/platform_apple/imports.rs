@@ -1,13 +1,36 @@
 //! Synthetic Apple framework imports used by the current macOS userland runner.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::macos::byte_preview::lossy_data_preview;
 use crate::macos::runner_support::{
     emit_arm64_event, record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
-use crate::macos::{process_event, runtime_process_metadata, Emulator, SharedTraceBus};
+use crate::macos::{
+    process_event, read_cstring, runtime_process_metadata, Emulator, SharedTraceBus, StubRegion,
+};
 use crate::UnicornEmulator;
+
+fn normalized_apple_symbol(symbol: &str) -> &str {
+    symbol.strip_prefix('_').unwrap_or(symbol)
+}
+
+pub fn is_apple_import_symbol(symbol: &str) -> bool {
+    matches!(
+        normalized_apple_symbol(symbol),
+        "CFStringCreateWithCString"
+            | "CFStringGetCString"
+            | "CFStringGetLength"
+            | "CFDataCreate"
+            | "CFDataGetLength"
+            | "CFDataGetBytePtr"
+            | "CFRelease"
+            | "CFRetain"
+            | "SecRandomCopyBytes"
+            | "SecCopyErrorMessageString"
+    )
+}
 
 fn read_guest_bytes(emu: &mut dyn Emulator, addr: u64, len: usize, cap: usize) -> Vec<u8> {
     if addr == 0 || len == 0 {
@@ -34,6 +57,93 @@ fn read_guest_u64_array(emu: &mut dyn Emulator, addr: u64, count: usize, cap: us
     out
 }
 
+fn write_guest_cstring(emu: &mut dyn Emulator, addr: u64, capacity: usize, bytes: &[u8]) -> bool {
+    if addr == 0 || capacity == 0 {
+        return false;
+    }
+    let copy_len = bytes.len().min(capacity.saturating_sub(1));
+    if copy_len > 0 && emu.write_memory(addr, &bytes[..copy_len]).is_err() {
+        return false;
+    }
+    emu.write_memory(addr + copy_len as u64, &[0]).is_ok()
+}
+
+fn cf_string_len(data: &[u8]) -> u64 {
+    String::from_utf8_lossy(data).encode_utf16().count() as u64
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_random_bytes(len: usize) -> Option<Vec<u8>> {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecRandomCopyBytes(rnd: *const std::ffi::c_void, count: usize, bytes: *mut u8) -> i32;
+    }
+
+    let mut out = vec![0u8; len];
+    let ret = unsafe { SecRandomCopyBytes(std::ptr::null(), len, out.as_mut_ptr()) };
+    (ret == 0).then_some(out)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_random_bytes(len: usize) -> Option<Vec<u8>> {
+    let mut x = 0xA5u8;
+    Some(
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(33).wrapping_add(17);
+                x
+            })
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_error_message(status: i32) -> Option<Vec<u8>> {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecCopyErrorMessageString(
+            status: i32,
+            reserved: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringGetCString(
+            the_string: *const std::ffi::c_void,
+            buffer: *mut std::ffi::c_char,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
+    const K_CFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    let cf = unsafe { SecCopyErrorMessageString(status, std::ptr::null()) };
+    if cf.is_null() {
+        return None;
+    }
+    let mut buf = vec![0i8; 1024];
+    let ok = unsafe {
+        CFStringGetCString(
+            cf,
+            buf.as_mut_ptr(),
+            buf.len() as isize,
+            K_CFSTRING_ENCODING_UTF8,
+        )
+    } != 0;
+    unsafe { CFRelease(cf) };
+    if !ok {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(buf[..end].iter().map(|&b| b as u8).collect())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_error_message(status: i32) -> Option<Vec<u8>> {
+    Some(format!("OSStatus {}", status).into_bytes())
+}
+
 fn install_returning_hook<F>(
     emulator: &mut UnicornEmulator,
     addr: u64,
@@ -57,15 +167,342 @@ where
     Ok(())
 }
 
+fn dispatch_apple_import(
+    emu: &mut machina::UnicornEmulator,
+    symbol: &str,
+    apple_runtime: &Arc<Mutex<crate::macos::AppleRuntime>>,
+    tracker: &Arm64ImportTracker,
+    trace: &Option<SharedTraceBus>,
+    metadata: &crate::macos::TraceMetadata,
+) -> Option<u64> {
+    match normalized_apple_symbol(symbol) {
+        "CFStringCreateWithCString" => {
+            let cstr_ptr = emu.read_reg("x1").unwrap_or(0);
+            let encoding = emu.read_reg("x2").unwrap_or(0);
+            let data = read_cstring(emu, cstr_ptr, 64 * 1024)
+                .unwrap_or_default()
+                .into_bytes();
+            let string_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_string(data.clone(), encoding)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFStringCreateWithCString(cstr=0x{:X}, enc=0x{:X}) -> 0x{:X}",
+                    cstr_ptr, encoding, string_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfstring", "CFStringCreateWithCString")
+                    .arg("CString", format!("0x{:X}", cstr_ptr))
+                    .arg("Encoding", format!("0x{:X}", encoding))
+                    .arg("Result", format!("0x{:X}", string_ref))
+                    .arg("Preview", lossy_data_preview(&data, 128))
+                    .arg("HostProxy", "true"),
+            );
+            Some(string_ref)
+        }
+        "CFStringGetLength" => {
+            let string_ref = emu.read_reg("x0").unwrap_or(0);
+            let data = apple_runtime.lock().ok()?.object_data(string_ref)?;
+            let len = cf_string_len(&data);
+            record_arm64_import(
+                tracker,
+                format!("_CFStringGetLength(string=0x{:X}) -> {}", string_ref, len),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfstring", "CFStringGetLength")
+                    .arg("String", format!("0x{:X}", string_ref))
+                    .arg("Result", len.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(len)
+        }
+        "CFStringGetCString" => {
+            let string_ref = emu.read_reg("x0").unwrap_or(0);
+            let buffer = emu.read_reg("x1").unwrap_or(0);
+            let capacity = emu.read_reg("x2").unwrap_or(0) as usize;
+            let data = apple_runtime.lock().ok()?.object_data(string_ref)?;
+            let ok = write_guest_cstring(emu, buffer, capacity, &data);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFStringGetCString(string=0x{:X}, buffer=0x{:X}, cap={}) -> {}",
+                    string_ref, buffer, capacity, ok as u64
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfstring", "CFStringGetCString")
+                    .arg("String", format!("0x{:X}", string_ref))
+                    .arg("Buffer", format!("0x{:X}", buffer))
+                    .arg("Capacity", capacity.to_string())
+                    .arg("Result", ok.to_string())
+                    .arg("Preview", lossy_data_preview(&data, 128))
+                    .arg("HostProxy", "true"),
+            );
+            Some(ok as u64)
+        }
+        "CFDataCreate" => {
+            let bytes_ptr = emu.read_reg("x1").unwrap_or(0);
+            let len = emu.read_reg("x2").unwrap_or(0) as usize;
+            let data = read_guest_bytes(emu, bytes_ptr, len, 8 * 1024 * 1024);
+            let data_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_data(data.clone())
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFDataCreate(bytes=0x{:X}, len={}) -> 0x{:X}",
+                    bytes_ptr, len, data_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfdata", "CFDataCreate")
+                    .arg("Bytes", format!("0x{:X}", bytes_ptr))
+                    .arg("Len", len.to_string())
+                    .arg("Result", format!("0x{:X}", data_ref))
+                    .arg("Preview", lossy_data_preview(&data, 128))
+                    .arg("HostProxy", "true"),
+            );
+            Some(data_ref)
+        }
+        "CFDataGetLength" => {
+            let data_ref = emu.read_reg("x0").unwrap_or(0);
+            let len = apple_runtime.lock().ok()?.object_len(data_ref).unwrap_or(0) as u64;
+            record_arm64_import(
+                tracker,
+                format!("_CFDataGetLength(data=0x{:X}) -> {}", data_ref, len),
+            );
+            Some(len)
+        }
+        "CFDataGetBytePtr" => {
+            let data_ref = emu.read_reg("x0").unwrap_or(0);
+            let exported_ptr = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let data = runtime.object_data(data_ref)?;
+                runtime.export_bytes(emu, &data).unwrap_or(0)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFDataGetBytePtr(data=0x{:X}) -> 0x{:X}",
+                    data_ref, exported_ptr
+                ),
+            );
+            Some(exported_ptr)
+        }
+        "SecRandomCopyBytes" => {
+            let count = emu.read_reg("x1").unwrap_or(0) as usize;
+            let out_ptr = emu.read_reg("x2").unwrap_or(0);
+            let result = if out_ptr == 0 {
+                -1
+            } else if let Some(bytes) = host_sec_random_bytes(count) {
+                if emu.write_memory(out_ptr, &bytes).is_ok() {
+                    0
+                } else {
+                    -1
+                }
+            } else {
+                -1
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecRandomCopyBytes(count={}, out=0x{:X}) -> {}",
+                    count, out_ptr, result
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "secrandom", "SecRandomCopyBytes")
+                    .arg("Count", count.to_string())
+                    .arg("Out", format!("0x{:X}", out_ptr))
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(result as u64)
+        }
+        "SecCopyErrorMessageString" => {
+            let status = emu.read_reg("x0").unwrap_or(0) as i32;
+            let data = host_sec_error_message(status)
+                .unwrap_or_else(|| format!("OSStatus {}", status).into_bytes());
+            let string_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_string(data.clone(), 0x0800_0100)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecCopyErrorMessageString(status={}) -> 0x{:X}",
+                    status, string_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "secerror", "SecCopyErrorMessageString")
+                    .arg("Status", status.to_string())
+                    .arg("Result", format!("0x{:X}", string_ref))
+                    .arg("Preview", lossy_data_preview(&data, 128))
+                    .arg("HostProxy", "true"),
+            );
+            Some(string_ref)
+        }
+        "CFRelease" => {
+            let object_ref = emu.read_reg("x0").unwrap_or(0);
+            if let Ok(mut runtime) = apple_runtime.lock() {
+                runtime.release(object_ref);
+            }
+            record_arm64_import(tracker, format!("_CFRelease(0x{:X})", object_ref));
+            Some(0)
+        }
+        "CFRetain" => {
+            let object_ref = emu.read_reg("x0").unwrap_or(0);
+            if let Ok(runtime) = apple_runtime.lock() {
+                let _ = runtime.retain(object_ref);
+            }
+            record_arm64_import(tracker, format!("_CFRetain(0x{:X})", object_ref));
+            Some(object_ref)
+        }
+        _ => None,
+    }
+}
+
+fn install_dispatch_hook(
+    emulator: &mut UnicornEmulator,
+    addr: u64,
+    symbol: &'static str,
+    apple_runtime: Arc<Mutex<crate::macos::AppleRuntime>>,
+    trace_bus: Option<SharedTraceBus>,
+    import_tracker: Arm64ImportTracker,
+    metadata: crate::macos::TraceMetadata,
+) -> Result<(), Box<dyn std::error::Error>> {
+    emulator.add_code_hook(
+        addr,
+        addr + 4,
+        move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+            let result = dispatch_apple_import(
+                emu,
+                symbol,
+                &apple_runtime,
+                &import_tracker,
+                &trace_bus,
+                &metadata,
+            )
+            .unwrap_or(0);
+            let lr = emu.read_reg("lr").unwrap_or(0);
+            let _ = emu.write_reg("x0", result);
+            if lr != 0 {
+                let _ = emu.write_reg("pc", lr);
+            }
+        },
+    )?;
+    Ok(())
+}
+
+fn install_dynamic_dispatch_hook(
+    emulator: &mut UnicornEmulator,
+    stub_region: StubRegion,
+    stub_name_map: Arc<Mutex<HashMap<u64, String>>>,
+    next_dynamic_stub_addr: Arc<Mutex<u64>>,
+    apple_runtime: Arc<Mutex<crate::macos::AppleRuntime>>,
+    trace_bus: Option<SharedTraceBus>,
+    import_tracker: Arm64ImportTracker,
+    metadata: crate::macos::TraceMetadata,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dynamic_start = next_dynamic_stub_addr
+        .lock()
+        .ok()
+        .map(|next| *next)
+        .unwrap_or_else(|| stub_region.base.saturating_add(stub_region.size));
+    let dynamic_end = stub_region.base.saturating_add(stub_region.size);
+    if dynamic_start >= dynamic_end {
+        return Ok(());
+    }
+
+    emulator.add_code_hook(
+        dynamic_start,
+        dynamic_end,
+        move |emu: &mut machina::UnicornEmulator, address: u64, _size: u32| {
+            let bucket = stub_region.bucket(address);
+            let symbol = stub_name_map
+                .lock()
+                .ok()
+                .and_then(|symbols| symbols.get(&bucket).cloned());
+            let Some(symbol) = symbol else {
+                return;
+            };
+            if !is_apple_import_symbol(&symbol) {
+                return;
+            }
+            let Some(result) = dispatch_apple_import(
+                emu,
+                &symbol,
+                &apple_runtime,
+                &import_tracker,
+                &trace_bus,
+                &metadata,
+            ) else {
+                return;
+            };
+            let lr = emu.read_reg("lr").unwrap_or(0);
+            let _ = emu.write_reg("x0", result);
+            if lr != 0 {
+                let _ = emu.write_reg("pc", lr);
+            }
+        },
+    )?;
+    Ok(())
+}
+
 pub fn install_apple_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
+    stub_region: StubRegion,
+    stub_name_map: Arc<Mutex<HashMap<u64, String>>>,
+    next_dynamic_stub_addr: Arc<Mutex<u64>>,
     trace_bus: &Option<SharedTraceBus>,
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
     process_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = runtime_process_metadata(process_name.to_string());
+
+    install_dynamic_dispatch_hook(
+        emulator,
+        stub_region,
+        stub_name_map,
+        next_dynamic_stub_addr,
+        shared_state.apple_runtime.clone(),
+        trace_bus.clone(),
+        import_tracker.clone(),
+        metadata.clone(),
+    )?;
+
+    for symbol in [
+        "_CFStringCreateWithCString",
+        "_CFStringGetCString",
+        "_CFStringGetLength",
+        "_SecRandomCopyBytes",
+        "_SecCopyErrorMessageString",
+    ] {
+        if let Some(&addr) = stub_map.get(symbol) {
+            install_dispatch_hook(
+                emulator,
+                addr,
+                symbol,
+                shared_state.apple_runtime.clone(),
+                trace_bus.clone(),
+                import_tracker.clone(),
+                metadata.clone(),
+            )?;
+        }
+    }
 
     if let Some(&addr) = stub_map.get("_CFStringCreateWithBytes") {
         let apple_runtime = shared_state.apple_runtime.clone();
