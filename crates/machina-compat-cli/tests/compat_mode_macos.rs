@@ -3007,6 +3007,222 @@ int main(void) {
     binary
 }
 
+#[cfg(target_os = "macos")]
+fn compile_arm64_foundation_startup_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_foundation_startup_compat.c");
+    let binary = out_dir.join("arm64_foundation_startup_compat");
+    fs::write(
+        &source,
+        r#"#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+extern void *NSHomeDirectory(void);
+extern void *NSTemporaryDirectory(void);
+extern void *NSUserName(void);
+extern void *NSSearchPathForDirectoriesInDomains(uintptr_t, uintptr_t, unsigned char);
+extern void *NSSelectorFromString(void *);
+extern void *NSStringFromSelector(void *);
+extern void *objc_getClass(const char *);
+extern void *sel_registerName(const char *);
+extern uintptr_t objc_msgSend(void *, void *, ...);
+
+typedef void *(*ns_string_noargs_fn)(void);
+typedef void *(*ns_search_paths_fn)(uintptr_t, uintptr_t, unsigned char);
+typedef void *(*ns_selector_from_string_fn)(void *);
+typedef void *(*ns_string_from_selector_fn)(void *);
+
+enum {
+    NSDocumentDirectoryCompat = 9,
+    NSCachesDirectoryCompat = 13,
+    NSUserDomainMaskCompat = 1,
+};
+
+static void *cls(const char *name) {
+    return objc_getClass(name);
+}
+
+static void *sel(const char *name) {
+    return sel_registerName(name);
+}
+
+static void *msg0_obj(void *receiver, const char *selector) {
+    return (void *)objc_msgSend(receiver, sel(selector));
+}
+
+static void *msg1_obj(void *receiver, const char *selector, void *arg0) {
+    return (void *)objc_msgSend(receiver, sel(selector), arg0);
+}
+
+static void *msg2_obj(void *receiver, const char *selector, void *arg0, void *arg1) {
+    return (void *)objc_msgSend(receiver, sel(selector), arg0, arg1);
+}
+
+static uintptr_t msg0_uint(void *receiver, const char *selector) {
+    return objc_msgSend(receiver, sel(selector));
+}
+
+static uintptr_t msg2_uint(void *receiver, const char *selector, void *arg0, void *arg1) {
+    return objc_msgSend(receiver, sel(selector), arg0, arg1);
+}
+
+static const char *utf8_or_null(void *value) {
+    if (!value) {
+        return "<null>";
+    }
+    const char *text = (const char *)objc_msgSend(value, sel("UTF8String"));
+    return text ? text : "<null>";
+}
+
+static int has_text(void *value) {
+    const char *text = utf8_or_null(value);
+    return text && text[0] != 0 && strcmp(text, "<null>") != 0;
+}
+
+static void *ns_string(const char *text) {
+    return msg1_obj(cls("NSString"), "stringWithUTF8String:", (void *)text);
+}
+
+int main(void) {
+    void *home = NSHomeDirectory();
+    void *temp = NSTemporaryDirectory();
+    void *user = NSUserName();
+    void *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectoryCompat, NSUserDomainMaskCompat, 1);
+    uintptr_t path_count = msg0_uint(paths, "count");
+    void *first_path = path_count ? msg1_obj(paths, "objectAtIndex:", 0) : 0;
+
+    void *process = msg0_obj(cls("NSProcessInfo"), "processInfo");
+    void *process_name = msg0_obj(process, "processName");
+    void *arguments = msg0_obj(process, "arguments");
+    void *environment = msg0_obj(process, "environment");
+    void *home_key = ns_string("HOME");
+    void *home_value = msg1_obj(environment, "objectForKey:", home_key);
+
+    void *bundle = msg0_obj(cls("NSBundle"), "mainBundle");
+    void *bundle_path = msg0_obj(bundle, "bundlePath");
+    void *info = msg0_obj(bundle, "infoDictionary");
+    void *bundle_key = ns_string("CFBundleExecutable");
+    void *bundle_exe = msg1_obj(bundle, "objectForInfoDictionaryKey:", bundle_key);
+    if (!bundle_exe) {
+        bundle_exe = msg1_obj(info, "objectForKey:", bundle_key);
+    }
+
+    void *fm = msg0_obj(cls("NSFileManager"), "defaultManager");
+    void *cwd = msg0_obj(fm, "currentDirectoryPath");
+    unsigned char is_dir = 0;
+    uintptr_t cwd_exists = msg2_uint(fm, "fileExistsAtPath:isDirectory:", cwd, &is_dir);
+    void *cwd_entries = msg2_obj(fm, "contentsOfDirectoryAtPath:error:", cwd, 0);
+    uintptr_t entry_count = msg0_uint(cwd_entries, "count");
+
+    int static_ok = has_text(home)
+        && has_text(temp)
+        && has_text(user)
+        && path_count > 0
+        && has_text(first_path)
+        && has_text(process_name)
+        && msg0_uint(arguments, "count") > 0
+        && has_text(home_value)
+        && has_text(bundle_path)
+        && has_text(bundle_exe)
+        && cwd_exists
+        && is_dir
+        && entry_count > 0;
+
+    printf(
+        "compat foundation static home=%s temp=%s user=%s paths=%lu first=%s process=%s args=%lu env_home=%s bundle=%s exe=%s cwd=%s exists=%lu isdir=%u entries=%lu pass=%d\n",
+        utf8_or_null(home),
+        utf8_or_null(temp),
+        utf8_or_null(user),
+        (unsigned long)path_count,
+        utf8_or_null(first_path),
+        utf8_or_null(process_name),
+        (unsigned long)msg0_uint(arguments, "count"),
+        utf8_or_null(home_value),
+        utf8_or_null(bundle_path),
+        utf8_or_null(bundle_exe),
+        utf8_or_null(cwd),
+        (unsigned long)cwd_exists,
+        (unsigned int)is_dir,
+        (unsigned long)entry_count,
+        static_ok
+    );
+
+    void *foundation = dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW);
+    ns_string_noargs_fn dyn_home = (ns_string_noargs_fn)dlsym(foundation, "NSHomeDirectory");
+    ns_string_noargs_fn dyn_temp = (ns_string_noargs_fn)dlsym(foundation, "NSTemporaryDirectory");
+    ns_search_paths_fn dyn_paths = (ns_search_paths_fn)dlsym(foundation, "NSSearchPathForDirectoriesInDomains");
+    ns_selector_from_string_fn dyn_selector = (ns_selector_from_string_fn)dlsym(foundation, "NSSelectorFromString");
+    ns_string_from_selector_fn dyn_selector_name = (ns_string_from_selector_fn)dlsym(foundation, "NSStringFromSelector");
+
+    void *dyn_home_value = dyn_home ? dyn_home() : 0;
+    void *dyn_temp_value = dyn_temp ? dyn_temp() : 0;
+    void *dyn_path_values = dyn_paths ? dyn_paths(NSCachesDirectoryCompat, NSUserDomainMaskCompat, 1) : 0;
+    void *dyn_sel = dyn_selector ? dyn_selector(ns_string("processName")) : 0;
+    void *dyn_sel_name = dyn_selector_name && dyn_sel ? dyn_selector_name(dyn_sel) : 0;
+    int dyn_ok = dyn_home
+        && dyn_temp
+        && dyn_paths
+        && dyn_selector
+        && dyn_selector_name
+        && has_text(dyn_home_value)
+        && has_text(dyn_temp_value)
+        && msg0_uint(dyn_path_values, "count") > 0
+        && dyn_sel
+        && strcmp(utf8_or_null(dyn_sel_name), "processName") == 0;
+
+    printf(
+        "compat foundation dlsym ptrs home=%p temp=%p paths=%p selector=%p selname=%p\n",
+        (void *)dyn_home,
+        (void *)dyn_temp,
+        (void *)dyn_paths,
+        (void *)dyn_selector,
+        (void *)dyn_selector_name
+    );
+    printf(
+        "compat foundation dlsym home=%s temp=%s paths=%lu sel=%s pass=%d\n",
+        utf8_or_null(dyn_home_value),
+        utf8_or_null(dyn_temp_value),
+        dyn_path_values ? (unsigned long)msg0_uint(dyn_path_values, "count") : 0UL,
+        utf8_or_null(dyn_sel_name),
+        dyn_ok
+    );
+    return static_ok && dyn_ok ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 Foundation startup fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-framework")
+        .arg("Foundation")
+        .arg("-lobjc")
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 Foundation startup fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 Foundation startup fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn compat_mode_smoke_is_macos_only() {
@@ -3654,6 +3870,92 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
             "compat apple dlsym cf ok=1 len=6 text=dyn-cf random=0 nonzero=1 err=1"
         ) && line.contains(" pass=1")),
         "Apple framework fixture did not complete dlsym CoreFoundation/Security calls; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_proxies_foundation_startup_glue() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode Foundation startup test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_foundation_startup_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(foundation startup): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(foundation startup): status={status}");
+    eprintln!("compat proof(foundation startup): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(foundation startup): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("compat foundation static ")
+            && line.contains(" paths=")
+            && line.contains(" process=")
+            && line.contains(" args=")
+            && line.contains(" env_home=")
+            && line.contains(" bundle=")
+            && line.contains(" exists=1 isdir=1 ")
+            && line.contains(" pass=1")),
+        "Foundation startup fixture did not complete static NSProcessInfo/NSBundle/NSFileManager glue; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat foundation dlsym ptrs home=0x")
+            && stdout.contains(" temp=0x")
+            && stdout.contains(" paths=0x")
+            && stdout.contains(" selector=0x")
+            && stdout.contains(" selname=0x"),
+        "Foundation startup fixture did not receive dlsym Foundation trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat foundation dlsym ")
+                && line.contains(" paths=")
+                && line.contains(" sel=processName")
+                && line.contains(" pass=1")),
+        "Foundation startup fixture did not complete dlsym Foundation calls; stdout:\n{stdout}"
     );
 }
 
