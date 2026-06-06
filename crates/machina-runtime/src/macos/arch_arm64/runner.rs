@@ -5,6 +5,7 @@ use crate::macos::analysis_arm64_cpp_imports::{
 };
 use crate::macos::apple_imports::install_apple_imports;
 use crate::macos::arm64_dynamic_imports::install_arm64_dynamic_imports;
+use crate::macos::arm64_import_stubs::arm64_import_can_resolve_to_guest_library;
 use crate::macos::binary_bootstrap::{map_binary_segments, setup_bootstrap_state};
 use crate::macos::binary_setup::{
     find_runtime_symbols, install_arm64_indirect_branch_hooks, install_arm64_lse_atomic_hooks,
@@ -21,8 +22,10 @@ use crate::macos::runner_support::{
 use crate::macos::runtime_hooks::install_runtime_hooks;
 use crate::macos::time_imports::install_time_imports;
 use crate::macos::{
-    default_guest_fs_base, ensure_macho_cpu, install_runtime_plugins, process_event, MacosCpu,
-    RuntimeContext, RuntimeMode, SyscallRuntimePlugin, TraceMetadata,
+    align_up, default_guest_fs_base, ensure_macho_cpu, install_runtime_plugins, process_event,
+    GuestImageRegistry, GuestLibraryChainedFixupReport, GuestLibraryImage, GuestLibrarySet,
+    MacosCpu, RuntimeContext, RuntimeMode, SyscallRuntimePlugin, TraceMetadata,
+    MACHINA_GUEST_LIBS_ENV,
 };
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
@@ -31,10 +34,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const INDIRECT_BRANCH_MODE_ENV: &str = "MACHINA_INDIRECT_BRANCH_MODE";
+const GUEST_LIBRARY_LOAD_GAP: u64 = 0x10000;
 
 fn section_pointer_values(
     emulator: &mut UnicornEmulator,
     binary: &MachoBinary,
+    section_name: &str,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    section_pointer_values_with_slide(emulator, binary, 0, section_name)
+}
+
+fn section_pointer_values_with_slide(
+    emulator: &mut UnicornEmulator,
+    binary: &MachoBinary,
+    slide: u64,
     section_name: &str,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let section = binary
@@ -60,7 +73,7 @@ fn section_pointer_values(
 
     let mut values = Vec::with_capacity((sec.size / 8) as usize);
     for i in 0..(sec.size / 8) as usize {
-        let slot_addr = sec.addr + (i as u64) * 8;
+        let slot_addr = sec.addr.wrapping_add(slide) + (i as u64) * 8;
         let bytes = emulator.read_memory(slot_addr, 8)?;
         let arr: [u8; 8] = bytes
             .try_into()
@@ -71,6 +84,19 @@ fn section_pointer_values(
         }
     }
     Ok(values)
+}
+
+fn guest_library_runtime_pointer(image: &GuestLibraryImage, address: u64) -> Option<u64> {
+    if address == 0 {
+        return None;
+    }
+    let runtime_address = if address >= image.vm_range.start && address < image.vm_range.end {
+        address.wrapping_add(image.slide)
+    } else {
+        address
+    };
+    (runtime_address >= image.mapped_range.start && runtime_address < image.mapped_range.end)
+        .then_some(runtime_address)
 }
 
 /// Build a synthetic trampoline that invokes each
@@ -89,6 +115,7 @@ fn build_mod_init_trampoline(
     binary: &MachoBinary,
     mmap_next: &Arc<AtomicU64>,
     mmap_end: u64,
+    pre_main_init_addrs: &[u64],
     main_addr: u64,
     done_addr: u64,
     trace_bus: &Option<SharedTraceBus>,
@@ -97,7 +124,9 @@ fn build_mod_init_trampoline(
     // Read every initializer address out of guest memory — the
     // chained-fixups pass has already replaced the on-disk chain
     // entries with resolved absolute addresses.
-    let init_addrs = section_pointer_values(emulator, binary, "__mod_init_func")?;
+    let main_init_addrs = section_pointer_values(emulator, binary, "__mod_init_func")?;
+    let mut init_addrs = pre_main_init_addrs.to_vec();
+    init_addrs.extend(main_init_addrs.iter().copied());
     if init_addrs.is_empty() {
         return Ok(None);
     }
@@ -196,6 +225,8 @@ fn build_mod_init_trampoline(
                 .arg("Base", format!("0x{:X}", base))
                 .arg("Size", format!("0x{:X}", code.len()))
                 .arg("InitCount", init_addrs.len().to_string())
+                .arg("GuestInitCount", pre_main_init_addrs.len().to_string())
+                .arg("MainInitCount", main_init_addrs.len().to_string())
                 .arg("FirstInit", format!("0x{:X}", init_addrs[0]))
                 .arg("MainAddr", format!("0x{:X}", main_addr))
                 .arg("DoneAddr", format!("0x{:X}", done_addr)),
@@ -227,6 +258,276 @@ impl IndirectBranchMode {
         match self {
             Self::Fast => "fast",
             Self::Sanitize => "sanitize",
+        }
+    }
+}
+
+fn map_guest_libraries_from_env(
+    emulator: &mut UnicornEmulator,
+    max_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) -> Result<GuestLibrarySet, Box<dyn std::error::Error>> {
+    let load_base = align_up(
+        max_addr.saturating_add(GUEST_LIBRARY_LOAD_GAP),
+        GUEST_LIBRARY_LOAD_GAP,
+    );
+    let guest_libraries = GuestLibrarySet::from_env(load_base)?;
+    if guest_libraries.is_empty() {
+        return Ok(guest_libraries);
+    }
+
+    guest_libraries.map_into(emulator)?;
+    if let Some(bus) = trace_bus {
+        let _ = bus.send(
+            process_event(metadata, "guest-libraries", "guest_libraries")
+                .arg("Env", MACHINA_GUEST_LIBS_ENV)
+                .arg("Count", guest_libraries.image_count().to_string())
+                .arg("Exports", guest_libraries.export_count().to_string())
+                .arg("MappedEnd", format!("0x{:X}", guest_libraries.mapped_end())),
+        );
+        for image in guest_libraries.images() {
+            let _ = bus.send(
+                process_event(metadata, "guest-library", "guest_library")
+                    .arg("Path", image.path.display().to_string())
+                    .arg(
+                        "InstallName",
+                        image
+                            .install_name
+                            .clone()
+                            .unwrap_or_else(|| "<none>".to_string()),
+                    )
+                    .arg("LoadBase", format!("0x{:X}", image.load_base))
+                    .arg("Slide", format!("0x{:X}", image.slide))
+                    .arg("Exports", image.export_count().to_string()),
+            );
+        }
+    }
+
+    Ok(guest_libraries)
+}
+
+fn emit_guest_image_registry_trace(
+    registry: &GuestImageRegistry,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) {
+    let Some(bus) = trace_bus else {
+        return;
+    };
+    let _ = bus.send(
+        process_event(metadata, "guest-image-registry", "guest_image_registry")
+            .arg("Images", registry.image_count().to_string())
+            .arg("Libraries", registry.library_count().to_string())
+            .arg(
+                "MappedStart",
+                registry
+                    .mapped_start()
+                    .map(|addr| format!("0x{:X}", addr))
+                    .unwrap_or_else(|| "0x0".to_string()),
+            )
+            .arg(
+                "MappedEnd",
+                registry
+                    .mapped_end()
+                    .map(|addr| format!("0x{:X}", addr))
+                    .unwrap_or_else(|| "0x0".to_string()),
+            ),
+    );
+    for record in registry.records() {
+        let _ = bus.send(
+            process_event(metadata, "guest-image", "guest_image")
+                .arg("Index", record.index.to_string())
+                .arg("Kind", record.kind.as_str())
+                .arg("Path", record.path.display().to_string())
+                .arg(
+                    "InstallName",
+                    record
+                        .install_name
+                        .clone()
+                        .unwrap_or_else(|| "<none>".to_string()),
+                )
+                .arg("Slide", format!("0x{:X}", record.slide))
+                .arg("VmStart", format!("0x{:X}", record.vm_range.start))
+                .arg("VmEnd", format!("0x{:X}", record.vm_range.end))
+                .arg("MappedStart", format!("0x{:X}", record.mapped_range.start))
+                .arg("MappedEnd", format!("0x{:X}", record.mapped_range.end))
+                .arg("Exports", record.export_count.to_string()),
+        );
+    }
+}
+
+fn emit_guest_library_chained_fixup_reports(
+    reports: &[GuestLibraryChainedFixupReport],
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) {
+    let Some(bus) = trace_bus else {
+        return;
+    };
+    for report in reports {
+        if let Some(stats) = report.stats {
+            if stats.bound + stats.rebased + stats.unresolved == 0 {
+                continue;
+            }
+            let _ = bus.send(
+                process_event(
+                    metadata,
+                    "guest-library-chained-fixups",
+                    "guest_library_chained_fixups",
+                )
+                .arg("Path", report.path.display().to_string())
+                .arg(
+                    "InstallName",
+                    report
+                        .install_name
+                        .clone()
+                        .unwrap_or_else(|| "<none>".to_string()),
+                )
+                .arg("Bound", stats.bound.to_string())
+                .arg("Rebased", stats.rebased.to_string())
+                .arg("Unresolved", stats.unresolved.to_string()),
+            );
+        } else if let Some(error) = &report.error {
+            let _ = bus.send(
+                process_event(
+                    metadata,
+                    "guest-library-chained-fixups-error",
+                    "guest_library_chained_fixups",
+                )
+                .arg("Path", report.path.display().to_string())
+                .arg(
+                    "InstallName",
+                    report
+                        .install_name
+                        .clone()
+                        .unwrap_or_else(|| "<none>".to_string()),
+                )
+                .arg("Error", error.clone()),
+            );
+        }
+    }
+}
+
+fn collect_guest_library_mod_init_entries(
+    emulator: &mut UnicornEmulator,
+    guest_libraries: &GuestLibrarySet,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) -> Vec<u64> {
+    let mut entries = Vec::new();
+    for image in guest_libraries.images() {
+        match section_pointer_values_with_slide(
+            emulator,
+            &image.binary,
+            image.slide,
+            "__mod_init_func",
+        ) {
+            Ok(raw_addrs) if !raw_addrs.is_empty() => {
+                let init_addrs = raw_addrs
+                    .into_iter()
+                    .filter_map(|addr| guest_library_runtime_pointer(image, addr))
+                    .collect::<Vec<_>>();
+                if init_addrs.is_empty() {
+                    continue;
+                }
+                if let Some(bus) = trace_bus {
+                    let _ = bus.send(
+                        memory_event(metadata, "guest-library-mod-init-handlers")
+                            .arg("Path", image.path.display().to_string())
+                            .arg(
+                                "InstallName",
+                                image
+                                    .install_name
+                                    .clone()
+                                    .unwrap_or_else(|| "<none>".to_string()),
+                            )
+                            .arg("Count", init_addrs.len().to_string())
+                            .arg("First", format!("0x{:X}", init_addrs[0])),
+                    );
+                }
+                entries.extend(init_addrs);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if let Some(bus) = trace_bus {
+                    let _ = bus.send(
+                        memory_event(metadata, "guest-library-mod-init-error")
+                            .arg("Path", image.path.display().to_string())
+                            .arg("Error", format!("{}", err)),
+                    );
+                }
+            }
+        }
+    }
+    entries
+}
+
+fn register_mod_term_handlers(
+    shared_state: &crate::macos::arm64_state::Arm64SharedState,
+    functions: &[u64],
+) {
+    if let Ok(mut handlers) = shared_state.exit_handlers.lock() {
+        for function in functions.iter().copied() {
+            handlers.push(Arm64ExitHandler {
+                function,
+                argument: 0,
+                dso_handle: 0,
+                kind: Arm64ExitHandlerKind::ModTerm,
+            });
+        }
+    }
+}
+
+fn register_guest_library_mod_term_handlers(
+    emulator: &mut UnicornEmulator,
+    guest_libraries: &GuestLibrarySet,
+    shared_state: &crate::macos::arm64_state::Arm64SharedState,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+) {
+    for image in guest_libraries.images() {
+        match section_pointer_values_with_slide(
+            emulator,
+            &image.binary,
+            image.slide,
+            "__mod_term_func",
+        ) {
+            Ok(raw_addrs) if !raw_addrs.is_empty() => {
+                let term_addrs = raw_addrs
+                    .into_iter()
+                    .filter_map(|addr| guest_library_runtime_pointer(image, addr))
+                    .collect::<Vec<_>>();
+                if term_addrs.is_empty() {
+                    continue;
+                }
+                register_mod_term_handlers(shared_state, &term_addrs);
+                if let Some(bus) = trace_bus {
+                    let _ = bus.send(
+                        memory_event(metadata, "guest-library-mod-term-handlers")
+                            .arg("Path", image.path.display().to_string())
+                            .arg(
+                                "InstallName",
+                                image
+                                    .install_name
+                                    .clone()
+                                    .unwrap_or_else(|| "<none>".to_string()),
+                            )
+                            .arg("Count", term_addrs.len().to_string())
+                            .arg("First", format!("0x{:X}", term_addrs[0])),
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if let Some(bus) = trace_bus {
+                    let _ = bus.send(
+                        memory_event(metadata, "guest-library-mod-term-error")
+                            .arg("Path", image.path.display().to_string())
+                            .arg("Error", format!("{}", err)),
+                    );
+                }
+            }
         }
     }
 }
@@ -289,7 +590,19 @@ pub fn emulate_macos_arm64_binary_with_mode(
     let sp = (stack_base + stack_size - 16) & !0xF;
     emulator.write_reg("sp", sp)?;
 
-    let max_addr = map_binary_segments(&mut emulator, &binary, &trace_bus, process_name)?;
+    let mut max_addr = map_binary_segments(&mut emulator, &binary, &trace_bus, process_name)?;
+    let guest_libraries =
+        map_guest_libraries_from_env(&mut emulator, max_addr, &trace_bus, &metadata)?;
+    if !guest_libraries.is_empty() {
+        max_addr = max_addr.max(guest_libraries.mapped_end());
+    }
+    let guest_images = GuestImageRegistry::from_loaded_images(
+        std::path::Path::new(binary_path),
+        &binary,
+        0,
+        &guest_libraries,
+    );
+    emit_guest_image_registry_trace(&guest_images, &trace_bus, &metadata);
     let bootstrap_state = setup_bootstrap_state(
         &mut emulator,
         &binary,
@@ -348,6 +661,22 @@ pub fn emulate_macos_arm64_binary_with_mode(
             }
         }
     }
+    let guest_import_report = guest_libraries.extend_undefined_imports(&mut undefs);
+    if guest_import_report.added > 0 || !guest_import_report.errors.is_empty() {
+        if let Some(bus) = &trace_bus {
+            let mut event = process_event(
+                &metadata,
+                "guest-library-import-set",
+                "guest_library_import_set",
+            )
+            .arg("Added", guest_import_report.added.to_string())
+            .arg("Total", guest_import_report.total.to_string());
+            if !guest_import_report.errors.is_empty() {
+                event = event.arg("Errors", guest_import_report.errors.join("; "));
+            }
+            let _ = bus.send(event);
+        }
+    }
     if let Some(bus) = &trace_bus {
         let preview = undefs
             .iter()
@@ -385,6 +714,38 @@ pub fn emulate_macos_arm64_binary_with_mode(
     for (name, addr) in stub_map.clone() {
         let normalized = crate::macos::imports::normalize_import_symbol(name);
         stub_map.entry(normalized).or_insert(addr);
+    }
+    let guest_library_bindings =
+        guest_libraries.apply_import_bindings(&undefs, &mut stub_map, |name| {
+            arm64_import_can_resolve_to_guest_library(name, runtime_mode)
+        });
+    if !guest_library_bindings.is_empty() {
+        if let Some(bus) = &trace_bus {
+            let preview = guest_library_bindings
+                .iter()
+                .take(8)
+                .map(|binding| {
+                    format!(
+                        "{}=0x{:X}({})",
+                        binding.import_name,
+                        binding.address,
+                        binding.install_name.as_deref().unwrap_or_else(|| {
+                            binding.library_path.to_str().unwrap_or("<guest-lib>")
+                        })
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = bus.send(
+                process_event(
+                    &metadata,
+                    "guest-library-bindings",
+                    "guest_library_bindings",
+                )
+                .arg("Count", guest_library_bindings.len().to_string())
+                .arg("Preview", preview),
+            );
+        }
     }
 
     let analysis_hook_plan = prepare_analysis_arm64_hooks(
@@ -431,6 +792,13 @@ pub fn emulate_macos_arm64_binary_with_mode(
             }
         }
     }
+    let guest_library_fixup_reports = guest_libraries.process_chained_fixups(
+        &mut emulator,
+        &stub_map,
+        Some(&analysis_hook_plan.cpp_data_symbols),
+        done_addr,
+    );
+    emit_guest_library_chained_fixup_reports(&guest_library_fixup_reports, &trace_bus, &metadata);
     install_prepared_analysis_arm64_hooks(
         analysis_hook_plan,
         &mut emulator,
@@ -505,6 +873,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &trace_bus,
         &shared_state,
         &import_tracker,
+        &guest_libraries,
         &process_name,
     )?;
 
@@ -580,18 +949,16 @@ pub fn emulate_macos_arm64_binary_with_mode(
     install_runtime_plugins(&mut emulator, &runtime_context, &[&SyscallRuntimePlugin])?;
 
     if runtime_mode.is_compat() {
+        register_guest_library_mod_term_handlers(
+            &mut emulator,
+            &guest_libraries,
+            &shared_state,
+            &trace_bus,
+            &metadata,
+        );
         match section_pointer_values(&mut emulator, &binary, "__mod_term_func") {
             Ok(term_addrs) if !term_addrs.is_empty() => {
-                if let Ok(mut handlers) = shared_state.exit_handlers.lock() {
-                    for function in term_addrs.iter().copied() {
-                        handlers.push(Arm64ExitHandler {
-                            function,
-                            argument: 0,
-                            dso_handle: 0,
-                            kind: Arm64ExitHandlerKind::ModTerm,
-                        });
-                    }
-                }
+                register_mod_term_handlers(&shared_state, &term_addrs);
                 if let Some(bus) = &trace_bus {
                     let _ = bus.send(
                         memory_event(&metadata, "mod-term-handlers")
@@ -612,6 +979,12 @@ pub fn emulate_macos_arm64_binary_with_mode(
     }
 
     let actual_entry = resolve_entry(&binary);
+    let guest_init_addrs = collect_guest_library_mod_init_entries(
+        &mut emulator,
+        &guest_libraries,
+        &trace_bus,
+        &metadata,
+    );
 
     // Optional: build a synthetic trampoline that calls every
     // __mod_init_func entry before transferring control to _main.
@@ -626,6 +999,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &binary,
         &mmap_next,
         mmap_end,
+        &guest_init_addrs,
         actual_entry,
         done_addr,
         &trace_bus,

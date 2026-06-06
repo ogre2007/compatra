@@ -92,7 +92,7 @@ fn arm64_import_has_analysis_runtime_hook(symbol: &str) -> bool {
     )
 }
 
-fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> bool {
+pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> bool {
     if arm64_import_has_analysis_runtime_hook(symbol) {
         return runtime_mode.is_analysis();
     }
@@ -234,6 +234,18 @@ fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> boo
     )
 }
 
+pub(crate) fn arm64_import_can_resolve_to_guest_library(
+    symbol: &str,
+    runtime_mode: RuntimeMode,
+) -> bool {
+    if CompatibilityServices::for_mode(runtime_mode)
+        .is_some_and(|compat| compat.should_proxy_import(symbol))
+    {
+        return false;
+    }
+    !arm64_import_has_runtime_hook(symbol, runtime_mode)
+}
+
 fn arm64_stub_bucket_is_reserved(stub_region: StubRegion, bucket: u64) -> bool {
     bucket == stub_region.done_addr || Some(bucket) == stub_region.thread_exit_stub
 }
@@ -276,6 +288,22 @@ mod tests {
     }
 
     #[test]
+    fn guest_library_resolution_only_covers_unhandled_imports() {
+        assert!(arm64_import_can_resolve_to_guest_library(
+            "__ZN5guest3runEv",
+            RuntimeMode::Compat
+        ));
+        assert!(!arm64_import_can_resolve_to_guest_library(
+            "_open",
+            RuntimeMode::Compat
+        ));
+        assert!(!arm64_import_can_resolve_to_guest_library(
+            "_CFStringCreateWithBytes",
+            RuntimeMode::Compat
+        ));
+    }
+
+    #[test]
     fn runtime_hook_classifier_covers_cf_bundle_and_iokit_compat_imports() {
         for symbol in [
             "_CFStringGetCStringPtr",
@@ -292,6 +320,62 @@ mod tests {
             "_IOIteratorNext",
             "_IORegistryEntryCreateCFProperty",
             "_IOObjectRelease",
+        ] {
+            assert!(
+                arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
+                "{symbol} should be dispatched by the arm64 compat runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_hook_classifier_covers_corefoundation_object_compat_imports() {
+        for symbol in [
+            "_CFStringCreateWithBytes",
+            "_CFStringCreateExternalRepresentation",
+            "_CFStringGetTypeID",
+            "_CFDataCreate",
+            "_CFDataGetLength",
+            "_CFDataGetBytePtr",
+            "_CFDataGetTypeID",
+            "_CFArrayCreateMutable",
+            "_CFArrayCreate",
+            "_CFArrayAppendValue",
+            "_CFArrayGetCount",
+            "_CFArrayGetValueAtIndex",
+            "_CFArrayGetTypeID",
+            "_CFDictionaryCreate",
+            "_CFDictionaryGetValueIfPresent",
+            "_CFDictionaryGetTypeID",
+            "_CFDateCreate",
+            "_CFErrorCreate",
+            "_CFErrorGetCode",
+            "_CFErrorCopyDescription",
+            "_CFGetTypeID",
+            "_CFNumberGetTypeID",
+            "_CFNumberGetValue",
+            "_CFBooleanGetTypeID",
+            "_CFBooleanGetValue",
+            "_xpc_date_create_from_current",
+        ] {
+            assert!(
+                arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
+                "{symbol} should be dispatched by the arm64 compat runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_hook_classifier_covers_security_object_compat_imports() {
+        for symbol in [
+            "_SecCertificateCreateWithData",
+            "_SecCertificateCopyData",
+            "_SecPolicyCreateSSL",
+            "_SecTrustCreateWithCertificates",
+            "_SecTrustEvaluateWithError",
+            "_SecTrustGetCertificateCount",
+            "_SecTrustGetCertificateAtIndex",
+            "_SecTrustSetVerifyDate",
         ] {
             assert!(
                 arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),

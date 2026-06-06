@@ -130,6 +130,14 @@ add new ones):
   is `--compat-log-filter`.
 - `MACHINA_COMPAT_LOG_PREVIEW_BYTES` — byte cap for escaped text/hex previews
   in compat I/O logs; CLI form is `--compat-log-preview-bytes`.
+- `MACHINA_GUEST_LIBS` — opt-in guest-side arm64 Mach-O dylib support for the
+  no-dyld runner. Values use the host path-list separator and may also contain
+  comma-separated entries; entries can be dylib files, directories of dylibs, or
+  `.framework` directories. Loaded guest-library exports are mapped into guest
+  memory and used for otherwise unhandled static/chained imports and `dlsym`
+  lookups. The loader also records these images in `GuestImageRegistry` and
+  emits `guest-image-registry` / `guest-image` trace events. This is not a full
+  dyld replacement.
 - `MACHINA_TRACE_WINDOW_START` / `_END` / `_HITS` — bounded instruction trace
   window for arm64 diagnostics.
 - `MACHINA_INDIRECT_BRANCH_MODE` — `fast` (default) or `sanitize`.

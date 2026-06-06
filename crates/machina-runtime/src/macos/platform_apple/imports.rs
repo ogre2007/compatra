@@ -23,14 +23,36 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
     matches!(
         normalized_apple_symbol(symbol),
         "CFStringCreateWithCString"
+            | "CFStringCreateWithBytes"
+            | "CFStringCreateExternalRepresentation"
             | "CFStringGetCString"
             | "CFStringGetLength"
+            | "CFStringGetTypeID"
             | "CFDataCreate"
             | "CFDataGetLength"
             | "CFDataGetBytePtr"
+            | "CFDataGetTypeID"
             | "CFStringCompare"
             | "CFStringCreateCopy"
             | "CFStringGetCStringPtr"
+            | "CFArrayCreateMutable"
+            | "CFArrayCreate"
+            | "CFArrayAppendValue"
+            | "CFArrayGetCount"
+            | "CFArrayGetValueAtIndex"
+            | "CFArrayGetTypeID"
+            | "CFDictionaryCreate"
+            | "CFDictionaryGetValueIfPresent"
+            | "CFDictionaryGetTypeID"
+            | "CFDateCreate"
+            | "CFErrorCreate"
+            | "CFErrorGetCode"
+            | "CFErrorCopyDescription"
+            | "CFGetTypeID"
+            | "CFNumberGetTypeID"
+            | "CFNumberGetValue"
+            | "CFBooleanGetTypeID"
+            | "CFBooleanGetValue"
             | "CFURLCreateWithFileSystemPath"
             | "CFURLCopyFileSystemPath"
             | "CFBundleGetMainBundle"
@@ -88,6 +110,15 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "NSLog"
             | "SecRandomCopyBytes"
             | "SecCopyErrorMessageString"
+            | "SecCertificateCreateWithData"
+            | "SecCertificateCopyData"
+            | "SecPolicyCreateSSL"
+            | "SecTrustCreateWithCertificates"
+            | "SecTrustEvaluateWithError"
+            | "SecTrustGetCertificateCount"
+            | "SecTrustGetCertificateAtIndex"
+            | "SecTrustSetVerifyDate"
+            | "xpc_date_create_from_current"
     )
 }
 
@@ -151,9 +182,15 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_CFStringCreateWithCString",
     "_CFStringGetCString",
     "_CFStringGetLength",
+    "_CFStringGetTypeID",
     "_CFStringGetCStringPtr",
     "_CFStringCreateCopy",
     "_CFStringCompare",
+    "_CFDataGetTypeID",
+    "_CFArrayGetTypeID",
+    "_CFDictionaryGetTypeID",
+    "_CFBooleanGetTypeID",
+    "_CFBooleanGetValue",
     "_CFURLCreateWithFileSystemPath",
     "_CFURLCopyFileSystemPath",
     "_CFBundleGetMainBundle",
@@ -1329,11 +1366,33 @@ fn register_host_cf_value_with_ownership(
                 if owned {
                     host_cf_release(cf);
                 }
-                return runtime.alloc_number(value as i64);
+                return runtime.alloc_boolean(value);
             }
         }
     }
     runtime.register_host_opaque(fallback_kind, cf)
+}
+
+fn runtime_cf_type_id_or_host(runtime: &crate::macos::AppleRuntime, cf: u64) -> u64 {
+    let synthetic = runtime.type_id(cf);
+    if synthetic != 0 {
+        return synthetic;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        runtime
+            .host_ptr_or_raw_unknown(cf)
+            .and_then(host_cf_get_type_id)
+            .unwrap_or(0)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = runtime;
+        let _ = cf;
+        0
+    }
 }
 
 fn runtime_object_data_or_host_cfstring(
@@ -3121,6 +3180,61 @@ fn dispatch_apple_import(
             );
             Some(cmp as u64)
         }
+        "CFStringCreateWithBytes" => {
+            let bytes_ptr = emu.read_reg("x1").unwrap_or(0);
+            let len = emu.read_reg("x2").unwrap_or(0) as usize;
+            let encoding = emu.read_reg("x3").unwrap_or(0);
+            let data = read_guest_bytes(emu, bytes_ptr, len, 64 * 1024);
+            let string_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_string(data.clone(), encoding)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFStringCreateWithBytes(bytes=0x{:X}, len={}, enc=0x{:X}) -> 0x{:X}",
+                    bytes_ptr, len, encoding, string_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfstring", "CFStringCreateWithBytes")
+                    .arg("Bytes", format!("0x{:X}", bytes_ptr))
+                    .arg("Len", len.to_string())
+                    .arg("Encoding", format!("0x{:X}", encoding))
+                    .arg("Result", format!("0x{:X}", string_ref))
+                    .arg("Preview", lossy_data_preview(&data, 128))
+                    .arg("HostProxy", "false"),
+            );
+            Some(string_ref)
+        }
+        "CFStringCreateExternalRepresentation" => {
+            let string_ref = emu.read_reg("x1").unwrap_or(0);
+            let data_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let data = runtime.object_data(string_ref)?;
+                runtime.alloc_data(data)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFStringCreateExternalRepresentation(string=0x{:X}) -> 0x{:X}",
+                    string_ref, data_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfstring", "CFStringCreateExternalRepresentation")
+                    .arg("String", format!("0x{:X}", string_ref))
+                    .arg("Result", format!("0x{:X}", data_ref)),
+            );
+            Some(data_ref)
+        }
+        "CFStringGetTypeID" => {
+            let type_id = apple_runtime.lock().ok()?.string_type_id();
+            record_arm64_import(tracker, format!("_CFStringGetTypeID() -> 0x{:X}", type_id));
+            Some(type_id)
+        }
         "CFURLCreateWithFileSystemPath" => {
             let path_ref = emu.read_reg("x1").unwrap_or(0);
             let path_style = emu.read_reg("x2").unwrap_or(K_CFURL_POSIX_PATH_STYLE);
@@ -3289,6 +3403,268 @@ fn dispatch_apple_import(
             );
             Some(exported_ptr)
         }
+        "CFDataGetTypeID" => {
+            let type_id = apple_runtime.lock().ok()?.data_type_id();
+            record_arm64_import(tracker, format!("_CFDataGetTypeID() -> 0x{:X}", type_id));
+            Some(type_id)
+        }
+        "CFArrayCreateMutable" => {
+            let array_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_array()
+            };
+            record_arm64_import(
+                tracker,
+                format!("_CFArrayCreateMutable() -> 0x{:X}", array_ref),
+            );
+            Some(array_ref)
+        }
+        "CFArrayCreate" => {
+            let values_ptr = emu.read_reg("x1").unwrap_or(0);
+            let count = emu.read_reg("x2").unwrap_or(0) as usize;
+            let values = read_guest_u64_array(emu, values_ptr, count, 4096);
+            let array_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_array_with_values(values)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFArrayCreate(values=0x{:X}, count={}) -> 0x{:X}",
+                    values_ptr, count, array_ref
+                ),
+            );
+            Some(array_ref)
+        }
+        "CFArrayAppendValue" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let ok = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.array_append(array_ref, value_ref)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFArrayAppendValue(array=0x{:X}, value=0x{:X}) ok={}",
+                    array_ref, value_ref, ok
+                ),
+            );
+            Some(0)
+        }
+        "CFArrayGetCount" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let count = apple_runtime.lock().ok()?.array_len(array_ref).unwrap_or(0) as u64;
+            record_arm64_import(
+                tracker,
+                format!("_CFArrayGetCount(array=0x{:X}) -> {}", array_ref, count),
+            );
+            Some(count)
+        }
+        "CFArrayGetValueAtIndex" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let index = emu.read_reg("x1").unwrap_or(0) as usize;
+            let value_ref = apple_runtime
+                .lock()
+                .ok()?
+                .array_get(array_ref, index)
+                .unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFArrayGetValueAtIndex(array=0x{:X}, index={}) -> 0x{:X}",
+                    array_ref, index, value_ref
+                ),
+            );
+            Some(value_ref)
+        }
+        "CFArrayGetTypeID" => {
+            let type_id = apple_runtime.lock().ok()?.array_type_id();
+            record_arm64_import(tracker, format!("_CFArrayGetTypeID() -> 0x{:X}", type_id));
+            Some(type_id)
+        }
+        "CFDictionaryCreate" => {
+            let keys_ptr = emu.read_reg("x1").unwrap_or(0);
+            let values_ptr = emu.read_reg("x2").unwrap_or(0);
+            let count = emu.read_reg("x3").unwrap_or(0) as usize;
+            let keys = read_guest_u64_array(emu, keys_ptr, count, 4096);
+            let values = read_guest_u64_array(emu, values_ptr, count, 4096);
+            let entries = keys.into_iter().zip(values).collect::<Vec<_>>();
+            let dict_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_dictionary(entries)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFDictionaryCreate(keys=0x{:X}, values=0x{:X}, count={}) -> 0x{:X}",
+                    keys_ptr, values_ptr, count, dict_ref
+                ),
+            );
+            Some(dict_ref)
+        }
+        "CFDictionaryGetValueIfPresent" => {
+            let dict_ref = emu.read_reg("x0").unwrap_or(0);
+            let key_ref = emu.read_reg("x1").unwrap_or(0);
+            let value_out = emu.read_reg("x2").unwrap_or(0);
+            let value_ref = apple_runtime
+                .lock()
+                .ok()?
+                .dictionary_get(dict_ref, key_ref)
+                .unwrap_or(0);
+            let present = value_ref != 0;
+            if present && value_out != 0 {
+                let _ = emu.write_memory(value_out, &value_ref.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFDictionaryGetValueIfPresent(dict=0x{:X}, key=0x{:X}, out=0x{:X}) -> {}",
+                    dict_ref, key_ref, value_out, present as u64
+                ),
+            );
+            Some(present as u64)
+        }
+        "CFDictionaryGetTypeID" => {
+            let type_id = apple_runtime.lock().ok()?.dictionary_type_id();
+            record_arm64_import(
+                tracker,
+                format!("_CFDictionaryGetTypeID() -> 0x{:X}", type_id),
+            );
+            Some(type_id)
+        }
+        "CFDateCreate" => {
+            let absolute_time = f64::from_bits(emu.read_reg("x1").unwrap_or(0));
+            let date_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_date(absolute_time)
+            };
+            record_arm64_import(
+                tracker,
+                format!("_CFDateCreate(abs={}) -> 0x{:X}", absolute_time, date_ref),
+            );
+            Some(date_ref)
+        }
+        "xpc_date_create_from_current" => {
+            let date_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_date(0.0)
+            };
+            record_arm64_import(
+                tracker,
+                format!("_xpc_date_create_from_current() -> 0x{:X}", date_ref),
+            );
+            Some(date_ref)
+        }
+        "CFErrorCreate" => {
+            let domain = emu.read_reg("x1").unwrap_or(0);
+            let code = emu.read_reg("x2").unwrap_or(0) as i64;
+            let error_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_error(code, format!("machina synthetic error {}", code))
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFErrorCreate(domain=0x{:X}, code={}) -> 0x{:X}",
+                    domain, code, error_ref
+                ),
+            );
+            Some(error_ref)
+        }
+        "CFErrorGetCode" => {
+            let error_ref = emu.read_reg("x0").unwrap_or(0);
+            let code = apple_runtime
+                .lock()
+                .ok()?
+                .error_code(error_ref)
+                .unwrap_or(0) as u64;
+            record_arm64_import(
+                tracker,
+                format!("_CFErrorGetCode(error=0x{:X}) -> {}", error_ref, code),
+            );
+            Some(code)
+        }
+        "CFErrorCopyDescription" => {
+            let error_ref = emu.read_reg("x0").unwrap_or(0);
+            let data = apple_runtime
+                .lock()
+                .ok()?
+                .error_description(error_ref)
+                .unwrap_or_else(|| "machina synthetic error".to_string())
+                .into_bytes();
+            let string_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_string(data.clone(), K_CFSTRING_ENCODING_UTF8 as u64)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFErrorCopyDescription(error=0x{:X}) -> 0x{:X}",
+                    error_ref, string_ref
+                ),
+            );
+            Some(string_ref)
+        }
+        "CFGetTypeID" => {
+            let object_ref = emu.read_reg("x0").unwrap_or(0);
+            let type_id = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime_cf_type_id_or_host(&runtime, object_ref)
+            };
+            record_arm64_import(
+                tracker,
+                format!("_CFGetTypeID(obj=0x{:X}) -> 0x{:X}", object_ref, type_id),
+            );
+            Some(type_id)
+        }
+        "CFNumberGetTypeID" => {
+            let type_id = apple_runtime.lock().ok()?.number_type_id();
+            record_arm64_import(tracker, format!("_CFNumberGetTypeID() -> 0x{:X}", type_id));
+            Some(type_id)
+        }
+        "CFNumberGetValue" => {
+            let number_ref = emu.read_reg("x0").unwrap_or(0);
+            let number_type = emu.read_reg("x1").unwrap_or(0);
+            let out_ptr = emu.read_reg("x2").unwrap_or(0);
+            let value = apple_runtime
+                .lock()
+                .ok()?
+                .number_value(number_ref)
+                .unwrap_or(0);
+            if out_ptr != 0 {
+                let _ = emu.write_memory(out_ptr, &value.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFNumberGetValue(num=0x{:X}, type=0x{:X}, out=0x{:X}) -> 1",
+                    number_ref, number_type, out_ptr
+                ),
+            );
+            Some(1)
+        }
+        "CFBooleanGetTypeID" => {
+            let type_id = apple_runtime.lock().ok()?.boolean_type_id();
+            record_arm64_import(tracker, format!("_CFBooleanGetTypeID() -> 0x{:X}", type_id));
+            Some(type_id)
+        }
+        "CFBooleanGetValue" => {
+            let boolean_ref = emu.read_reg("x0").unwrap_or(0);
+            let value = apple_runtime
+                .lock()
+                .ok()?
+                .boolean_value(boolean_ref)
+                .unwrap_or(false);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFBooleanGetValue(boolean=0x{:X}) -> {}",
+                    boolean_ref, value as u64
+                ),
+            );
+            Some(value as u64)
+        }
         "SecRandomCopyBytes" => {
             let count = emu.read_reg("x1").unwrap_or(0) as usize;
             let out_ptr = emu.read_reg("x2").unwrap_or(0);
@@ -3344,6 +3720,133 @@ fn dispatch_apple_import(
                     .arg("HostProxy", "true"),
             );
             Some(string_ref)
+        }
+        "SecCertificateCreateWithData" => {
+            let data_ref = emu.read_reg("x1").unwrap_or(0);
+            let cert_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_certificate(data_ref)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecCertificateCreateWithData(data=0x{:X}) -> 0x{:X}",
+                    data_ref, cert_ref
+                ),
+            );
+            Some(cert_ref)
+        }
+        "SecCertificateCopyData" => {
+            let cert_ref = emu.read_reg("x0").unwrap_or(0);
+            let data_ref = apple_runtime
+                .lock()
+                .ok()?
+                .certificate_data(cert_ref)
+                .unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecCertificateCopyData(cert=0x{:X}) -> 0x{:X}",
+                    cert_ref, data_ref
+                ),
+            );
+            Some(data_ref)
+        }
+        "SecPolicyCreateSSL" => {
+            let server = emu.read_reg("x0").unwrap_or(0) != 0;
+            let hostname = emu.read_reg("x1").unwrap_or(0);
+            let policy_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_policy_ssl(server, hostname)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecPolicyCreateSSL(server={}, hostname=0x{:X}) -> 0x{:X}",
+                    server, hostname, policy_ref
+                ),
+            );
+            Some(policy_ref)
+        }
+        "SecTrustCreateWithCertificates" => {
+            let certificates = emu.read_reg("x0").unwrap_or(0);
+            let policies = emu.read_reg("x1").unwrap_or(0);
+            let trust_out = emu.read_reg("x2").unwrap_or(0);
+            let trust_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_trust(certificates, policies)
+            };
+            if trust_out != 0 {
+                let _ = emu.write_memory(trust_out, &trust_ref.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecTrustCreateWithCertificates(certs=0x{:X}, policies=0x{:X}, out=0x{:X}) -> 0x{:X}",
+                    certificates, policies, trust_out, trust_ref
+                ),
+            );
+            Some(0)
+        }
+        "SecTrustEvaluateWithError" => {
+            let trust_ref = emu.read_reg("x0").unwrap_or(0);
+            let error_out = emu.read_reg("x1").unwrap_or(0);
+            if error_out != 0 {
+                let _ = emu.write_memory(error_out, &0u64.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecTrustEvaluateWithError(trust=0x{:X}, error=0x{:X}) -> 1",
+                    trust_ref, error_out
+                ),
+            );
+            Some(1)
+        }
+        "SecTrustGetCertificateCount" => {
+            let trust_ref = emu.read_reg("x0").unwrap_or(0);
+            let count = apple_runtime
+                .lock()
+                .ok()?
+                .trust_certificate_count(trust_ref)
+                .unwrap_or(0) as u64;
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecTrustGetCertificateCount(trust=0x{:X}) -> {}",
+                    trust_ref, count
+                ),
+            );
+            Some(count)
+        }
+        "SecTrustGetCertificateAtIndex" => {
+            let trust_ref = emu.read_reg("x0").unwrap_or(0);
+            let index = emu.read_reg("x1").unwrap_or(0) as usize;
+            let cert_ref = apple_runtime
+                .lock()
+                .ok()?
+                .trust_certificate_at_index(trust_ref, index)
+                .unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecTrustGetCertificateAtIndex(trust=0x{:X}, index={}) -> 0x{:X}",
+                    trust_ref, index, cert_ref
+                ),
+            );
+            Some(cert_ref)
+        }
+        "SecTrustSetVerifyDate" => {
+            let trust_ref = emu.read_reg("x0").unwrap_or(0);
+            let date_ref = emu.read_reg("x1").unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecTrustSetVerifyDate(trust=0x{:X}, date=0x{:X})",
+                    trust_ref, date_ref
+                ),
+            );
+            Some(0)
         }
         "IONotificationPortCreate" => {
             let master_port = emu.read_reg("x0").unwrap_or(0);
@@ -5479,6 +5982,122 @@ mod tests {
             assert!(
                 APPLE_DIRECT_DISPATCH_IMPORTS.contains(&symbol),
                 "{symbol} must be installed by install_apple_imports for static imports"
+            );
+        }
+    }
+
+    #[test]
+    fn corefoundation_object_imports_are_apple_dispatched() {
+        for symbol in [
+            "_CFStringCreateWithBytes",
+            "_CFStringCreateExternalRepresentation",
+            "_CFStringGetTypeID",
+            "_CFDataCreate",
+            "_CFDataGetLength",
+            "_CFDataGetBytePtr",
+            "_CFDataGetTypeID",
+            "_CFArrayCreateMutable",
+            "_CFArrayCreate",
+            "_CFArrayAppendValue",
+            "_CFArrayGetCount",
+            "_CFArrayGetValueAtIndex",
+            "_CFArrayGetTypeID",
+            "_CFDictionaryCreate",
+            "_CFDictionaryGetValueIfPresent",
+            "_CFDictionaryGetTypeID",
+            "_CFDateCreate",
+            "_CFErrorCreate",
+            "_CFErrorGetCode",
+            "_CFErrorCopyDescription",
+            "_CFGetTypeID",
+            "_CFNumberGetTypeID",
+            "_CFNumberGetValue",
+            "_CFBooleanGetTypeID",
+            "_CFBooleanGetValue",
+            "_xpc_date_create_from_current",
+        ] {
+            assert!(
+                is_apple_import_symbol(symbol),
+                "{symbol} should be Apple-dispatched"
+            );
+        }
+    }
+
+    #[test]
+    fn corefoundation_type_imports_use_direct_dispatch_hooks() {
+        for symbol in [
+            "_CFStringGetTypeID",
+            "_CFDataGetTypeID",
+            "_CFArrayGetTypeID",
+            "_CFDictionaryGetTypeID",
+            "_CFBooleanGetTypeID",
+            "_CFBooleanGetValue",
+        ] {
+            assert!(
+                APPLE_DIRECT_DISPATCH_IMPORTS.contains(&symbol),
+                "{symbol} must be installed by install_apple_imports for static imports"
+            );
+        }
+    }
+
+    #[test]
+    fn object_imports_with_special_static_hooks_avoid_double_direct_dispatch() {
+        for symbol in [
+            "_CFStringCreateWithBytes",
+            "_CFStringCreateExternalRepresentation",
+            "_CFDataCreate",
+            "_CFDataGetLength",
+            "_CFDataGetBytePtr",
+            "_CFArrayCreateMutable",
+            "_CFArrayCreate",
+            "_CFArrayAppendValue",
+            "_CFArrayGetCount",
+            "_CFArrayGetValueAtIndex",
+            "_CFDictionaryCreate",
+            "_CFDictionaryGetValueIfPresent",
+            "_CFDateCreate",
+            "_CFErrorCreate",
+            "_CFErrorGetCode",
+            "_CFErrorCopyDescription",
+            "_CFGetTypeID",
+            "_CFNumberGetTypeID",
+            "_CFNumberGetValue",
+            "_SecCertificateCreateWithData",
+            "_SecCertificateCopyData",
+            "_SecPolicyCreateSSL",
+            "_SecTrustCreateWithCertificates",
+            "_SecTrustEvaluateWithError",
+            "_SecTrustGetCertificateCount",
+            "_SecTrustGetCertificateAtIndex",
+            "_SecTrustSetVerifyDate",
+            "_xpc_date_create_from_current",
+        ] {
+            assert!(
+                is_apple_import_symbol(symbol),
+                "{symbol} should still be Apple-dispatched"
+            );
+            assert!(
+                !APPLE_DIRECT_DISPATCH_IMPORTS.contains(&symbol),
+                "{symbol} has a dedicated static hook and should not also use direct dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn security_object_imports_are_apple_dispatched() {
+        for symbol in [
+            "_SecCertificateCreateWithData",
+            "_SecCertificateCopyData",
+            "_SecPolicyCreateSSL",
+            "_SecTrustCreateWithCertificates",
+            "_SecTrustEvaluateWithError",
+            "_SecTrustGetCertificateCount",
+            "_SecTrustGetCertificateAtIndex",
+            "_SecTrustSetVerifyDate",
+        ] {
+            assert!(
+                is_apple_import_symbol(symbol),
+                "{symbol} should be Apple-dispatched"
             );
         }
     }

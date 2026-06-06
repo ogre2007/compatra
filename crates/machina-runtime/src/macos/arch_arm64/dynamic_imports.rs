@@ -8,12 +8,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::macos::apple_imports::is_apple_import_symbol;
-use crate::macos::arm64_import_stubs::{allocate_arm64_dynamic_import_stub, Arm64ImportTracker};
+use crate::macos::arm64_import_stubs::{
+    allocate_arm64_dynamic_import_stub, arm64_import_can_resolve_to_guest_library,
+    Arm64ImportTracker,
+};
 use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64SharedState,
 };
 use crate::macos::compat::CompatibilityServices;
-use crate::macos::{read_cstring, Emulator, RuntimeMode, SharedTraceBus, StubRegion};
+use crate::macos::{
+    read_cstring, Emulator, GuestLibrarySet, RuntimeMode, SharedTraceBus, StubRegion,
+};
 use crate::UnicornEmulator;
 use machina_arch_arm64::abi::DYNAMIC_IMPORT_HANDLE_BASE;
 
@@ -26,6 +31,7 @@ pub fn install_arm64_dynamic_imports(
     trace_bus: &Option<SharedTraceBus>,
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
+    guest_libraries: &GuestLibrarySet,
     process_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(compat) = CompatibilityServices::for_mode(shared_state.runtime_mode) else {
@@ -35,6 +41,7 @@ pub fn install_arm64_dynamic_imports(
     let next_handle = Arc::new(Mutex::new(DYNAMIC_IMPORT_HANDLE_BASE));
     let dynamic_symbols = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
     let unresolved_symbols = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let guest_libraries = Arc::new(guest_libraries.clone());
 
     if let Some(&addr) = stub_map.get("_dlopen") {
         let handles = handles.clone();
@@ -92,6 +99,7 @@ pub fn install_arm64_dynamic_imports(
         let unresolved_symbols = unresolved_symbols.clone();
         let next_dynamic_stub_addr = next_dynamic_stub_addr.clone();
         let stub_name_map = stub_name_map.clone();
+        let guest_libraries = guest_libraries.clone();
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
         let process_name = process_name.to_string();
@@ -108,7 +116,23 @@ pub fn install_arm64_dynamic_imports(
                         .lock()
                         .ok()
                         .is_some_and(|handles| handles.contains_key(&handle));
-                let result = if handle_known
+                let handle_path = handles
+                    .lock()
+                    .ok()
+                    .and_then(|handles| handles.get(&handle).cloned())
+                    .flatten();
+                let guest_symbol = if handle_known
+                    && arm64_import_can_resolve_to_guest_library(&symbol, RuntimeMode::Compat)
+                {
+                    guest_libraries
+                        .resolve_symbol_for_library_reference(handle_path.as_deref(), &symbol)
+                        .cloned()
+                } else {
+                    None
+                };
+                let (result, source) = if let Some(guest_symbol) = &guest_symbol {
+                    (guest_symbol.address, "guest-library")
+                } else if handle_known
                     && (compat.should_proxy_import(&symbol) || is_apple_import_symbol(&symbol))
                 {
                     if let Some(existing) = dynamic_symbols
@@ -116,7 +140,7 @@ pub fn install_arm64_dynamic_imports(
                         .ok()
                         .and_then(|symbols| symbols.get(&symbol).copied())
                     {
-                        existing
+                        (existing, "host-proxy")
                     } else {
                         let Some(stub_addr) = allocate_arm64_dynamic_import_stub(
                             emu,
@@ -133,14 +157,14 @@ pub fn install_arm64_dynamic_imports(
                         if let Ok(mut symbols) = dynamic_symbols.lock() {
                             symbols.insert(symbol.clone(), stub_addr);
                         }
-                        stub_addr
+                        (stub_addr, "host-proxy")
                     }
                 } else {
-                    0
+                    (0, "unresolved")
                 };
                 if result == 0 {
                     let reason = if handle_known {
-                        "no compat proxy or Apple dynamic dispatcher"
+                        "no guest library export, compat proxy, or Apple dynamic dispatcher"
                     } else {
                         "unknown dlopen handle"
                     };
@@ -165,11 +189,31 @@ pub fn install_arm64_dynamic_imports(
                         handle, symbol, result
                     ),
                 );
-                let event = arm64_process_event(1, 1, "dlsym", "dlsym")
-                    .arg("HostProxy", "true")
+                let mut event = arm64_process_event(1, 1, "dlsym", "dlsym")
+                    .arg("HostProxy", (source == "host-proxy").to_string())
                     .arg("Handle", format!("0x{:X}", handle))
-                    .arg("Symbol", symbol)
+                    .arg("Symbol", symbol.clone())
+                    .arg("Source", source)
                     .arg("Result", format!("0x{:X}", result));
+                if let Some(guest_symbol) = &guest_symbol {
+                    event = event
+                        .arg(
+                            "GuestLibrary",
+                            guest_symbol.library_path.display().to_string(),
+                        )
+                        .arg(
+                            "GuestInstallName",
+                            guest_symbol
+                                .install_name
+                                .clone()
+                                .unwrap_or_else(|| "<none>".to_string()),
+                        )
+                        .arg("GuestExport", guest_symbol.symbol.clone())
+                        .arg(
+                            "GuestFileVmaddr",
+                            format!("0x{:X}", guest_symbol.file_vmaddr),
+                        );
+                }
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;

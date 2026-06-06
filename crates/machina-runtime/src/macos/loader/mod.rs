@@ -4,8 +4,19 @@
 
 pub mod command;
 pub mod consts;
+pub mod guest_libraries;
 pub mod header;
 pub mod parser;
+
+pub use crate::macos::guest_images::{
+    GuestImageAddress, GuestImageKind, GuestImageRecord, GuestImageRegistry,
+};
+pub use guest_libraries::{
+    guest_library_specs_from_env, guest_library_symbol_lookup_keys, parse_guest_library_specs,
+    GuestLibraryBinding, GuestLibraryChainedFixupReport, GuestLibraryImage,
+    GuestLibraryImportSetReport, GuestLibrarySet, GuestLibrarySpec, GuestLibrarySymbol,
+    MACHINA_GUEST_LIBS_ENV,
+};
 
 use crate::macos::imports::{
     install_synthetic_macho_imports, patch_macho_import_pointer_sections,

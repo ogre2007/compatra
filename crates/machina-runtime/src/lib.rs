@@ -23,7 +23,13 @@ pub use macos::imports::{
     install_synthetic_macho_imports, patch_macho_import_pointer_sections, read_c_string,
     ImportReturnPolicy, ImportThunk, SyntheticImportLayout,
 };
-pub use macos::loader::{parser::MachoBinary, MachOLoader};
+pub use macos::loader::{
+    guest_library_specs_from_env, guest_library_symbol_lookup_keys, parse_guest_library_specs,
+    parser::MachoBinary, GuestImageAddress, GuestImageKind, GuestImageRecord, GuestImageRegistry,
+    GuestLibraryBinding, GuestLibraryChainedFixupReport, GuestLibraryImage,
+    GuestLibraryImportSetReport, GuestLibrarySet, GuestLibrarySpec, GuestLibrarySymbol,
+    MachOLoader, MACHINA_GUEST_LIBS_ENV,
+};
 pub use macos::macho_utils::{
     file_backed_slice_for_vmaddr, find_symbol_address, get_dysymtab_cmd, get_symtab_cmd,
     patch_section64_u64_slots, reload_file_backed_range, section32_indirect_symbol_name,

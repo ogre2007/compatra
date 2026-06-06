@@ -272,6 +272,124 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_guest_library_init_fixture() -> (PathBuf, PathBuf) {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let lib_source = out_dir.join("guest_state_lib.c");
+    let main_source = out_dir.join("guest_state_main.c");
+    let dylib = out_dir.join("libguest_state.dylib");
+    let binary = out_dir.join("arm64_guest_state_main");
+
+    fs::write(
+        &lib_source,
+        r#"#include <stddef.h>
+#include <unistd.h>
+
+static int guest_state = 7;
+
+static void mark(const char *text) {
+    size_t len = 0;
+    while (text[len] != '\0') {
+        len++;
+    }
+    write(1, text, len);
+}
+
+__attribute__((constructor))
+static void guest_before_main(void) {
+    guest_state = 41;
+    mark("compat guestlib ctor\n");
+}
+
+__attribute__((destructor))
+static void guest_after_main(void) {
+    mark("compat guestlib dtor\n");
+}
+
+int guest_state_value(void) {
+    return guest_state + 1;
+}
+
+const char *guest_state_text(void) {
+    return guest_state == 41 ? "ready" : "cold";
+}
+"#,
+    )
+    .expect("failed to write generated arm64 guest library source");
+
+    fs::write(
+        &main_source,
+        r#"#include <stdio.h>
+
+int guest_state_value(void);
+const char *guest_state_text(void);
+
+int main(void) {
+    int value = guest_state_value();
+    const char *text = guest_state_text();
+    printf("compat guestlib main value=%d text=%s\n", value, text);
+    return value == 42 ? 0 : 7;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 guest library main source");
+
+    let lib_output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-dynamiclib")
+        .arg("-install_name")
+        .arg("@rpath/libguest_state.dylib")
+        .arg("-fno-builtin")
+        .arg("-fno-stack-protector")
+        .arg(&lib_source)
+        .arg("-o")
+        .arg(&dylib)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 guest library");
+    assert!(
+        lib_output.status.success(),
+        "failed to compile generated arm64 guest library with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        lib_output.status,
+        String::from_utf8_lossy(&lib_output.stdout),
+        String::from_utf8_lossy(&lib_output.stderr)
+    );
+
+    let main_output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&main_source)
+        .arg("-L")
+        .arg(&out_dir)
+        .arg("-lguest_state")
+        .arg("-Wl,-rpath,@loader_path")
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 guest library main fixture");
+    assert!(
+        main_output.status.success(),
+        "failed to compile generated arm64 guest library main fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        main_output.status,
+        String::from_utf8_lossy(&main_output.stdout),
+        String::from_utf8_lossy(&main_output.stderr)
+    );
+
+    (binary, dylib)
+}
+
+#[cfg(target_os = "macos")]
 fn compile_universal_native_preferred_fixture() -> PathBuf {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -627,6 +745,305 @@ int main(void) {
     assert!(
         output.status.success(),
         "failed to compile generated arm64 memory/string fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
+fn compile_arm64_startup_glue_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_startup_glue_compat.c");
+    let binary = out_dir.join("arm64_startup_glue_compat");
+    fs::write(
+        &source,
+        r#"#include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+extern size_t compat_libcpp_next_prime(size_t) __asm("__ZNSt3__112__next_primeEm");
+extern int compat_cxa_guard_acquire(uint64_t *) __asm("___cxa_guard_acquire");
+extern void compat_cxa_guard_release(uint64_t *) __asm("___cxa_guard_release");
+extern void compat_cxa_guard_abort(uint64_t *) __asm("___cxa_guard_abort");
+extern void compat_string_init(void *, const char *, size_t) __asm("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm");
+extern void *compat_string_append_cstr_len(void *, const char *, size_t) __asm("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm");
+extern void compat_string_push_back(void *, int) __asm("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc");
+extern size_t compat_string_find_char(const void *, int, size_t) __asm("__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm");
+extern int compat_string_compare(const void *, size_t, size_t, const char *) __asm("__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKc");
+
+typedef int (*mlock_fn)(const void *, size_t);
+typedef int (*munlock_fn)(const void *, size_t);
+typedef int (*madvise_fn)(void *, size_t, int);
+typedef int (*pthread_sigmask_fn)(int, const sigset_t *, sigset_t *);
+typedef int (*issetugid_fn)(void);
+typedef int (*execl_fn)(const char *, const char *, ...);
+typedef size_t (*next_prime_fn)(size_t);
+typedef int (*cxa_guard_acquire_fn)(uint64_t *);
+typedef void (*cxa_guard_void_fn)(uint64_t *);
+typedef void (*string_init_fn)(void *, const char *, size_t);
+typedef void *(*string_append_cstr_len_fn)(void *, const char *, size_t);
+typedef void (*string_push_back_fn)(void *, int);
+typedef size_t (*string_find_char_fn)(const void *, int, size_t);
+typedef int (*string_compare_fn)(const void *, size_t, size_t, const char *);
+
+#define COMPAT_STRING_OBJECT_SIZE 24
+#define COMPAT_ALT_LONG_FLAG (1ULL << 63)
+
+static unsigned int byte_sum(const unsigned char *buf, size_t len) {
+    unsigned int sum = 0;
+    for (size_t i = 0; i < len; i++) {
+        sum += buf[i];
+    }
+    return sum;
+}
+
+static uint64_t load_u64(const unsigned char *ptr) {
+    uint64_t value = 0;
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+static size_t compat_string_len(const unsigned char *obj) {
+    uint64_t word2 = load_u64(obj + 16);
+    if ((word2 & COMPAT_ALT_LONG_FLAG) != 0) {
+        return (size_t)load_u64(obj + 8);
+    }
+    return (size_t)(obj[23] & 0x7f);
+}
+
+static const char *compat_string_data(const unsigned char *obj) {
+    uint64_t word2 = load_u64(obj + 16);
+    if ((word2 & COMPAT_ALT_LONG_FLAG) != 0) {
+        return (const char *)(uintptr_t)load_u64(obj);
+    }
+    return (const char *)obj;
+}
+
+static int exercise_startup_glue(
+    const char *label,
+    mlock_fn mlock_impl,
+    munlock_fn munlock_impl,
+    madvise_fn madvise_impl,
+    pthread_sigmask_fn pthread_sigmask_impl,
+    issetugid_fn issetugid_impl,
+    execl_fn execl_impl,
+    next_prime_fn next_prime_impl,
+    cxa_guard_acquire_fn cxa_guard_acquire_impl,
+    cxa_guard_void_fn cxa_guard_release_impl,
+    cxa_guard_void_fn cxa_guard_abort_impl,
+    string_init_fn string_init_impl,
+    string_append_cstr_len_fn string_append_cstr_len_impl,
+    string_push_back_fn string_push_back_impl,
+    string_find_char_fn string_find_char_impl,
+    string_compare_fn string_compare_impl
+) {
+    static unsigned char page[4096] __attribute__((aligned(4096)));
+    memset(page, 0x41, sizeof(page));
+
+    int mlock_ret = mlock_impl(page, 64);
+    int munlock_ret = munlock_impl(page, 64);
+    int madvise_ret = madvise_impl(page, 64, 0);
+
+    sigset_t oldmask;
+    memset(&oldmask, 0xA5, sizeof(oldmask));
+    int mask_ret = pthread_sigmask_impl(SIG_SETMASK, 0, &oldmask);
+    unsigned int oldmask_sum = byte_sum((const unsigned char *)&oldmask, sizeof(oldmask));
+
+    int ugid = issetugid_impl();
+
+    errno = 0;
+    int exec_ret = execl_impl("/machina/compat/no-such-helper", "no-such-helper", (char *)0);
+    int exec_errno = errno;
+
+    size_t prime = next_prime_impl(1000);
+    uint64_t guard = 0;
+    int guard_first = cxa_guard_acquire_impl(&guard);
+    cxa_guard_release_impl(&guard);
+    int guard_second = cxa_guard_acquire_impl(&guard);
+
+    uint64_t guard_abort = 0;
+    int guard_abort_first = cxa_guard_acquire_impl(&guard_abort);
+    cxa_guard_abort_impl(&guard_abort);
+    int guard_abort_second = cxa_guard_acquire_impl(&guard_abort);
+
+    unsigned char compat_string[COMPAT_STRING_OBJECT_SIZE];
+    memset(compat_string, 0, sizeof(compat_string));
+    string_init_impl(compat_string, "glue", 4);
+    string_append_cstr_len_impl(compat_string, "-cxx", 4);
+    string_push_back_impl(compat_string, '!');
+    size_t str_len = compat_string_len(compat_string);
+    const char *str_text = compat_string_data(compat_string);
+    size_t str_find = string_find_char_impl(compat_string, '-', 0);
+    int str_compare = string_compare_impl(compat_string, 5, 3, "cxx");
+    int str_ok = str_text
+        && str_len == 9
+        && memcmp(str_text, "glue-cxx!", 9) == 0
+        && str_find == 4
+        && str_compare == 0;
+
+    int ok = mlock_ret == 0
+        && munlock_ret == 0
+        && madvise_ret == 0
+        && mask_ret == 0
+        && oldmask_sum == 0
+        && ugid == 0
+        && exec_ret == -1
+        && exec_errno != 0
+        && prime == 1009
+        && guard_first == 1
+        && guard_second == 0
+        && (guard & 1) == 1
+        && guard_abort_first == 1
+        && guard_abort_second == 1
+        && (guard_abort & 1) == 0
+        && str_ok;
+
+    printf(
+        "compat startup glue %s mlock=%d munlock=%d madvise=%d mask=%d oldmask_size=%lu oldmask_sum=%u issetugid=%d execl=%d execl_errno=%d next_prime=%lu guard_first=%d guard_second=%d guard=0x%llx guard_abort_first=%d guard_abort_second=%d guard_abort=0x%llx str_len=%lu str_text=%.*s str_find=%lu str_compare=%d str_ok=%d ok=%d\n",
+        label,
+        mlock_ret,
+        munlock_ret,
+        madvise_ret,
+        mask_ret,
+        (unsigned long)sizeof(oldmask),
+        oldmask_sum,
+        ugid,
+        exec_ret,
+        exec_errno,
+        (unsigned long)prime,
+        guard_first,
+        guard_second,
+        (unsigned long long)guard,
+        guard_abort_first,
+        guard_abort_second,
+        (unsigned long long)guard_abort,
+        (unsigned long)str_len,
+        (int)(str_len < 64 ? str_len : 64),
+        str_text ? str_text : "",
+        (unsigned long)str_find,
+        str_compare,
+        str_ok,
+        ok
+    );
+    return ok ? 0 : 1;
+}
+
+int main(void) {
+    int failures = 0;
+    failures += exercise_startup_glue(
+        "static",
+        mlock,
+        munlock,
+        madvise,
+        pthread_sigmask,
+        issetugid,
+        execl,
+        compat_libcpp_next_prime,
+        compat_cxa_guard_acquire,
+        compat_cxa_guard_release,
+        compat_cxa_guard_abort,
+        compat_string_init,
+        compat_string_append_cstr_len,
+        compat_string_push_back,
+        compat_string_find_char,
+        compat_string_compare
+    );
+
+    void *self = dlopen(NULL, RTLD_NOW);
+    void *libcxx = dlopen("/usr/lib/libc++.1.dylib", RTLD_NOW);
+    void *next_prime_handle = libcxx ? libcxx : self;
+    void *string_handle = libcxx ? libcxx : self;
+    mlock_fn dyn_mlock = (mlock_fn)dlsym(self, "mlock");
+    munlock_fn dyn_munlock = (munlock_fn)dlsym(self, "munlock");
+    madvise_fn dyn_madvise = (madvise_fn)dlsym(self, "madvise");
+    pthread_sigmask_fn dyn_pthread_sigmask = (pthread_sigmask_fn)dlsym(self, "pthread_sigmask");
+    issetugid_fn dyn_issetugid = (issetugid_fn)dlsym(self, "issetugid");
+    execl_fn dyn_execl = (execl_fn)dlsym(self, "execl");
+    next_prime_fn dyn_next_prime = (next_prime_fn)dlsym(next_prime_handle, "_ZNSt3__112__next_primeEm");
+    cxa_guard_acquire_fn dyn_cxa_guard_acquire = (cxa_guard_acquire_fn)dlsym(self, "__cxa_guard_acquire");
+    cxa_guard_void_fn dyn_cxa_guard_release = (cxa_guard_void_fn)dlsym(self, "__cxa_guard_release");
+    cxa_guard_void_fn dyn_cxa_guard_abort = (cxa_guard_void_fn)dlsym(self, "__cxa_guard_abort");
+    string_init_fn dyn_string_init = (string_init_fn)dlsym(string_handle, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm");
+    string_append_cstr_len_fn dyn_string_append_cstr_len = (string_append_cstr_len_fn)dlsym(string_handle, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm");
+    string_push_back_fn dyn_string_push_back = (string_push_back_fn)dlsym(string_handle, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc");
+    string_find_char_fn dyn_string_find_char = (string_find_char_fn)dlsym(string_handle, "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm");
+    string_compare_fn dyn_string_compare = (string_compare_fn)dlsym(string_handle, "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKc");
+
+    printf(
+        "compat startup glue dlsym ptrs mlock=%p munlock=%p madvise=%p pthread_sigmask=%p issetugid=%p execl=%p next_prime=%p cxa_guard_acquire=%p cxa_guard_release=%p cxa_guard_abort=%p string_init=%p string_append=%p string_push=%p string_find=%p string_compare=%p\n",
+        (void *)dyn_mlock,
+        (void *)dyn_munlock,
+        (void *)dyn_madvise,
+        (void *)dyn_pthread_sigmask,
+        (void *)dyn_issetugid,
+        (void *)dyn_execl,
+        (void *)dyn_next_prime,
+        (void *)dyn_cxa_guard_acquire,
+        (void *)dyn_cxa_guard_release,
+        (void *)dyn_cxa_guard_abort,
+        (void *)dyn_string_init,
+        (void *)dyn_string_append_cstr_len,
+        (void *)dyn_string_push_back,
+        (void *)dyn_string_find_char,
+        (void *)dyn_string_compare
+    );
+
+    if (!dyn_mlock || !dyn_munlock || !dyn_madvise || !dyn_pthread_sigmask || !dyn_issetugid || !dyn_execl || !dyn_next_prime || !dyn_cxa_guard_acquire || !dyn_cxa_guard_release || !dyn_cxa_guard_abort || !dyn_string_init || !dyn_string_append_cstr_len || !dyn_string_push_back || !dyn_string_find_char || !dyn_string_compare) {
+        return 2;
+    }
+    failures += exercise_startup_glue(
+        "dlsym",
+        dyn_mlock,
+        dyn_munlock,
+        dyn_madvise,
+        dyn_pthread_sigmask,
+        dyn_issetugid,
+        dyn_execl,
+        dyn_next_prime,
+        dyn_cxa_guard_acquire,
+        dyn_cxa_guard_release,
+        dyn_cxa_guard_abort,
+        dyn_string_init,
+        dyn_string_append_cstr_len,
+        dyn_string_push_back,
+        dyn_string_find_char,
+        dyn_string_compare
+    );
+    return failures == 0 ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 startup glue fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-lc++")
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 startup glue fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 startup glue fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -2449,6 +2866,7 @@ fn compile_arm64_env_time_fixture() -> PathBuf {
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -2518,6 +2936,25 @@ int main(void) {
     printf("compat system sysconf_pagesize=%ld gethostname=%d host=%s uname=%d sys=%s machine=%s\n", page_size, hostname_ret, hostname, uname_ret, uts.sysname, uts.machine);
     if (page_size <= 0 || hostname_ret != 0 || uname_ret != 0) {
         failures += 30;
+    }
+    char hw_machine[64] = {0};
+    size_t hw_machine_len = sizeof(hw_machine);
+    int hw_machine_ret = sysctlbyname("hw.machine", hw_machine, &hw_machine_len, 0, 0);
+    int hw_arm64 = 0;
+    size_t hw_arm64_len = sizeof(hw_arm64);
+    int hw_arm64_ret = sysctlbyname("hw.optional.arm64", &hw_arm64, &hw_arm64_len, 0, 0);
+    printf(
+        "compat system identity uname_machine=%s hw_machine_ret=%d hw_machine=%s hw_machine_len=%lu arm64_ret=%d arm64=%d arm64_len=%lu\n",
+        uts.machine,
+        hw_machine_ret,
+        hw_machine,
+        (unsigned long)hw_machine_len,
+        hw_arm64_ret,
+        hw_arm64,
+        (unsigned long)hw_arm64_len
+    );
+    if (uname_ret != 0 || strcmp(uts.machine, "arm64") != 0 || hw_machine_ret != 0 || strcmp(hw_machine, "arm64") != 0 || hw_arm64_ret != 0 || hw_arm64 != 1) {
+        failures += 31;
     }
 
     struct timeval tv = {0};
@@ -3070,6 +3507,11 @@ fn compile_arm64_apple_framework_fixture() -> PathBuf {
 typedef CFStringRef (*cf_create_cstr_fn)(CFAllocatorRef, const char *, CFStringEncoding);
 typedef Boolean (*cf_get_cstr_fn)(CFStringRef, char *, CFIndex, CFStringEncoding);
 typedef CFIndex (*cf_get_len_fn)(CFStringRef);
+typedef CFDataRef (*cf_data_create_fn)(CFAllocatorRef, const UInt8 *, CFIndex);
+typedef CFIndex (*cf_data_get_len_fn)(CFDataRef);
+typedef const UInt8 *(*cf_data_get_bytes_fn)(CFDataRef);
+typedef CFTypeID (*cf_get_type_id_fn)(CFTypeRef);
+typedef CFTypeID (*cf_type_id_fn)(void);
 typedef int (*sec_random_fn)(void *, size_t, uint8_t *);
 typedef CFStringRef (*sec_error_fn)(OSStatus, void *);
 
@@ -3087,17 +3529,32 @@ int main(void) {
     CFStringRef s = CFStringCreateWithCString(0, "static-cf", kCFStringEncodingUTF8);
     Boolean s_ok = s ? CFStringGetCString(s, static_buf, sizeof(static_buf), kCFStringEncodingUTF8) : 0;
     CFIndex s_len = s ? CFStringGetLength(s) : -1;
+    CFDataRef data = CFDataCreate(0, (const UInt8 *)"cfdata", 6);
+    CFIndex data_len = data ? CFDataGetLength(data) : -1;
+    const UInt8 *data_ptr = data ? CFDataGetBytePtr(data) : 0;
+    CFTypeID string_type = CFStringGetTypeID();
+    CFTypeID data_type = CFDataGetTypeID();
+    CFTypeID static_string_type = s ? CFGetTypeID(s) : 0;
+    CFTypeID static_data_type = data ? CFGetTypeID(data) : 0;
+    int type_ok = string_type != 0 && data_type != 0 && static_string_type == string_type && static_data_type == data_type;
     unsigned char rnd[16] = {0};
     int rnd_ret = SecRandomCopyBytes(0, sizeof(rnd), rnd);
     CFStringRef err = SecCopyErrorMessageString(-50, 0);
     char err_buf[128] = {0};
     Boolean err_ok = err ? CFStringGetCString(err, err_buf, sizeof(err_buf), kCFStringEncodingUTF8) : 0;
-    int static_ok = s_ok && s_len == 9 && strcmp(static_buf, "static-cf") == 0 && rnd_ret == 0 && any_nonzero(rnd, sizeof(rnd)) && err_ok;
+    int data_ok = data_len == 6 && data_ptr && memcmp(data_ptr, "cfdata", 6) == 0;
+    int static_ok = s_ok && s_len == 9 && strcmp(static_buf, "static-cf") == 0 && data_ok && type_ok && rnd_ret == 0 && any_nonzero(rnd, sizeof(rnd)) && err_ok;
     printf(
-        "compat apple static cf ok=%d len=%ld text=%s random=%d nonzero=%d err=%d errtext=%s pass=%d\n",
+        "compat apple static cf ok=%d len=%ld text=%s data_len=%ld data_text=%.*s type_ok=%d string_type=%lu data_type=%lu random=%d nonzero=%d err=%d errtext=%s pass=%d\n",
         s_ok,
         (long)s_len,
         static_buf,
+        (long)data_len,
+        (int)(data_len > 0 && data_len < 64 ? data_len : 0),
+        data_ptr ? (const char *)data_ptr : "",
+        type_ok,
+        (unsigned long)string_type,
+        (unsigned long)data_type,
         rnd_ret,
         any_nonzero(rnd, sizeof(rnd)),
         err_ok,
@@ -3110,13 +3567,25 @@ int main(void) {
     cf_create_cstr_fn dyn_create = (cf_create_cstr_fn)dlsym(cf, "CFStringCreateWithCString");
     cf_get_cstr_fn dyn_get = (cf_get_cstr_fn)dlsym(cf, "CFStringGetCString");
     cf_get_len_fn dyn_len = (cf_get_len_fn)dlsym(cf, "CFStringGetLength");
+    cf_data_create_fn dyn_data_create = (cf_data_create_fn)dlsym(cf, "CFDataCreate");
+    cf_data_get_len_fn dyn_data_len = (cf_data_get_len_fn)dlsym(cf, "CFDataGetLength");
+    cf_data_get_bytes_fn dyn_data_bytes = (cf_data_get_bytes_fn)dlsym(cf, "CFDataGetBytePtr");
+    cf_get_type_id_fn dyn_get_type = (cf_get_type_id_fn)dlsym(cf, "CFGetTypeID");
+    cf_type_id_fn dyn_string_type = (cf_type_id_fn)dlsym(cf, "CFStringGetTypeID");
+    cf_type_id_fn dyn_data_type = (cf_type_id_fn)dlsym(cf, "CFDataGetTypeID");
     sec_random_fn dyn_random = (sec_random_fn)dlsym(sec, "SecRandomCopyBytes");
     sec_error_fn dyn_error = (sec_error_fn)dlsym(sec, "SecCopyErrorMessageString");
     printf(
-        "compat apple dlsym ptrs create=%p get=%p len=%p random=%p error=%p\n",
+        "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p random=%p error=%p\n",
         (void *)dyn_create,
         (void *)dyn_get,
         (void *)dyn_len,
+        (void *)dyn_data_create,
+        (void *)dyn_data_len,
+        (void *)dyn_data_bytes,
+        (void *)dyn_get_type,
+        (void *)dyn_string_type,
+        (void *)dyn_data_type,
         (void *)dyn_random,
         (void *)dyn_error
     );
@@ -3125,17 +3594,32 @@ int main(void) {
     CFStringRef ds = dyn_create ? dyn_create(0, "dyn-cf", kCFStringEncodingUTF8) : 0;
     Boolean d_ok = dyn_get && ds ? dyn_get(ds, dyn_buf, sizeof(dyn_buf), kCFStringEncodingUTF8) : 0;
     CFIndex d_len = dyn_len && ds ? dyn_len(ds) : -1;
+    CFDataRef ddata = dyn_data_create ? dyn_data_create(0, (const UInt8 *)"dyndata", 7) : 0;
+    CFIndex ddata_len = dyn_data_len && ddata ? dyn_data_len(ddata) : -1;
+    const UInt8 *ddata_ptr = dyn_data_bytes && ddata ? dyn_data_bytes(ddata) : 0;
+    CFTypeID d_string_type = dyn_string_type ? dyn_string_type() : 0;
+    CFTypeID d_data_type = dyn_data_type ? dyn_data_type() : 0;
+    CFTypeID d_string_obj_type = dyn_get_type && ds ? dyn_get_type(ds) : 0;
+    CFTypeID d_data_obj_type = dyn_get_type && ddata ? dyn_get_type(ddata) : 0;
+    int d_type_ok = d_string_type != 0 && d_data_type != 0 && d_string_obj_type == d_string_type && d_data_obj_type == d_data_type;
+    int d_data_ok = ddata_len == 7 && ddata_ptr && memcmp(ddata_ptr, "dyndata", 7) == 0;
     unsigned char dyn_rnd[16] = {0};
     int dyn_rnd_ret = dyn_random ? dyn_random(0, sizeof(dyn_rnd), dyn_rnd) : -1;
     CFStringRef derr = dyn_error ? dyn_error(-50, 0) : 0;
     char derr_buf[128] = {0};
     Boolean derr_ok = dyn_get && derr ? dyn_get(derr, derr_buf, sizeof(derr_buf), kCFStringEncodingUTF8) : 0;
-    int dyn_ok = d_ok && d_len == 6 && strcmp(dyn_buf, "dyn-cf") == 0 && dyn_rnd_ret == 0 && any_nonzero(dyn_rnd, sizeof(dyn_rnd)) && derr_ok;
+    int dyn_ok = d_ok && d_len == 6 && strcmp(dyn_buf, "dyn-cf") == 0 && d_data_ok && d_type_ok && dyn_rnd_ret == 0 && any_nonzero(dyn_rnd, sizeof(dyn_rnd)) && derr_ok;
     printf(
-        "compat apple dlsym cf ok=%d len=%ld text=%s random=%d nonzero=%d err=%d errtext=%s pass=%d\n",
+        "compat apple dlsym cf ok=%d len=%ld text=%s data_len=%ld data_text=%.*s type_ok=%d string_type=%lu data_type=%lu random=%d nonzero=%d err=%d errtext=%s pass=%d\n",
         d_ok,
         (long)d_len,
         dyn_buf,
+        (long)ddata_len,
+        (int)(ddata_len > 0 && ddata_len < 64 ? ddata_len : 0),
+        ddata_ptr ? (const char *)ddata_ptr : "",
+        d_type_ok,
+        (unsigned long)d_string_type,
+        (unsigned long)d_data_type,
         dyn_rnd_ret,
         any_nonzero(dyn_rnd, sizeof(dyn_rnd)),
         derr_ok,
@@ -3822,6 +4306,129 @@ fn compat_mode_runs_lifecycle_glue() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn compat_mode_runs_guest_library_constructors() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS guest-library constructor diagnostic on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let (fixture, dylib) = compile_arm64_guest_library_init_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("calls")
+        .arg("--compat-log-filter")
+        .arg("printf,write")
+        .arg("--compat-log-preview-bytes")
+        .arg("128")
+        .arg(&fixture)
+        .env("MACHINA_GUEST_LIBS", &dylib)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_TRACE_PROFILE", "full")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[') && !line.starts_with('{')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let saw_ctor = stdout.contains("compat guestlib ctor");
+    let saw_main = stdout.contains("compat guestlib main value=42 text=ready");
+    let saw_dtor = stdout.contains("compat guestlib dtor");
+    let saw_registry = stdout.contains("\"Event\":\"guest-image-registry\"");
+    let saw_image =
+        stdout.contains("\"Event\":\"guest-image\"") && stdout.contains("libguest_state.dylib");
+    let saw_binding = stdout.contains("\"Event\":\"guest-library-bindings\"")
+        && stdout.contains("_guest_state_value");
+    let saw_init_trace = stdout.contains("\"Event\":\"guest-library-mod-init-handlers\"");
+
+    eprintln!(
+        "compat proof(guest-library-init): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!(
+        "compat proof(guest-library-init): MACHINA_GUEST_LIBS={}",
+        dylib.display()
+    );
+    eprintln!("compat proof(guest-library-init): status={status}");
+    eprintln!(
+        "compat proof(guest-library-init): guest stdout={:?}",
+        text_excerpt(&guest_stdout, 512)
+    );
+    eprintln!(
+        "compat proof(guest-library-init): observed ctor={} main={} dtor={} registry={} image={} binding={} init_trace={}",
+        saw_ctor as u8,
+        saw_main as u8,
+        saw_dtor as u8,
+        saw_registry as u8,
+        saw_image as u8,
+        saw_binding as u8,
+        saw_init_trace as u8,
+    );
+    if !stderr.trim().is_empty() {
+        eprintln!(
+            "compat proof(guest-library-init): stderr excerpt:\n{}",
+            stderr_log_excerpt(&stderr, 12)
+        );
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        saw_ctor,
+        "guest library constructor did not execute before main; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_main,
+        "guest library export did not observe constructor-initialized state; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_dtor,
+        "guest library destructor did not run through compat exit handlers; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_registry && saw_image,
+        "guest image registry trace did not describe the guest dylib; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_binding,
+        "guest library static import binding trace did not include guest_state_value; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_init_trace,
+        "guest library init-handler trace was missing; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"write\"") && stderr.contains("\"Call\":\"printf\""),
+        "guest library fixture did not log host-proxied write and printf calls; stderr:\n{stderr}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn compat_mode_runs_native_slice_for_universal_binary() {
     if std::env::consts::ARCH != "x86_64" {
         eprintln!(
@@ -3836,6 +4443,10 @@ fn compat_mode_runs_native_slice_for_universal_binary() {
     let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
+        .arg("--compat-log")
+        .arg("verbose")
+        .arg("--compat-log-filter")
+        .arg("gethostname,uname,sysctl,sysctlbyname")
         .arg(&fixture)
         .env("MACHINA_PLUGIN_TRACE", "1")
         .env("MACHINA_TRACE_FORMAT", "jsonl")
@@ -3970,6 +4581,125 @@ fn compat_mode_proxies_memory_and_string_imports() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode startup glue test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_startup_glue_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("verbose")
+        .arg("--compat-log-filter")
+        .arg("mlock,munlock,madvise,pthread_sigmask,issetugid,issetguid,execl,next_prime,cxa_guard_acquire,cxa_guard_release,cxa_guard_abort")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(startup glue): command={} --mode compat --compat-log verbose --compat-log-filter mlock,munlock,madvise,pthread_sigmask,issetugid,issetguid,execl,next_prime,cxa_guard_acquire,cxa_guard_release,cxa_guard_abort {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(startup glue): status={status}");
+    eprintln!("compat proof(startup glue): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(startup glue): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("compat startup glue static mlock=0 munlock=0 madvise=0 mask=0")
+            && stdout.contains("oldmask_sum=0")
+            && stdout.contains("issetugid=0 execl=-1")
+            && stdout.contains("next_prime=1009")
+            && stdout.contains("guard_first=1 guard_second=0 guard=0x1")
+            && stdout.contains("guard_abort_first=1 guard_abort_second=1")
+            && stdout.contains("str_len=9 str_text=glue-cxx! str_find=4 str_compare=0 str_ok=1")
+            && stdout.contains("ok=1"),
+        "startup glue fixture did not complete static import roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat startup glue dlsym ptrs mlock=0x")
+            && stdout.contains(" munlock=0x")
+            && stdout.contains(" madvise=0x")
+            && stdout.contains(" pthread_sigmask=0x")
+            && stdout.contains(" issetugid=0x")
+            && stdout.contains(" execl=0x")
+            && stdout.contains(" next_prime=0x")
+            && stdout.contains(" cxa_guard_acquire=0x")
+            && stdout.contains(" cxa_guard_release=0x")
+            && stdout.contains(" cxa_guard_abort=0x")
+            && stdout.contains(" string_init=0x")
+            && stdout.contains(" string_append=0x")
+            && stdout.contains(" string_push=0x")
+            && stdout.contains(" string_find=0x")
+            && stdout.contains(" string_compare=0x"),
+        "startup glue fixture did not receive dlsym trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat startup glue dlsym mlock=0 munlock=0 madvise=0 mask=0")
+            && stdout.contains("oldmask_sum=0")
+            && stdout.contains("issetugid=0 execl=-1")
+            && stdout.contains("next_prime=1009")
+            && stdout.contains("guard_first=1 guard_second=0 guard=0x1")
+            && stdout.contains("guard_abort_first=1 guard_abort_second=1")
+            && stdout.contains("str_len=9 str_text=glue-cxx! str_find=4 str_compare=0 str_ok=1")
+            && stdout.contains("ok=1"),
+        "startup glue fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"
+    );
+    for fragment in [
+        "\"Call\":\"mlock\"",
+        "\"Call\":\"munlock\"",
+        "\"Call\":\"madvise\"",
+        "\"Call\":\"pthread_sigmask\"",
+        "issetugid",
+        "\"Call\":\"execl\"",
+        "\"Call\":\"__next_prime\"",
+        "__cxa_guard_acquire",
+        "__cxa_guard_release",
+        "__cxa_guard_abort",
+    ] {
+        assert!(
+            stderr.contains(fragment),
+            "startup glue compat log missing fragment {fragment:?}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn compat_mode_proxies_corefoundation_and_security_imports() {
     if std::env::consts::ARCH != "x86_64" {
         eprintln!(
@@ -4026,7 +4756,7 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
     );
     assert!(
         stdout.lines().any(|line| line.contains(
-            "compat apple static cf ok=1 len=9 text=static-cf random=0 nonzero=1 err=1"
+            "compat apple static cf ok=1 len=9 text=static-cf data_len=6 data_text=cfdata type_ok=1"
         ) && line.contains(" pass=1")),
         "Apple framework fixture did not complete static CoreFoundation/Security calls; stdout:\n{stdout}"
     );
@@ -4034,13 +4764,19 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
         stdout.contains("compat apple dlsym ptrs create=0x")
             && stdout.contains(" get=0x")
             && stdout.contains(" len=0x")
+            && stdout.contains(" data_create=0x")
+            && stdout.contains(" data_len=0x")
+            && stdout.contains(" data_bytes=0x")
+            && stdout.contains(" get_type=0x")
+            && stdout.contains(" string_type=0x")
+            && stdout.contains(" data_type=0x")
             && stdout.contains(" random=0x")
             && stdout.contains(" error=0x"),
         "Apple framework fixture did not receive dlsym Apple trampolines; stdout:\n{stdout}"
     );
     assert!(
         stdout.lines().any(|line| line.contains(
-            "compat apple dlsym cf ok=1 len=6 text=dyn-cf random=0 nonzero=1 err=1"
+            "compat apple dlsym cf ok=1 len=6 text=dyn-cf data_len=7 data_text=dyndata type_ok=1"
         ) && line.contains(" pass=1")),
         "Apple framework fixture did not complete dlsym CoreFoundation/Security calls; stdout:\n{stdout}"
     );
@@ -4722,7 +5458,7 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
         .join(" | ");
 
     eprintln!(
-        "compat proof(env/time/syscall): command={} --mode compat {}",
+        "compat proof(env/time/syscall): command={} --mode compat --compat-log verbose --compat-log-filter gethostname,uname,sysctl,sysctlbyname {}",
         machina.display(),
         fixture.display()
     );
@@ -4753,6 +5489,21 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stdout.contains(" gethostname=0 ")
             && stdout.contains(" uname=0 "),
         "env/time fixture did not complete sysconf/gethostname/uname; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat system identity uname_machine=arm64")
+            && stdout.contains(" hw_machine=arm64 ")
+            && stdout.contains(" arm64=1 "),
+        "env/time fixture did not expose ARM guest identity through uname/sysctlbyname; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"Kind\":\"identity\"")
+            && stderr.contains("\"Call\":\"uname\"")
+            && stderr.contains("\"GuestMachine\":\"arm64\"")
+            && stderr.contains("\"Call\":\"sysctlbyname\"")
+            && stderr.contains("\"Query\":\"hw.machine\"")
+            && stderr.contains("\"GuestValueText\":\"arm64\\u0000\""),
+        "verbose compat log did not include guest-facing OS identity payloads; stderr:\n{stderr}"
     );
     assert!(
         stdout.contains("compat time imported gtod=0 clock=0 nanosleep=0 usleep=0 sleep=0")

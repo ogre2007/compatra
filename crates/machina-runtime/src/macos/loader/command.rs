@@ -18,6 +18,7 @@ pub enum LoadCommand {
     Unixthread(UnixThreadCommand),
     Main(MainCommand),
     Dylib(DylibCommand),
+    IdDylib(DylibCommand),
     Rpath(RpathCommand),
     CodeSignature(CodeSignatureCommand),
     VersionMinMacosx(VersionMinCommand),
@@ -98,6 +99,9 @@ impl LoadCommand {
             load_command::LC_LOAD_DYLIB | load_command::LC_LOAD_WEAK_DYLIB => {
                 LoadCommand::Dylib(DylibCommand::parse(cmd_data, big_endian)?)
             }
+            load_command::LC_ID_DYLIB => {
+                LoadCommand::IdDylib(DylibCommand::parse(cmd_data, big_endian)?)
+            }
             load_command::LC_RPATH => {
                 LoadCommand::Rpath(RpathCommand::parse(cmd_data, big_endian)?)
             }
@@ -150,6 +154,7 @@ impl LoadCommand {
             LoadCommand::Unixthread(_) => load_command::LC_UNIXTHREAD,
             LoadCommand::Main(_) => load_command::LC_MAIN,
             LoadCommand::Dylib(_) => load_command::LC_LOAD_DYLIB,
+            LoadCommand::IdDylib(_) => load_command::LC_ID_DYLIB,
             LoadCommand::Rpath(_) => load_command::LC_RPATH,
             LoadCommand::CodeSignature(_) => load_command::LC_CODE_SIGNATURE,
             LoadCommand::VersionMinMacosx(_) => load_command::LC_VERSION_MIN_MACOSX,

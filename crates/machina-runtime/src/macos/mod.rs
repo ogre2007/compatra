@@ -59,6 +59,8 @@ pub mod emulation;
 pub mod events;
 #[path = "guest_model/files.rs"]
 pub mod guest_files;
+#[path = "loader/guest_images.rs"]
+pub mod guest_images;
 #[path = "guest_model/memory.rs"]
 pub mod guest_memory;
 pub mod guest_model;
@@ -135,6 +137,12 @@ pub use guest_files::{
 pub use guest_memory::{
     align_up, alloc_bytes, alloc_cstr, push_recent_trace, read_arm64_argv, read_cstring,
     stack_push_u32, stack_push_u64,
+};
+pub use loader::{
+    guest_library_specs_from_env, guest_library_symbol_lookup_keys, parse_guest_library_specs,
+    GuestImageAddress, GuestImageKind, GuestImageRecord, GuestImageRegistry, GuestLibraryBinding,
+    GuestLibraryChainedFixupReport, GuestLibraryImage, GuestLibraryImportSetReport,
+    GuestLibrarySet, GuestLibrarySpec, GuestLibrarySymbol, MACHINA_GUEST_LIBS_ENV,
 };
 pub use macho_utils::{
     file_backed_slice_for_vmaddr, find_symbol_address, get_dysymtab_cmd, get_symtab_cmd,

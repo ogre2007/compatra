@@ -81,6 +81,7 @@ Useful knobs:
 - `MACHINA_COMPAT_LOG=off|summary|calls|verbose`: emit compatibility-layer JSONL logs to stderr; default is `off`. Any non-`off` level also reports unhandled import-stub hits and unresolved `dlsym` requests.
 - `MACHINA_COMPAT_LOG_FILTER=write,open,getaddrinfo`: limit compat host-call logs to comma-separated normalized call names; missing-import diagnostics still emit at any non-`off` log level
 - `MACHINA_COMPAT_LOG_PREVIEW_BYTES=96`: cap escaped text/hex previews for host-proxied I/O payloads
+- `MACHINA_GUEST_LIBS=/path/libhelper.dylib`: opt in guest-side arm64 Mach-O dylibs for the no-dyld runner. Values use the host path-list separator, may include comma-separated entries, and may point at dylib files, directories of dylibs, or `.framework` directories. Guest-library exports are mapped into guest memory and used for otherwise unhandled static/chained imports and `dlsym` lookups. The loader also records a guest image registry and emits `guest-image-registry` / `guest-image` trace events with image ranges, slides, and export counts.
 - `MACHINA_INDIRECT_BRANCH_MODE=fast`: default; skip expensive indirect-branch sanitizers
 - `MACHINA_INDIRECT_BRANCH_MODE=sanitize`: enable indirect-branch sanitizers for debugging signed or tagged branch targets
 - `MACHINA_PROFILE=default`: default; 60s timeout, 50M instruction budget (suitable for most samples and CI)
@@ -111,7 +112,11 @@ cargo run --bin machina -- fixtures\macos\bin\arm64_hello
 Compatibility mode keeps the same arm64 loader and execution path but uses
 non-analysis runtime services. Selected Darwin/libSystem imports and raw
 `svc #0x80` syscall traps are proxied into host-backed helpers so small arm64
-programs can make observable progress under an Intel macOS host.
+programs can make observable progress under an Intel macOS host. For helper
+code that must run as arm64 guest code, set `MACHINA_GUEST_LIBS` to one or more
+arm64 dylibs; this is an explicit no-dyld import-resolution aid, not a full
+dyld replacement. These guest images are tracked in a loader-level registry so
+future lazy-resolution and translated-address mapping can share one image model.
 
 ```powershell
 cargo run --bin machina -- --mode compat fixtures\macos\bin\arm64_hello
@@ -198,6 +203,7 @@ Working today:
 - synthetic imports, syscall shims, guest filesystem model
 - host-backed compatibility shims for selected Darwin/libSystem imports and
   raw arm64 Darwin syscall traps in compat mode
+- opt-in guest-side arm64 dylib export mapping for otherwise unhandled imports
 - JSONL plugin events
 - real sample progression into malware logic for AMOS-style paths
 

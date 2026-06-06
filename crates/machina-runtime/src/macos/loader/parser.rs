@@ -542,6 +542,15 @@ impl MachoBinary {
         paths
     }
 
+    pub fn get_dylib_id(&self) -> Option<String> {
+        for cmd in &self.commands {
+            if let LoadCommand::IdDylib(dylib) = cmd {
+                return Some(dylib.name.clone());
+            }
+        }
+        None
+    }
+
     pub fn get_undefined_symbols(&self) -> Vec<(String, u8)> {
         let mut symbols = Vec::new();
 

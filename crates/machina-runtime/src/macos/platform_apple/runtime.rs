@@ -25,6 +25,9 @@ pub enum AppleObject {
     Number {
         value: i64,
     },
+    Boolean {
+        value: bool,
+    },
     Certificate {
         data_ref: u64,
     },
@@ -101,6 +104,7 @@ impl AppleRuntime {
     const TYPE_ID_TRUST: u64 = 0x1008;
     const TYPE_ID_DATE: u64 = 0x1009;
     const TYPE_ID_ERROR: u64 = 0x100A;
+    const TYPE_ID_BOOLEAN: u64 = 0x100B;
 
     pub fn retain(&self, handle: u64) -> u64 {
         handle
@@ -218,6 +222,19 @@ impl AppleRuntime {
     pub fn number_value(&self, number_ref: u64) -> Option<i64> {
         match self.objects.get(&number_ref) {
             Some(AppleObject::Number { value }) => Some(*value),
+            Some(AppleObject::Boolean { value }) => Some(*value as i64),
+            _ => None,
+        }
+    }
+
+    pub fn alloc_boolean(&mut self, value: bool) -> u64 {
+        self.alloc(AppleObject::Boolean { value })
+    }
+
+    pub fn boolean_value(&self, boolean_ref: u64) -> Option<bool> {
+        match self.objects.get(&boolean_ref) {
+            Some(AppleObject::Boolean { value }) => Some(*value),
+            Some(AppleObject::Number { value }) => Some(*value != 0),
             _ => None,
         }
     }
@@ -468,6 +485,9 @@ impl AppleRuntime {
             Some(AppleObject::Data { .. }) => Some("NSData".to_string()),
             Some(AppleObject::Array { .. }) => Some("NSArray".to_string()),
             Some(AppleObject::Dictionary { .. }) => Some("NSDictionary".to_string()),
+            Some(AppleObject::Number { .. }) | Some(AppleObject::Boolean { .. }) => {
+                Some("NSNumber".to_string())
+            }
             Some(AppleObject::Url { .. }) => Some("NSURL".to_string()),
             Some(AppleObject::Bundle { .. }) => Some("NSBundle".to_string()),
             _ => None,
@@ -538,6 +558,7 @@ impl AppleRuntime {
             Some(AppleObject::Array { .. }) => Self::TYPE_ID_ARRAY,
             Some(AppleObject::Dictionary { .. }) => Self::TYPE_ID_DICTIONARY,
             Some(AppleObject::Number { .. }) => Self::TYPE_ID_NUMBER,
+            Some(AppleObject::Boolean { .. }) => Self::TYPE_ID_BOOLEAN,
             Some(AppleObject::Certificate { .. }) => Self::TYPE_ID_CERTIFICATE,
             Some(AppleObject::PolicySsl { .. }) => Self::TYPE_ID_POLICY_SSL,
             Some(AppleObject::Trust { .. }) => Self::TYPE_ID_TRUST,
@@ -555,6 +576,26 @@ impl AppleRuntime {
 
     pub fn number_type_id(&self) -> u64 {
         Self::TYPE_ID_NUMBER
+    }
+
+    pub fn string_type_id(&self) -> u64 {
+        Self::TYPE_ID_STRING
+    }
+
+    pub fn data_type_id(&self) -> u64 {
+        Self::TYPE_ID_DATA
+    }
+
+    pub fn array_type_id(&self) -> u64 {
+        Self::TYPE_ID_ARRAY
+    }
+
+    pub fn dictionary_type_id(&self) -> u64 {
+        Self::TYPE_ID_DICTIONARY
+    }
+
+    pub fn boolean_type_id(&self) -> u64 {
+        Self::TYPE_ID_BOOLEAN
     }
 
     pub fn error_code(&self, error_ref: u64) -> Option<i64> {
@@ -628,6 +669,7 @@ impl AppleRuntime {
                 None => format!("CFDictionary(count={})", entries.len()),
             },
             Some(AppleObject::Number { value }) => format!("CFNumber({})", value),
+            Some(AppleObject::Boolean { value }) => format!("CFBoolean({})", value),
             Some(AppleObject::Certificate { data_ref }) => {
                 format!("SecCertificate(data=0x{:X})", data_ref)
             }
@@ -816,6 +858,61 @@ mod tests {
         assert_eq!(runtime.host_ptr(dict_ref), Some(0x1234_B000));
         assert_eq!(runtime.dictionary_len(dict_ref), Some(1));
         assert_eq!(runtime.dictionary_get(dict_ref, 0x30), Some(0x40));
+    }
+
+    #[test]
+    fn corefoundation_type_ids_track_synthetic_object_kinds() {
+        let mut runtime = AppleRuntime::default();
+
+        let string_ref = runtime.alloc_string(b"hello".to_vec(), 0x0800_0100);
+        let data_ref = runtime.alloc_data(b"bytes".to_vec());
+        let array_ref = runtime.alloc_array_with_values(vec![string_ref]);
+        let dict_ref = runtime.alloc_dictionary(vec![(string_ref, data_ref)]);
+        let number_ref = runtime.alloc_number(42);
+        let boolean_ref = runtime.alloc_boolean(true);
+
+        assert_eq!(runtime.type_id(string_ref), runtime.string_type_id());
+        assert_eq!(runtime.type_id(data_ref), runtime.data_type_id());
+        assert_eq!(runtime.type_id(array_ref), runtime.array_type_id());
+        assert_eq!(runtime.type_id(dict_ref), runtime.dictionary_type_id());
+        assert_eq!(runtime.type_id(number_ref), runtime.number_type_id());
+        assert_eq!(runtime.type_id(boolean_ref), runtime.boolean_type_id());
+        assert_eq!(runtime.boolean_value(boolean_ref), Some(true));
+        assert_eq!(runtime.number_value(boolean_ref), Some(1));
+        assert_eq!(
+            runtime.objc_object_kind(boolean_ref),
+            Some("NSNumber".to_string())
+        );
+    }
+
+    #[test]
+    fn security_objects_preserve_certificate_and_trust_relationships() {
+        let mut runtime = AppleRuntime::default();
+
+        let cert_data = runtime.alloc_data(b"certificate-bytes".to_vec());
+        let cert = runtime.alloc_certificate(cert_data);
+        let policy = runtime.alloc_policy_ssl(true, 0);
+        let single_trust = runtime.alloc_trust(cert, policy);
+
+        assert_eq!(runtime.certificate_data(cert), Some(cert_data));
+        assert_eq!(runtime.trust_certificate_count(single_trust), Some(1));
+        assert_eq!(
+            runtime.trust_certificate_at_index(single_trust, 0),
+            Some(cert)
+        );
+        assert_eq!(runtime.trust_certificate_at_index(single_trust, 1), None);
+
+        let certs = runtime.alloc_array_with_values(vec![cert, 0xCAFE]);
+        let array_trust = runtime.alloc_trust(certs, policy);
+        assert_eq!(runtime.trust_certificate_count(array_trust), Some(2));
+        assert_eq!(
+            runtime.trust_certificate_at_index(array_trust, 0),
+            Some(cert)
+        );
+        assert_eq!(
+            runtime.trust_certificate_at_index(array_trust, 1),
+            Some(0xCAFE)
+        );
     }
 
     #[test]

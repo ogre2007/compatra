@@ -1,10 +1,15 @@
 //! Compatibility-mode host service boundary.
 
+mod cxx;
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "macos")]
+use cxx::CxxImportKind;
 
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
@@ -535,6 +540,21 @@ fn emit_compat_log_line(
     let _ = writeln!(std::io::stderr(), "{out}");
 }
 
+#[cfg(target_os = "macos")]
+fn emit_verbose_compat_payload(
+    kind: &str,
+    call: &str,
+    args: &[(&str, String)],
+    fields: &mut [(&str, Option<String>)],
+    preview: Option<&[u8]>,
+) {
+    let config = compat_log_config();
+    if config.level != CompatLogLevel::Verbose || !config.should_emit(call, false) {
+        return;
+    }
+    emit_compat_log_line(kind, call, args, fields, preview);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostImportKind {
     #[cfg(target_os = "macos")]
@@ -748,6 +768,12 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     SysctlByName,
     #[cfg(target_os = "macos")]
+    Mlock,
+    #[cfg(target_os = "macos")]
+    Munlock,
+    #[cfg(target_os = "macos")]
+    Madvise,
+    #[cfg(target_os = "macos")]
     Umask,
     #[cfg(target_os = "macos")]
     FOpen,
@@ -816,6 +842,8 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     Strdup,
     #[cfg(target_os = "macos")]
+    Cxx(CxxImportKind),
+    #[cfg(target_os = "macos")]
     OpenDir,
     #[cfg(target_os = "macos")]
     FdOpenDir,
@@ -838,7 +866,13 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     PthreadThreadingNp,
     #[cfg(target_os = "macos")]
+    PthreadSigmask,
+    #[cfg(target_os = "macos")]
     NSGetExecutablePath,
+    #[cfg(target_os = "macos")]
+    IsSetUGid,
+    #[cfg(target_os = "macos")]
+    Execl,
     #[cfg(target_os = "macos")]
     GetProgName,
     #[cfg(target_os = "macos")]
@@ -894,10 +928,14 @@ impl CompatibilityServices {
             ("Address", hex_arg(address)),
             ("Lr", hex_arg(lr)),
         ];
-        let mut fields = [
+        let mut fields = vec![
             ("status", Some("unhandled".to_string())),
             ("reason", Some(reason.to_string())),
         ];
+        if let Some(diagnostic) = cxx::diagnose_symbol(symbol) {
+            fields.push(("CxxCategory", Some(diagnostic.category.to_string())));
+            fields.push(("CxxStrategy", Some(diagnostic.strategy.to_string())));
+        }
         emit_compat_log_line("diagnostic", "unhandled-import", &args, &mut fields, None);
     }
 
@@ -924,10 +962,14 @@ impl CompatibilityServices {
             ("Handle", hex_arg(handle)),
             ("ImportSymbol", symbol.to_string()),
         ];
-        let mut fields = [
+        let mut fields = vec![
             ("status", Some("unhandled".to_string())),
             ("reason", Some(reason.to_string())),
         ];
+        if let Some(diagnostic) = cxx::diagnose_symbol(symbol) {
+            fields.push(("CxxCategory", Some(diagnostic.category.to_string())));
+            fields.push(("CxxStrategy", Some(diagnostic.strategy.to_string())));
+        }
         emit_compat_log_line("diagnostic", "unresolved-dlsym", &args, &mut fields, None);
     }
 
@@ -1259,6 +1301,11 @@ impl CompatibilityServices {
                     self.sysctlbyname(memory, args[0], args[1], args[2], args[3], args[4])?
                         .into(),
                 ),
+                HostImportKind::Mlock => Some(proxy_guest_memory_lock("mlock", args[0], args[1])),
+                HostImportKind::Munlock => {
+                    Some(proxy_guest_memory_lock("munlock", args[0], args[1]))
+                }
+                HostImportKind::Madvise => Some(proxy_guest_madvise(args[0], args[1], args[2])),
                 HostImportKind::Umask => Some(self.umask(args[0])?),
                 HostImportKind::FOpen => Some(self.fopen_path(memory, args[0], args[1])?),
                 HostImportKind::FdOpen => Some(self.fdopen_fd(memory, args[0], args[1])?),
@@ -1303,6 +1350,7 @@ impl CompatibilityServices {
                 HostImportKind::Strchr => Some(self.strchr(memory, args[0], args[1])?),
                 HostImportKind::Strrchr => Some(self.strrchr(memory, args[0], args[1])?),
                 HostImportKind::Strdup => Some(self.strdup(memory, args[0])?),
+                HostImportKind::Cxx(kind) => proxy_cxx_import(kind, memory, args),
                 HostImportKind::OpenDir => Some(self.opendir_path(memory, args[0])?),
                 HostImportKind::FdOpenDir => Some(self.fdopendir_fd(memory, args[0])?),
                 HostImportKind::ReadDir => Some(self.readdir_handle(memory, args[0])?),
@@ -1318,9 +1366,14 @@ impl CompatibilityServices {
                     Some(self.getentropy(memory, args[0], args[1] as usize)?.into())
                 }
                 HostImportKind::PthreadThreadingNp => Some(proxy_host_pthread_threading_np()),
+                HostImportKind::PthreadSigmask => Some(proxy_guest_pthread_sigmask(
+                    memory, args[0], args[1], args[2],
+                )?),
                 HostImportKind::NSGetExecutablePath => Some(proxy_guest_ns_get_executable_path(
                     memory, args[0], args[1],
                 )?),
+                HostImportKind::IsSetUGid => Some(host_call_value(0)),
+                HostImportKind::Execl => Some(proxy_guest_execl(memory, args[0], args[1])?),
                 HostImportKind::GetProgName => Some(host_call_value(
                     memory
                         .guest_program_name_ptr()
@@ -4191,6 +4244,320 @@ fn proxy_host_pthread_threading_np() -> HostCallResult {
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_cxx_import<M: GuestMemory + ?Sized>(
+    kind: CxxImportKind,
+    memory: &mut M,
+    args: &[u64; 8],
+) -> Option<HostCallResult> {
+    match kind {
+        CxxImportKind::LibcppNextPrime => Some(proxy_libcpp_next_prime(args[0])),
+        CxxImportKind::CxaGuardAcquire => Some(proxy_guest_cxa_guard_acquire(memory, args[0])?),
+        CxxImportKind::CxaGuardRelease => Some(proxy_guest_cxa_guard_release(memory, args[0])?),
+        CxxImportKind::CxaGuardAbort => Some(proxy_guest_cxa_guard_abort(memory, args[0])?),
+        _ => cxx::proxy_import(kind, memory, args),
+    }
+}
+
+#[cfg(target_os = "macos")]
+type LibcppNextPrimeFn = unsafe extern "C" fn(libc::c_ulong) -> libc::c_ulong;
+
+#[cfg(target_os = "macos")]
+fn host_libcpp_next_prime_fn() -> Option<LibcppNextPrimeFn> {
+    static SYMBOL: OnceLock<Option<LibcppNextPrimeFn>> = OnceLock::new();
+    *SYMBOL.get_or_init(|| {
+        let symbol_names = [
+            CString::new("_ZNSt3__112__next_primeEm").ok()?,
+            CString::new("__ZNSt3__112__next_primeEm").ok()?,
+        ];
+        let default_handle = (-2isize) as *mut libc::c_void;
+        for symbol in &symbol_names {
+            let ptr = unsafe { libc::dlsym(default_handle, symbol.as_ptr()) };
+            if !ptr.is_null() {
+                return Some(unsafe {
+                    mem::transmute::<*mut libc::c_void, LibcppNextPrimeFn>(ptr)
+                });
+            }
+        }
+
+        let path = CString::new("/usr/lib/libc++.1.dylib").ok()?;
+        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW) };
+        if handle.is_null() {
+            return None;
+        }
+        for symbol in &symbol_names {
+            let ptr = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+            if !ptr.is_null() {
+                return Some(unsafe {
+                    mem::transmute::<*mut libc::c_void, LibcppNextPrimeFn>(ptr)
+                });
+            }
+        }
+        None
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_libcpp_next_prime(value: u64) -> HostCallResult {
+    let host_value = libc::c_ulong::try_from(value)
+        .ok()
+        .and_then(|value| host_libcpp_next_prime_fn().map(|func| unsafe { func(value) as u64 }));
+    let (return_value, source) = host_value
+        .map(|value| (value, "host-libc++"))
+        .unwrap_or_else(|| (compat_next_prime(value), "compat-fallback"));
+    let mut fields = [
+        ("Source", Some(source.to_string())),
+        ("Result", Some(return_value.to_string())),
+    ];
+    emit_verbose_compat_payload(
+        "cxx",
+        "__next_prime",
+        &[("Value", value.to_string())],
+        &mut fields,
+        None,
+    );
+    host_call_value(return_value)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn compat_next_prime(value: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    if value <= 2 {
+        return 2;
+    }
+    let mut candidate = value;
+    if candidate % 2 == 0 {
+        candidate = candidate.saturating_add(1);
+    }
+    while !compat_is_prime(candidate) {
+        let Some(next) = candidate.checked_add(2) else {
+            return u64::MAX;
+        };
+        candidate = next;
+    }
+    candidate
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn compat_is_prime(value: u64) -> bool {
+    if value < 2 {
+        return false;
+    }
+    if value % 2 == 0 {
+        return value == 2;
+    }
+    let mut divisor = 3u64;
+    while divisor <= value / divisor {
+        if value % divisor == 0 {
+            return false;
+        }
+        divisor += 2;
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+const CXA_GUARD_SIZE: usize = 8;
+#[cfg(target_os = "macos")]
+const CXA_GUARD_INITIALIZED_BYTE: usize = 0;
+#[cfg(target_os = "macos")]
+const CXA_GUARD_IN_USE_BYTE: usize = 1;
+
+#[cfg(target_os = "macos")]
+fn read_guest_cxa_guard<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    guard_ptr: u64,
+) -> Result<[u8; CXA_GUARD_SIZE], GuestMemoryError> {
+    let bytes = memory.read_memory(guard_ptr, CXA_GUARD_SIZE)?;
+    <[u8; CXA_GUARD_SIZE]>::try_from(bytes.as_slice()).map_err(|_| GuestMemoryError)
+}
+
+#[cfg(target_os = "macos")]
+fn emit_verbose_cxa_guard(
+    call: &str,
+    guard_ptr: u64,
+    before: &[u8; CXA_GUARD_SIZE],
+    after: &[u8; CXA_GUARD_SIZE],
+    return_value: u64,
+) {
+    let mut fields = [
+        ("BeforeHex", Some(compat_preview_hex(before))),
+        ("AfterHex", Some(compat_preview_hex(after))),
+        ("Result", Some(return_value.to_string())),
+    ];
+    emit_verbose_compat_payload(
+        "cxx",
+        call,
+        &[("guard", hex_arg(guard_ptr))],
+        &mut fields,
+        None,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_cxa_guard_acquire<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    guard_ptr: u64,
+) -> Option<HostCallResult> {
+    if guard_ptr == 0 {
+        return Some(host_call_value(0));
+    }
+    let Ok(before) = read_guest_cxa_guard(memory, guard_ptr) else {
+        return Some(host_call_value(0));
+    };
+    let mut after = before;
+    let return_value = if before[CXA_GUARD_INITIALIZED_BYTE] & 1 != 0 {
+        0
+    } else if before[CXA_GUARD_IN_USE_BYTE] != 0 {
+        0
+    } else {
+        after[CXA_GUARD_IN_USE_BYTE] = 1;
+        if memory.write_memory(guard_ptr, &after).is_err() {
+            return Some(host_call_value(0));
+        }
+        1
+    };
+    emit_verbose_cxa_guard(
+        "__cxa_guard_acquire",
+        guard_ptr,
+        &before,
+        &after,
+        return_value,
+    );
+    Some(host_call_value(return_value))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_cxa_guard_release<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    guard_ptr: u64,
+) -> Option<HostCallResult> {
+    if guard_ptr == 0 {
+        return Some(host_call_value(0));
+    }
+    let before = read_guest_cxa_guard(memory, guard_ptr).unwrap_or([0u8; CXA_GUARD_SIZE]);
+    let mut after = before;
+    after[CXA_GUARD_INITIALIZED_BYTE] = 1;
+    after[CXA_GUARD_IN_USE_BYTE] = 0;
+    let _ = memory.write_memory(guard_ptr, &after);
+    emit_verbose_cxa_guard("__cxa_guard_release", guard_ptr, &before, &after, 0);
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_cxa_guard_abort<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    guard_ptr: u64,
+) -> Option<HostCallResult> {
+    if guard_ptr == 0 {
+        return Some(host_call_value(0));
+    }
+    let before = read_guest_cxa_guard(memory, guard_ptr).unwrap_or([0u8; CXA_GUARD_SIZE]);
+    let mut after = before;
+    after[CXA_GUARD_IN_USE_BYTE] = 0;
+    let _ = memory.write_memory(guard_ptr, &after);
+    emit_verbose_cxa_guard("__cxa_guard_abort", guard_ptr, &before, &after, 0);
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+const DARWIN_SIGSET_T_SIZE: usize = 4;
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_pthread_sigmask<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    how: u64,
+    set_ptr: u64,
+    oldset_ptr: u64,
+) -> Option<HostCallResult> {
+    if oldset_ptr != 0
+        && memory
+            .write_memory(oldset_ptr, &[0u8; DARWIN_SIGSET_T_SIZE])
+            .is_err()
+    {
+        return Some(host_call_value(libc::EFAULT as u64));
+    }
+    let mut fields = [
+        ("Model", Some("guest-empty-mask".to_string())),
+        ("OldSetBytes", Some(DARWIN_SIGSET_T_SIZE.to_string())),
+    ];
+    emit_verbose_compat_payload(
+        "thread",
+        "pthread_sigmask",
+        &[
+            ("how", how.to_string()),
+            ("set", hex_arg(set_ptr)),
+            ("oldset", hex_arg(oldset_ptr)),
+        ],
+        &mut fields,
+        None,
+    );
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_memory_lock(call: &str, addr: u64, len: u64) -> HostCallResult {
+    let mut fields = [("Model", Some("guest-pointer-noop".to_string()))];
+    emit_verbose_compat_payload(
+        "memory",
+        call,
+        &[("addr", hex_arg(addr)), ("len", len.to_string())],
+        &mut fields,
+        None,
+    );
+    host_call_value(0)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_madvise(addr: u64, len: u64, advice: u64) -> HostCallResult {
+    let mut fields = [("Model", Some("guest-pointer-noop".to_string()))];
+    emit_verbose_compat_payload(
+        "memory",
+        "madvise",
+        &[
+            ("addr", hex_arg(addr)),
+            ("len", len.to_string()),
+            ("advice", advice.to_string()),
+        ],
+        &mut fields,
+        None,
+    );
+    host_call_value(0)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_execl<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    arg0_ptr: u64,
+) -> Option<HostCallResult> {
+    let path = read_cstring(memory, path_ptr, 4096)
+        .unwrap_or_else(|_| format!("<invalid:0x{path_ptr:X}>"));
+    let arg0 = if arg0_ptr == 0 {
+        "<null>".to_string()
+    } else {
+        read_cstring(memory, arg0_ptr, 4096).unwrap_or_else(|_| format!("<invalid:0x{arg0_ptr:X}>"))
+    };
+    let mut fields = [
+        ("Path", Some(path)),
+        ("Arg0", Some(arg0)),
+        (
+            "Reason",
+            Some("exec would replace the compatibility host process".to_string()),
+        ),
+    ];
+    emit_verbose_compat_payload(
+        "process",
+        "execl",
+        &[("path", hex_arg(path_ptr)), ("arg0", hex_arg(arg0_ptr))],
+        &mut fields,
+        None,
+    );
+    Some(host_call_error(libc::ENOSYS as u32))
+}
+
+#[cfg(target_os = "macos")]
 const DEFAULT_GUEST_PTHREAD_STACK_SIZE: u64 = 0x20_0000;
 
 #[cfg(target_os = "macos")]
@@ -4417,7 +4784,11 @@ fn proxy_guest_os_unfair_lock_unlock<M: GuestMemory + ?Sized>(
 fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
     #[cfg(target_os = "macos")]
     {
-        match normalize_import_name(symbol) {
+        let symbol = normalize_import_name(symbol);
+        if let Some(kind) = cxx::classify_import(symbol) {
+            return Some(HostImportKind::Cxx(kind));
+        }
+        match symbol {
             "puts" => Some(HostImportKind::Puts),
             "printf" => Some(HostImportKind::Printf),
             "snprintf" => Some(HostImportKind::SnPrintf),
@@ -4525,6 +4896,9 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "setrlimit" => Some(HostImportKind::SetRLimit),
             "sysctl" => Some(HostImportKind::Sysctl),
             "sysctlbyname" => Some(HostImportKind::SysctlByName),
+            "mlock" => Some(HostImportKind::Mlock),
+            "munlock" => Some(HostImportKind::Munlock),
+            "madvise" => Some(HostImportKind::Madvise),
             "umask" => Some(HostImportKind::Umask),
             "fopen" | "fopen$UNIX2003" => Some(HostImportKind::FOpen),
             "fdopen" | "fdopen$UNIX2003" => Some(HostImportKind::FdOpen),
@@ -4570,9 +4944,12 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "seekdir" => Some(HostImportKind::Seekdir),
             "getentropy" => Some(HostImportKind::GetEntropy),
             "pthread_threading_np" => Some(HostImportKind::PthreadThreadingNp),
+            "pthread_sigmask" => Some(HostImportKind::PthreadSigmask),
             "_NSGetExecutablePath" | "NSGetExecutablePath" => {
                 Some(HostImportKind::NSGetExecutablePath)
             }
+            "issetugid" | "issetguid" => Some(HostImportKind::IsSetUGid),
+            "execl" => Some(HostImportKind::Execl),
             "getprogname" => Some(HostImportKind::GetProgName),
             "setprogname" => Some(HostImportKind::SetProgName),
             "_dyld_image_count" | "dyld_image_count" => Some(HostImportKind::DyldImageCount),
@@ -8134,6 +8511,137 @@ fn proxy_host_unsetenv<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+const COMPAT_GUEST_MACHINE: &str = "arm64";
+#[cfg(target_os = "macos")]
+const COMPAT_GUEST_MODEL: &str = "VirtualMac2,1";
+#[cfg(target_os = "macos")]
+const DARWIN_CTL_HW: libc::c_int = 6;
+#[cfg(target_os = "macos")]
+const DARWIN_HW_MACHINE: libc::c_int = 1;
+#[cfg(target_os = "macos")]
+const DARWIN_HW_MODEL: libc::c_int = 2;
+#[cfg(target_os = "macos")]
+const DARWIN_HW_MACHINE_ARCH: libc::c_int = 12;
+#[cfg(target_os = "macos")]
+const DARWIN_CPU_TYPE_ARM64: i32 = 0x0100_000C;
+#[cfg(target_os = "macos")]
+const DARWIN_CPU_SUBTYPE_ARM64_ALL: i32 = 0;
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct CompatIdentitySysctl {
+    label: String,
+    value_kind: &'static str,
+    value: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_cstring_value(value: &str) -> Vec<u8> {
+    let mut out = value.as_bytes().to_vec();
+    out.push(0);
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_i32_value(value: i32) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+#[cfg(target_os = "macos")]
+fn compat_identity_sysctl_by_name(name: &str) -> Option<CompatIdentitySysctl> {
+    let (value_kind, value) = match name {
+        "hw.machine" | "hw.machinearch" => ("cstring", sysctl_cstring_value(COMPAT_GUEST_MACHINE)),
+        "hw.model" => ("cstring", sysctl_cstring_value(COMPAT_GUEST_MODEL)),
+        "hw.cputype" => ("i32", sysctl_i32_value(DARWIN_CPU_TYPE_ARM64)),
+        "hw.cpusubtype" => ("i32", sysctl_i32_value(DARWIN_CPU_SUBTYPE_ARM64_ALL)),
+        "hw.optional.arm64" => ("i32", sysctl_i32_value(1)),
+        name if name.starts_with("hw.optional.arm64.")
+            || name.starts_with("hw.optional.armv")
+            || name.starts_with("hw.optional.arm.") =>
+        {
+            ("i32", sysctl_i32_value(0))
+        }
+        _ => return None,
+    };
+    Some(CompatIdentitySysctl {
+        label: name.to_string(),
+        value_kind,
+        value,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn compat_identity_sysctl_by_mib(mib: &[libc::c_int]) -> Option<CompatIdentitySysctl> {
+    if mib.len() < 2 || mib[0] != DARWIN_CTL_HW {
+        return None;
+    }
+    let (label, value_kind, value) = match mib[1] {
+        DARWIN_HW_MACHINE => (
+            "CTL_HW.HW_MACHINE",
+            "cstring",
+            sysctl_cstring_value(COMPAT_GUEST_MACHINE),
+        ),
+        DARWIN_HW_MODEL => (
+            "CTL_HW.HW_MODEL",
+            "cstring",
+            sysctl_cstring_value(COMPAT_GUEST_MODEL),
+        ),
+        DARWIN_HW_MACHINE_ARCH => (
+            "CTL_HW.HW_MACHINE_ARCH",
+            "cstring",
+            sysctl_cstring_value(COMPAT_GUEST_MACHINE),
+        ),
+        _ => return None,
+    };
+    Some(CompatIdentitySysctl {
+        label: label.to_string(),
+        value_kind,
+        value,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn preview_text_field(bytes: &[u8]) -> String {
+    let preview_len = bytes.len().min(compat_log_config().preview_bytes);
+    compat_preview_text(&bytes[..preview_len])
+}
+
+#[cfg(target_os = "macos")]
+fn preview_hex_field(bytes: &[u8]) -> String {
+    let preview_len = bytes.len().min(compat_log_config().preview_bytes);
+    compat_preview_hex(&bytes[..preview_len])
+}
+
+#[cfg(target_os = "macos")]
+fn c_char_array_to_string<const N: usize>(value: &[libc::c_char; N]) -> String {
+    unsafe { CStr::from_ptr(value.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn write_c_char_array<const N: usize>(dst: &mut [libc::c_char; N], value: &str) {
+    for byte in dst.iter_mut() {
+        *byte = 0;
+    }
+    let bytes = value.as_bytes();
+    let copy_len = bytes.len().min(N.saturating_sub(1));
+    for (idx, byte) in bytes.iter().take(copy_len).enumerate() {
+        dst[idx] = *byte as libc::c_char;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn emit_verbose_identity(
+    call: &str,
+    args: &[(&str, String)],
+    fields: &mut [(&str, Option<String>)],
+    preview: Option<&[u8]>,
+) {
+    emit_verbose_compat_payload("identity", call, args, fields, preview);
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_sysconf(name: u64) -> Option<HostCallResult> {
     clear_errno();
     let ret = unsafe { libc::sysconf(name as libc::c_int) };
@@ -8172,6 +8680,20 @@ fn proxy_host_gethostname<M: GuestMemory + ?Sized>(
     {
         return Some(host_io_error(libc::EFAULT as u32));
     }
+    if ret == 0 {
+        let returned_name = host
+            .split(|byte| *byte == 0)
+            .next()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default();
+        let args = [("name_ptr", hex_arg(name_ptr)), ("len", len.to_string())];
+        let mut fields = [
+            ("Source", Some("host".to_string())),
+            ("HostName", Some(returned_name.clone())),
+            ("GuestName", Some(returned_name)),
+        ];
+        emit_verbose_identity("gethostname", &args, &mut fields, Some(&host));
+    }
     Some(host_io_result(ret as isize, host))
 }
 
@@ -8183,8 +8705,33 @@ fn proxy_host_uname<M: GuestMemory + ?Sized>(memory: &mut M, uts_ptr: u64) -> Op
     let mut uts = MaybeUninit::<libc::utsname>::zeroed();
     clear_errno();
     let ret = unsafe { libc::uname(uts.as_mut_ptr()) };
-    if ret == 0 && write_guest_host_struct(memory, uts_ptr, &uts).is_err() {
-        return Some(host_io_error(libc::EFAULT as u32));
+    if ret == 0 {
+        let mut uts = unsafe { uts.assume_init() };
+        let host_sysname = c_char_array_to_string(&uts.sysname);
+        let host_nodename = c_char_array_to_string(&uts.nodename);
+        let host_release = c_char_array_to_string(&uts.release);
+        let host_version = c_char_array_to_string(&uts.version);
+        let host_machine = c_char_array_to_string(&uts.machine);
+        write_c_char_array(&mut uts.machine, COMPAT_GUEST_MACHINE);
+        let out = MaybeUninit::new(uts);
+        if write_guest_host_struct(memory, uts_ptr, &out).is_err() {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
+        let args = [("uts_ptr", hex_arg(uts_ptr))];
+        let mut fields = [
+            ("Source", Some("host+compat-identity".to_string())),
+            ("HostSysName", Some(host_sysname.clone())),
+            ("HostNodeName", Some(host_nodename.clone())),
+            ("HostRelease", Some(host_release.clone())),
+            ("HostVersion", Some(host_version.clone())),
+            ("HostMachine", Some(host_machine)),
+            ("GuestSysName", Some(host_sysname)),
+            ("GuestNodeName", Some(host_nodename)),
+            ("GuestRelease", Some(host_release)),
+            ("GuestVersion", Some(host_version)),
+            ("GuestMachine", Some(COMPAT_GUEST_MACHINE.to_string())),
+        ];
+        emit_verbose_identity("uname", &args, &mut fields, None);
     }
     Some(host_io_result(ret as isize, Vec::new()))
 }
@@ -8434,6 +8981,142 @@ fn proxy_host_sysctlbyname<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct HostSysctlSnapshot {
+    ret: libc::c_int,
+    errno: u32,
+    value: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+fn host_sysctlbyname_snapshot(name: &str) -> Option<HostSysctlSnapshot> {
+    let host_name = CString::new(name).ok()?;
+    let mut old_len = 0usize;
+    clear_errno();
+    let len_ret = unsafe {
+        libc::sysctlbyname(
+            host_name.as_ptr(),
+            ptr::null_mut(),
+            &mut old_len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    let len_errno = if len_ret < 0 { host_errno() } else { 0 };
+    if len_ret != 0 || old_len == 0 || old_len > MAX_GUEST_SYSCTL_BYTES {
+        return Some(HostSysctlSnapshot {
+            ret: len_ret,
+            errno: len_errno,
+            value: Vec::new(),
+        });
+    }
+    let mut value = vec![0u8; old_len];
+    clear_errno();
+    let ret = unsafe {
+        libc::sysctlbyname(
+            host_name.as_ptr(),
+            value.as_mut_ptr().cast::<libc::c_void>(),
+            &mut old_len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    value.truncate(old_len.min(value.len()));
+    Some(HostSysctlSnapshot {
+        ret,
+        errno: if ret < 0 { host_errno() } else { 0 },
+        value,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn host_sysctl_mib_snapshot(mib: &[libc::c_int]) -> Option<HostSysctlSnapshot> {
+    if mib.is_empty() {
+        return None;
+    }
+    let mut name = mib.to_vec();
+    let mut old_len = 0usize;
+    clear_errno();
+    let len_ret = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            name.len() as libc::c_uint,
+            ptr::null_mut(),
+            &mut old_len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    let len_errno = if len_ret < 0 { host_errno() } else { 0 };
+    if len_ret != 0 || old_len == 0 || old_len > MAX_GUEST_SYSCTL_BYTES {
+        return Some(HostSysctlSnapshot {
+            ret: len_ret,
+            errno: len_errno,
+            value: Vec::new(),
+        });
+    }
+    let mut value = vec![0u8; old_len];
+    clear_errno();
+    let ret = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            name.len() as libc::c_uint,
+            value.as_mut_ptr().cast::<libc::c_void>(),
+            &mut old_len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    value.truncate(old_len.min(value.len()));
+    Some(HostSysctlSnapshot {
+        ret,
+        errno: if ret < 0 { host_errno() } else { 0 },
+        value,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn emit_verbose_sysctl_payload(
+    call: &str,
+    query: &str,
+    source: &str,
+    ret: u64,
+    errno: u32,
+    oldp: u64,
+    oldlenp: u64,
+    value_kind: &str,
+    guest_value: &[u8],
+    host_snapshot: Option<&HostSysctlSnapshot>,
+) {
+    let args = [
+        ("Query", query.to_string()),
+        ("oldp", hex_arg(oldp)),
+        ("oldlenp", hex_arg(oldlenp)),
+    ];
+    let mut fields = vec![
+        ("Source", Some(source.to_string())),
+        ("return", Some(format_return(ret))),
+        ("return_hex", Some(format!("0x{ret:X}"))),
+        ("errno", Some(errno.to_string())),
+        ("ValueKind", Some(value_kind.to_string())),
+        ("GuestValueText", Some(preview_text_field(guest_value))),
+        ("GuestValueHex", Some(preview_hex_field(guest_value))),
+        ("GuestValueBytes", Some(guest_value.len().to_string())),
+    ];
+    if let Some(host) = host_snapshot {
+        fields.push((
+            "HostReturn",
+            Some(format_return(signed_return_value(host.ret as isize))),
+        ));
+        fields.push(("HostErrno", Some(host.errno.to_string())));
+        fields.push(("HostValueText", Some(preview_text_field(&host.value))));
+        fields.push(("HostValueHex", Some(preview_hex_field(&host.value))));
+        fields.push(("HostValueBytes", Some(host.value.len().to_string())));
+    }
+    emit_verbose_identity(call, &args, &mut fields, Some(guest_value));
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_sysctl_common<M: GuestMemory + ?Sized>(
     memory: &mut M,
     mut name: Option<&mut Vec<libc::c_int>>,
@@ -8446,6 +9129,10 @@ fn proxy_host_sysctl_common<M: GuestMemory + ?Sized>(
     if oldp != 0 && oldlenp == 0 {
         return Some(host_io_error(libc::EFAULT as u32));
     }
+    let query_name = name_by_string
+        .and_then(|name| name.to_str().ok())
+        .map(str::to_string);
+    let query_mib = name.as_deref().map(|mib| mib.to_vec());
     let mut old_len = if oldp != 0 && oldlenp != 0 {
         match read_guest_u64_value(memory, oldlenp) {
             Ok(value) => value as usize,
@@ -8466,6 +9153,49 @@ fn proxy_host_sysctl_common<M: GuestMemory + ?Sized>(
         Ok(buffer) => buffer,
         Err(errno) => return Some(host_io_error(errno)),
     };
+    if newp == 0 && newlen == 0 {
+        let identity = query_name
+            .as_deref()
+            .and_then(compat_identity_sysctl_by_name)
+            .or_else(|| query_mib.as_deref().and_then(compat_identity_sysctl_by_mib));
+        if let Some(identity) = identity {
+            if let Err(errno) = write_guest_sysctl_output(
+                memory,
+                oldp,
+                oldlenp,
+                identity.value.len(),
+                &identity.value,
+            ) {
+                return Some(host_io_error(errno));
+            }
+            let host_snapshot = if compat_log_config().level == CompatLogLevel::Verbose {
+                query_name
+                    .as_deref()
+                    .and_then(host_sysctlbyname_snapshot)
+                    .or_else(|| query_mib.as_deref().and_then(host_sysctl_mib_snapshot))
+            } else {
+                None
+            };
+            let call = if query_name.is_some() {
+                "sysctlbyname"
+            } else {
+                "sysctl"
+            };
+            emit_verbose_sysctl_payload(
+                call,
+                &identity.label,
+                "compat-identity",
+                0,
+                0,
+                oldp,
+                oldlenp,
+                identity.value_kind,
+                &identity.value,
+                host_snapshot.as_ref(),
+            );
+            return Some(host_io_result(0, identity.value));
+        }
+    }
     clear_errno();
     let ret = unsafe {
         if let Some(host_name) = name_by_string {
@@ -8515,10 +9245,32 @@ fn proxy_host_sysctl_common<M: GuestMemory + ?Sized>(
     if let Err(errno) = write_guest_sysctl_output(memory, oldp, oldlenp, old_len, &old_buffer) {
         return Some(host_io_error(errno));
     }
-    Some(host_io_result(
-        ret as isize,
-        old_buffer[..old_len.min(old_buffer.len())].to_vec(),
-    ))
+    let preview = old_buffer[..old_len.min(old_buffer.len())].to_vec();
+    let query = query_name.unwrap_or_else(|| {
+        query_mib
+            .unwrap_or_default()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    });
+    emit_verbose_sysctl_payload(
+        if name_by_string.is_some() {
+            "sysctlbyname"
+        } else {
+            "sysctl"
+        },
+        &query,
+        "host",
+        signed_return_value(ret as isize),
+        if ret < 0 { host_errno() } else { 0 },
+        oldp,
+        oldlenp,
+        "host-bytes",
+        &preview,
+        None,
+    );
+    Some(host_io_result(ret as isize, preview))
 }
 
 #[cfg(target_os = "macos")]
@@ -9536,6 +10288,9 @@ mod tests {
             assert!(compat.should_proxy_import("_setrlimit"));
             assert!(compat.should_proxy_import("_sysctl"));
             assert!(compat.should_proxy_import("_sysctlbyname"));
+            assert!(compat.should_proxy_import("_mlock"));
+            assert!(compat.should_proxy_import("_munlock"));
+            assert!(compat.should_proxy_import("_madvise"));
             assert!(compat.should_proxy_import("_umask"));
             assert!(compat.should_proxy_import("_fopen"));
             assert!(compat.should_proxy_import("_fdopen"));
@@ -9570,6 +10325,24 @@ mod tests {
             assert!(compat.should_proxy_import("_strchr"));
             assert!(compat.should_proxy_import("_strrchr"));
             assert!(compat.should_proxy_import("_strdup"));
+            assert!(compat.should_proxy_import("__ZNSt3__112__next_primeEm"));
+            assert!(compat.should_proxy_import("_ZNSt3__112__next_primeEm"));
+            assert!(compat.should_proxy_import("___cxa_guard_acquire"));
+            assert!(compat.should_proxy_import("__cxa_guard_acquire"));
+            assert!(compat.should_proxy_import("___cxa_guard_release"));
+            assert!(compat.should_proxy_import("___cxa_guard_abort"));
+            assert!(compat.should_proxy_import(
+                "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc"
+            ));
+            assert!(compat.should_proxy_import(
+                "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm"
+            ));
+            assert!(compat.should_proxy_import(
+                "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm"
+            ));
+            assert!(compat.should_proxy_import(
+                "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKcm"
+            ));
             assert!(compat.should_proxy_import("_opendir"));
             assert!(compat.should_proxy_import("_fdopendir"));
             assert!(compat.should_proxy_import("_readdir"));
@@ -9581,8 +10354,12 @@ mod tests {
             assert!(compat.should_proxy_import("_seekdir"));
             assert!(compat.should_proxy_import("_getentropy"));
             assert!(compat.should_proxy_import("_pthread_threading_np"));
+            assert!(compat.should_proxy_import("_pthread_sigmask"));
             assert!(compat.should_proxy_import("__NSGetExecutablePath"));
             assert!(compat.should_proxy_import("_NSGetExecutablePath"));
+            assert!(compat.should_proxy_import("_issetugid"));
+            assert!(compat.should_proxy_import("_issetguid"));
+            assert!(compat.should_proxy_import("_execl"));
             assert!(compat.should_proxy_import("_getprogname"));
             assert!(compat.should_proxy_import("_setprogname"));
             assert!(compat.should_proxy_import("__dyld_image_count"));
@@ -9611,6 +10388,123 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert!(!compat.should_proxy_import("_puts"));
+    }
+
+    #[test]
+    fn libcxx_next_prime_fallback_matches_common_bucket_growth_values() {
+        assert_eq!(compat_next_prime(0), 0);
+        assert_eq!(compat_next_prime(1), 2);
+        assert_eq!(compat_next_prime(2), 2);
+        assert_eq!(compat_next_prime(3), 3);
+        assert_eq!(compat_next_prime(4), 5);
+        assert_eq!(compat_next_prime(31), 31);
+        assert_eq!(compat_next_prime(32), 37);
+        assert_eq!(compat_next_prime(1000), 1009);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cxa_guard_proxy_models_local_static_lifecycle() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, &[0u8; CXA_GUARD_SIZE]);
+
+        let first = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "___cxa_guard_acquire",
+                &[0x1000, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("___cxa_guard_acquire should be proxied");
+        assert_eq!(first.return_value, 1);
+        assert_eq!(memory.read_memory(0x1000, 2).unwrap(), vec![0, 1]);
+
+        let recursive = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "__cxa_guard_acquire",
+                &[0x1000, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("__cxa_guard_acquire should be proxied");
+        assert_eq!(recursive.return_value, 0);
+
+        let release = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "___cxa_guard_release",
+                &[0x1000, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("___cxa_guard_release should be proxied");
+        assert_eq!(release.return_value, 0);
+        assert_eq!(memory.read_memory(0x1000, 2).unwrap(), vec![1, 0]);
+
+        let after_release = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "___cxa_guard_acquire",
+                &[0x1000, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("released guard acquire should be proxied");
+        assert_eq!(after_release.return_value, 0);
+
+        memory.write_guest(0x2000, &[0u8; CXA_GUARD_SIZE]);
+        let pending = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "___cxa_guard_acquire",
+                &[0x2000, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("second guard acquire should be proxied");
+        assert_eq!(pending.return_value, 1);
+
+        let abort = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "___cxa_guard_abort",
+                &[0x2000, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("___cxa_guard_abort should be proxied");
+        assert_eq!(abort.return_value, 0);
+        assert_eq!(memory.read_memory(0x2000, 2).unwrap(), vec![0, 0]);
+
+        let after_abort = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "___cxa_guard_acquire",
+                &[0x2000, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("aborted guard acquire should be proxied again");
+        assert_eq!(after_abort.return_value, 1);
     }
 
     #[cfg(target_os = "macos")]
