@@ -16,8 +16,14 @@ const STRING_COPY_C1_SYMBOL: &str =
     "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_";
 const STRING_COPY_C2_SYMBOL: &str =
     "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_";
+const STRING_DEFAULT_C1_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1Ev";
+const STRING_DEFAULT_C2_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2Ev";
 const STRING_D1_SYMBOL: &str = "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev";
 const STRING_D2_SYMBOL: &str = "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev";
+const STRING_ASSIGN_STRING_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_";
 const STRING_ASSIGN_CSTR_SYMBOL: &str =
     "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc";
 const STRING_ASSIGN_CSTR_LEN_SYMBOL: &str =
@@ -74,10 +80,12 @@ pub(crate) enum CxxImportKind {
     CxaGuardRelease,
     CxaGuardAbort,
     StringInitCstrLen,
+    StringDefaultCtor,
     StringCopy,
     StringDtor,
     StringAssignCstr,
     StringAssignCstrLen,
+    StringAssignString,
     StringAppendCstr,
     StringAppendCstrLen,
     StringAppendString,
@@ -106,6 +114,10 @@ pub(crate) enum CxxImportKind {
     VectorIndex,
     VectorFront,
     VectorBack,
+    VectorDefaultCtor,
+    VectorCopy,
+    VectorAssign,
+    VectorDtor,
     VectorClear,
     VectorReserve,
     VectorResize,
@@ -211,6 +223,10 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
             write_basic_string(memory, args[0], &bytes)?;
             Some(call_value(args[0]))
         }
+        CxxImportKind::StringDefaultCtor => {
+            write_basic_string(memory, args[0], &[])?;
+            Some(call_value(args[0]))
+        }
         CxxImportKind::StringCopy => {
             let source = decode_basic_string(memory, args[1])?;
             write_basic_string(memory, args[0], &source.bytes)?;
@@ -232,6 +248,11 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
         CxxImportKind::StringAssignCstrLen => {
             let bytes = read_capped_guest_bytes(memory, args[1], capped_len(args[2]))?;
             write_basic_string(memory, args[0], &bytes)?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::StringAssignString => {
+            let source = decode_basic_string(memory, args[1])?;
+            write_basic_string(memory, args[0], &source.bytes)?;
             Some(call_value(args[0]))
         }
         CxxImportKind::StringAppendCstr => {
@@ -348,6 +369,25 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
             let index = vector.len.saturating_sub(1) as u64;
             Some(call_value(vector_index_pointer(&vector, index)?))
         }
+        CxxImportKind::VectorDefaultCtor => {
+            write_basic_vector_header(memory, args[0], 0, 0, 0)?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorCopy => {
+            copy_basic_vector(memory, args[0], args[1])?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorAssign => {
+            if args[0] != args[1] {
+                destroy_basic_vector(memory, args[0])?;
+                copy_basic_vector(memory, args[0], args[1])?;
+            }
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorDtor => {
+            destroy_basic_vector(memory, args[0])?;
+            Some(call_value(args[0]))
+        }
         CxxImportKind::VectorClear => {
             clear_basic_vector(memory, args[0])?;
             Some(call_value(args[0]))
@@ -391,10 +431,12 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
 fn classify_libcpp_string_import(symbol: &str) -> Option<CxxImportKind> {
     Some(match symbol {
         STRING_INIT_CSTR_LEN_SYMBOL => CxxImportKind::StringInitCstrLen,
+        STRING_DEFAULT_C1_SYMBOL | STRING_DEFAULT_C2_SYMBOL => CxxImportKind::StringDefaultCtor,
         STRING_COPY_C1_SYMBOL | STRING_COPY_C2_SYMBOL => CxxImportKind::StringCopy,
         STRING_D1_SYMBOL | STRING_D2_SYMBOL => CxxImportKind::StringDtor,
         STRING_ASSIGN_CSTR_SYMBOL => CxxImportKind::StringAssignCstr,
         STRING_ASSIGN_CSTR_LEN_SYMBOL => CxxImportKind::StringAssignCstrLen,
+        STRING_ASSIGN_STRING_SYMBOL => CxxImportKind::StringAssignString,
         STRING_APPEND_CSTR_SYMBOL => CxxImportKind::StringAppendCstr,
         STRING_APPEND_CSTR_LEN_SYMBOL => CxxImportKind::StringAppendCstrLen,
         STRING_APPEND_STRING_SYMBOL => CxxImportKind::StringAppendString,
@@ -448,6 +490,10 @@ fn classify_libcpp_vector_import(symbol: &str) -> Option<CxxImportKind> {
             "ixEm" => Some(CxxImportKind::VectorIndex),
             "5frontEv" => Some(CxxImportKind::VectorFront),
             "4backEv" => Some(CxxImportKind::VectorBack),
+            "C1Ev" | "C2Ev" => Some(CxxImportKind::VectorDefaultCtor),
+            "C1ERKS3_" | "C2ERKS3_" => Some(CxxImportKind::VectorCopy),
+            "aSERKS3_" => Some(CxxImportKind::VectorAssign),
+            "D1Ev" | "D2Ev" => Some(CxxImportKind::VectorDtor),
             "5clearEv" => Some(CxxImportKind::VectorClear),
             "7reserveEm" => Some(CxxImportKind::VectorReserve),
             "6resizeEm" => Some(CxxImportKind::VectorResize),
@@ -763,6 +809,29 @@ fn clear_basic_vector<M: GuestMemory + ?Sized>(memory: &mut M, this: u64) -> Opt
     write_basic_vector_header(memory, this, vector.begin, 0, vector.capacity)
 }
 
+fn destroy_basic_vector<M: GuestMemory + ?Sized>(memory: &mut M, this: u64) -> Option<()> {
+    let vector = decode_basic_vector(memory, this)?;
+    if vector.begin != 0 {
+        let _ = memory.free_memory(vector.begin);
+    }
+    write_basic_vector_header(memory, this, 0, 0, 0)
+}
+
+fn copy_basic_vector<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+    source: u64,
+) -> Option<()> {
+    let vector = decode_basic_vector(memory, source)?;
+    if vector.len == 0 {
+        return write_basic_vector_header(memory, this, 0, 0, 0);
+    }
+    let begin = memory.allocate_memory(vector.len, 16).ok()?;
+    let bytes = memory.read_memory(vector.begin, vector.len).ok()?;
+    memory.write_memory(begin, &bytes).ok()?;
+    write_basic_vector_header(memory, this, begin, vector.len, vector.len)
+}
+
 fn vector_index_pointer(vector: &DecodedVector, index: u64) -> Option<u64> {
     let index = capped_len(index);
     if index >= vector.len {
@@ -1066,6 +1135,16 @@ mod tests {
             Some(CxxImportKind::StringAppendCstr)
         );
         assert_eq!(
+            classify_import("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1Ev"),
+            Some(CxxImportKind::StringDefaultCtor)
+        );
+        assert_eq!(
+            classify_import(
+                "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_"
+            ),
+            Some(CxxImportKind::StringAssignString)
+        );
+        assert_eq!(
             classify_import(
                 "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm"
             ),
@@ -1146,6 +1225,22 @@ mod tests {
         assert_eq!(
             classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE8pop_backEv"),
             Some(CxxImportKind::VectorPopBack)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEEC1Ev"),
+            Some(CxxImportKind::VectorDefaultCtor)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEEC1ERKS3_"),
+            Some(CxxImportKind::VectorCopy)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEEaSERKS3_"),
+            Some(CxxImportKind::VectorAssign)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEED1Ev"),
+            Some(CxxImportKind::VectorDtor)
         );
     }
 
@@ -1282,6 +1377,28 @@ mod tests {
             b"helloworld!"
         );
 
+        let assigned = 0x3060;
+        proxy_import(
+            CxxImportKind::StringDefaultCtor,
+            &mut memory,
+            &args(&[assigned]),
+        )
+        .expect("string default ctor should be proxied");
+        assert!(decode_basic_string(&mut memory, assigned)
+            .unwrap()
+            .bytes
+            .is_empty());
+        proxy_import(
+            CxxImportKind::StringAssignString,
+            &mut memory,
+            &args(&[assigned, copy]),
+        )
+        .expect("string assignment should be proxied");
+        assert_eq!(
+            decode_basic_string(&mut memory, assigned).unwrap().bytes,
+            b"helloworld!"
+        );
+
         proxy_import(
             CxxImportKind::StringReserve,
             &mut memory,
@@ -1400,7 +1517,12 @@ mod tests {
     fn proxies_basic_libcpp_vector_char_operations() {
         let mut memory = TestMemory::default();
         let object = 0x4000;
-        memory.write_at(object, &[0; LIBCPP_VECTOR_OBJECT_SIZE]);
+        proxy_import(
+            CxxImportKind::VectorDefaultCtor,
+            &mut memory,
+            &args(&[object]),
+        )
+        .expect("vector default ctor should be proxied");
         memory.write_at(0x2100, b"v");
         memory.write_at(0x2120, b"!");
 
@@ -1479,6 +1601,63 @@ mod tests {
         assert_eq!(popped.len, 6);
         assert!(popped.capacity >= 8);
         assert_eq!(memory.read_memory(popped.begin, 6).unwrap(), b"vvvvvv");
+
+        let copied_object = 0x4040;
+        proxy_import(
+            CxxImportKind::VectorCopy,
+            &mut memory,
+            &args(&[copied_object, object]),
+        )
+        .expect("vector copy ctor should be proxied");
+        let copied = decode_basic_vector(&mut memory, copied_object).expect("vector should decode");
+        assert_eq!(copied.len, 6);
+        assert_eq!(copied.capacity, 6);
+        assert_ne!(copied.begin, popped.begin);
+        assert_eq!(memory.read_memory(copied.begin, 6).unwrap(), b"vvvvvv");
+
+        let assigned_object = 0x4080;
+        proxy_import(
+            CxxImportKind::VectorDefaultCtor,
+            &mut memory,
+            &args(&[assigned_object]),
+        )
+        .expect("assigned vector default ctor should be proxied");
+        proxy_import(
+            CxxImportKind::VectorAssign,
+            &mut memory,
+            &args(&[assigned_object, copied_object]),
+        )
+        .expect("vector assignment should be proxied");
+        let assigned =
+            decode_basic_vector(&mut memory, assigned_object).expect("vector should decode");
+        assert_eq!(assigned.len, 6);
+        assert_eq!(memory.read_memory(assigned.begin, 6).unwrap(), b"vvvvvv");
+
+        proxy_import(
+            CxxImportKind::VectorAssign,
+            &mut memory,
+            &args(&[assigned_object, assigned_object]),
+        )
+        .expect("vector self-assignment should be proxied");
+        let self_assigned =
+            decode_basic_vector(&mut memory, assigned_object).expect("vector should decode");
+        assert_eq!(self_assigned.len, 6);
+        assert_eq!(
+            memory.read_memory(self_assigned.begin, 6).unwrap(),
+            b"vvvvvv"
+        );
+
+        proxy_import(
+            CxxImportKind::VectorDtor,
+            &mut memory,
+            &args(&[copied_object]),
+        )
+        .expect("vector dtor should be proxied");
+        let destroyed =
+            decode_basic_vector(&mut memory, copied_object).expect("vector should decode");
+        assert_eq!(destroyed.len, 0);
+        assert_eq!(destroyed.capacity, 0);
+        assert_eq!(destroyed.begin, 0);
 
         proxy_import(
             CxxImportKind::VectorResize,
