@@ -38,6 +38,18 @@ const STRING_COMPARE_SYMBOL: &str =
     "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKc";
 const STRING_COMPARE_N_SYMBOL: &str =
     "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKcm";
+const STRING_SIZE_SYMBOL: &str =
+    "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4sizeEv";
+const STRING_LENGTH_SYMBOL: &str =
+    "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6lengthEv";
+const STRING_EMPTY_SYMBOL: &str =
+    "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5emptyEv";
+const STRING_DATA_CONST_SYMBOL: &str =
+    "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4dataEv";
+const STRING_DATA_MUT_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4dataEv";
+const STRING_C_STR_SYMBOL: &str =
+    "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5c_strEv";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CxxImportKind {
@@ -59,6 +71,11 @@ pub(crate) enum CxxImportKind {
     StringRfindChar,
     StringCompare,
     StringCompareN,
+    StringSize,
+    StringLength,
+    StringEmpty,
+    StringData,
+    StringCStr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +233,18 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
             let cmp = compare_substring(&string.bytes, args[1], args[2], &right);
             Some(call_i32(cmp))
         }
+        CxxImportKind::StringSize | CxxImportKind::StringLength => {
+            let string = decode_basic_string(memory, args[0])?;
+            Some(call_value(string.bytes.len() as u64))
+        }
+        CxxImportKind::StringEmpty => {
+            let string = decode_basic_string(memory, args[0])?;
+            Some(call_value(u64::from(string.bytes.is_empty())))
+        }
+        CxxImportKind::StringData | CxxImportKind::StringCStr => {
+            let string = decode_basic_string(memory, args[0])?;
+            Some(call_value(string_data_pointer(args[0], &string)))
+        }
         _ => None,
     }
 }
@@ -236,6 +265,11 @@ fn classify_libcpp_string_import(symbol: &str) -> Option<CxxImportKind> {
         STRING_RFIND_CHAR_SYMBOL => CxxImportKind::StringRfindChar,
         STRING_COMPARE_SYMBOL => CxxImportKind::StringCompare,
         STRING_COMPARE_N_SYMBOL => CxxImportKind::StringCompareN,
+        STRING_SIZE_SYMBOL => CxxImportKind::StringSize,
+        STRING_LENGTH_SYMBOL => CxxImportKind::StringLength,
+        STRING_EMPTY_SYMBOL => CxxImportKind::StringEmpty,
+        STRING_DATA_CONST_SYMBOL | STRING_DATA_MUT_SYMBOL => CxxImportKind::StringData,
+        STRING_C_STR_SYMBOL => CxxImportKind::StringCStr,
         _ => return None,
     })
 }
@@ -364,6 +398,16 @@ fn decode_long_string<M: GuestMemory + ?Sized>(
         layout,
         data_ptr: Some(data_ptr),
     })
+}
+
+fn string_data_pointer(this: u64, string: &DecodedString) -> u64 {
+    if let Some(data_ptr) = string.data_ptr {
+        return data_ptr;
+    }
+    if string.layout == "libc++-default-short" {
+        return this.saturating_add(1);
+    }
+    this
 }
 
 fn write_basic_string<M: GuestMemory + ?Sized>(
@@ -655,12 +699,30 @@ mod tests {
             ),
             Some(CxxImportKind::StringCompareN)
         );
+        assert_eq!(
+            classify_import(
+                "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4sizeEv"
+            ),
+            Some(CxxImportKind::StringSize)
+        );
+        assert_eq!(
+            classify_import(
+                "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4dataEv"
+            ),
+            Some(CxxImportKind::StringData)
+        );
+        assert_eq!(
+            classify_import(
+                "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5c_strEv"
+            ),
+            Some(CxxImportKind::StringCStr)
+        );
     }
 
     #[test]
     fn diagnostics_classify_unhandled_object_abi_symbols() {
         let diagnostic = diagnose_symbol(
-            "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4sizeEv",
+            "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE8capacityEv",
         )
         .expect("libc++ string symbol should be diagnosed");
         assert_eq!(diagnostic.category, "libc++-basic-string-object-abi");
@@ -711,6 +773,26 @@ mod tests {
             decode_basic_string(&mut memory, object).unwrap().bytes,
             b"hello world!"
         );
+
+        let size = proxy_import(CxxImportKind::StringSize, &mut memory, &args(&[object]))
+            .expect("string size should be proxied");
+        assert_eq!(size.return_value, 12);
+        let length = proxy_import(CxxImportKind::StringLength, &mut memory, &args(&[object]))
+            .expect("string length should be proxied");
+        assert_eq!(length.return_value, 12);
+        let empty = proxy_import(CxxImportKind::StringEmpty, &mut memory, &args(&[object]))
+            .expect("string empty should be proxied");
+        assert_eq!(empty.return_value, 0);
+        let data = proxy_import(CxxImportKind::StringData, &mut memory, &args(&[object]))
+            .expect("string data should be proxied");
+        assert_eq!(data.return_value, object);
+        assert_eq!(
+            memory.read_memory(data.return_value, 12).unwrap(),
+            b"hello world!"
+        );
+        let c_str = proxy_import(CxxImportKind::StringCStr, &mut memory, &args(&[object]))
+            .expect("string c_str should be proxied");
+        assert_eq!(c_str.return_value, object);
 
         let find = proxy_import(
             CxxImportKind::StringFindChar,
@@ -766,6 +848,21 @@ mod tests {
             decode_basic_string(&mut memory, copy).unwrap().bytes,
             b"helloworld!"
         );
+
+        let empty_object = 0x3080;
+        proxy_import(
+            CxxImportKind::StringInitCstrLen,
+            &mut memory,
+            &args(&[empty_object, 0x2000, 0]),
+        )
+        .expect("empty string init should be proxied");
+        let empty = proxy_import(
+            CxxImportKind::StringEmpty,
+            &mut memory,
+            &args(&[empty_object]),
+        )
+        .expect("empty string check should be proxied");
+        assert_eq!(empty.return_value, 1);
     }
 
     #[test]
@@ -817,5 +914,12 @@ mod tests {
         assert_eq!(decoded.bytes, text);
         assert_eq!(decoded.layout, "libc++-alternate-long");
         assert!(decoded.data_ptr.unwrap_or(0) >= 0x10_000);
+
+        let data = proxy_import(CxxImportKind::StringCStr, &mut memory, &args(&[object]))
+            .expect("long string c_str should be proxied");
+        assert_eq!(
+            memory.read_memory(data.return_value, text.len()).unwrap(),
+            text
+        );
     }
 }
