@@ -101,11 +101,18 @@ pub(crate) enum CxxImportKind {
     VectorEmpty,
     VectorCapacity,
     VectorData,
+    VectorBegin,
+    VectorEnd,
+    VectorIndex,
+    VectorFront,
+    VectorBack,
     VectorClear,
     VectorReserve,
     VectorResize,
     VectorResizeFill,
     VectorResizeFillRef,
+    VectorPushBackRef,
+    VectorPopBack,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,6 +327,27 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
             let vector = decode_basic_vector(memory, args[0])?;
             Some(call_value(vector.begin))
         }
+        CxxImportKind::VectorBegin => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(vector.begin))
+        }
+        CxxImportKind::VectorEnd => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(vector.end))
+        }
+        CxxImportKind::VectorIndex => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(vector_index_pointer(&vector, args[1])?))
+        }
+        CxxImportKind::VectorFront => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(vector_index_pointer(&vector, 0)?))
+        }
+        CxxImportKind::VectorBack => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            let index = vector.len.saturating_sub(1) as u64;
+            Some(call_value(vector_index_pointer(&vector, index)?))
+        }
         CxxImportKind::VectorClear => {
             clear_basic_vector(memory, args[0])?;
             Some(call_value(args[0]))
@@ -342,6 +370,18 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
                 .copied()
                 .unwrap_or(0);
             resize_basic_vector(memory, args[0], args[1], fill)?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorPushBackRef => {
+            let byte = read_guest_bytes(memory, args[1], 1)?
+                .first()
+                .copied()
+                .unwrap_or(0);
+            push_basic_vector(memory, args[0], byte)?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorPopBack => {
+            pop_basic_vector(memory, args[0])?;
             Some(call_value(args[0]))
         }
         _ => None,
@@ -388,6 +428,11 @@ fn classify_libcpp_vector_import(symbol: &str) -> Option<CxxImportKind> {
             "5emptyEv" => Some(CxxImportKind::VectorEmpty),
             "8capacityEv" => Some(CxxImportKind::VectorCapacity),
             "4dataEv" => Some(CxxImportKind::VectorData),
+            "5beginEv" => Some(CxxImportKind::VectorBegin),
+            "3endEv" => Some(CxxImportKind::VectorEnd),
+            "ixEm" => Some(CxxImportKind::VectorIndex),
+            "5frontEv" => Some(CxxImportKind::VectorFront),
+            "4backEv" => Some(CxxImportKind::VectorBack),
             _ => None,
         };
     }
@@ -398,11 +443,18 @@ fn classify_libcpp_vector_import(symbol: &str) -> Option<CxxImportKind> {
     if let Some(suffix) = suffix {
         return match suffix {
             "4dataEv" => Some(CxxImportKind::VectorData),
+            "5beginEv" => Some(CxxImportKind::VectorBegin),
+            "3endEv" => Some(CxxImportKind::VectorEnd),
+            "ixEm" => Some(CxxImportKind::VectorIndex),
+            "5frontEv" => Some(CxxImportKind::VectorFront),
+            "4backEv" => Some(CxxImportKind::VectorBack),
             "5clearEv" => Some(CxxImportKind::VectorClear),
             "7reserveEm" => Some(CxxImportKind::VectorReserve),
             "6resizeEm" => Some(CxxImportKind::VectorResize),
             "6resizeEmc" | "6resizeEmh" => Some(CxxImportKind::VectorResizeFill),
             "6resizeEmRKc" | "6resizeEmRKh" => Some(CxxImportKind::VectorResizeFillRef),
+            "9push_backERKc" | "9push_backERKh" => Some(CxxImportKind::VectorPushBackRef),
+            "8pop_backEv" => Some(CxxImportKind::VectorPopBack),
             _ => None,
         };
     }
@@ -711,6 +763,14 @@ fn clear_basic_vector<M: GuestMemory + ?Sized>(memory: &mut M, this: u64) -> Opt
     write_basic_vector_header(memory, this, vector.begin, 0, vector.capacity)
 }
 
+fn vector_index_pointer(vector: &DecodedVector, index: u64) -> Option<u64> {
+    let index = capped_len(index);
+    if index >= vector.len {
+        return Some(0);
+    }
+    vector.begin.checked_add(index as u64)
+}
+
 fn reserve_basic_vector<M: GuestMemory + ?Sized>(
     memory: &mut M,
     this: u64,
@@ -756,6 +816,34 @@ fn resize_basic_vector<M: GuestMemory + ?Sized>(
         new_len,
         vector.capacity.max(new_len),
     )
+}
+
+fn push_basic_vector<M: GuestMemory + ?Sized>(memory: &mut M, this: u64, byte: u8) -> Option<()> {
+    let vector = decode_basic_vector(memory, this)?;
+    let new_len = vector.len.checked_add(1)?;
+    if new_len > MAX_COMPAT_VECTOR_LEN {
+        return None;
+    }
+    if new_len > vector.capacity {
+        let doubled = vector.capacity.saturating_mul(2);
+        let capacity = doubled.max(1).max(new_len).min(MAX_COMPAT_VECTOR_LEN);
+        reserve_basic_vector(memory, this, capacity as u64)?;
+    }
+    let vector = decode_basic_vector(memory, this)?;
+    memory.write_memory(vector.end, &[byte]).ok()?;
+    write_basic_vector_header(
+        memory,
+        this,
+        vector.begin,
+        new_len,
+        vector.capacity.max(new_len),
+    )
+}
+
+fn pop_basic_vector<M: GuestMemory + ?Sized>(memory: &mut M, this: u64) -> Option<()> {
+    let vector = decode_basic_vector(memory, this)?;
+    let new_len = vector.len.saturating_sub(1);
+    write_basic_vector_header(memory, this, vector.begin, new_len, vector.capacity)
 }
 
 fn read_capped_cstring<M: GuestMemory + ?Sized>(
@@ -1035,6 +1123,30 @@ mod tests {
             classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE6resizeEmRKc"),
             Some(CxxImportKind::VectorResizeFillRef)
         );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE5beginEv"),
+            Some(CxxImportKind::VectorBegin)
+        );
+        assert_eq!(
+            classify_import("__ZNKSt3__16vectorIcNS_9allocatorIcEEE3endEv"),
+            Some(CxxImportKind::VectorEnd)
+        );
+        assert_eq!(
+            classify_import("__ZNKSt3__16vectorIcNS_9allocatorIcEEEixEm"),
+            Some(CxxImportKind::VectorIndex)
+        );
+        assert_eq!(
+            classify_import("__ZNKSt3__16vectorIcNS_9allocatorIcEEE5frontEv"),
+            Some(CxxImportKind::VectorFront)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE9push_backERKc"),
+            Some(CxxImportKind::VectorPushBackRef)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE8pop_backEv"),
+            Some(CxxImportKind::VectorPopBack)
+        );
     }
 
     #[test]
@@ -1290,6 +1402,7 @@ mod tests {
         let object = 0x4000;
         memory.write_at(object, &[0; LIBCPP_VECTOR_OBJECT_SIZE]);
         memory.write_at(0x2100, b"v");
+        memory.write_at(0x2120, b"!");
 
         let empty = proxy_import(CxxImportKind::VectorEmpty, &mut memory, &args(&[object]))
             .expect("vector empty should be proxied");
@@ -1322,9 +1435,50 @@ mod tests {
         let data = proxy_import(CxxImportKind::VectorData, &mut memory, &args(&[object]))
             .expect("vector data should be proxied");
         assert_eq!(data.return_value, vector.begin);
+        let begin = proxy_import(CxxImportKind::VectorBegin, &mut memory, &args(&[object]))
+            .expect("vector begin should be proxied");
+        assert_eq!(begin.return_value, vector.begin);
+        let end = proxy_import(CxxImportKind::VectorEnd, &mut memory, &args(&[object]))
+            .expect("vector end should be proxied");
+        assert_eq!(end.return_value, vector.end);
+        let front = proxy_import(CxxImportKind::VectorFront, &mut memory, &args(&[object]))
+            .expect("vector front should be proxied");
+        assert_eq!(front.return_value, vector.begin);
+        let back = proxy_import(CxxImportKind::VectorBack, &mut memory, &args(&[object]))
+            .expect("vector back should be proxied");
+        assert_eq!(back.return_value, vector.begin + 5);
+        let index = proxy_import(CxxImportKind::VectorIndex, &mut memory, &args(&[object, 2]))
+            .expect("vector index should be proxied");
+        assert_eq!(index.return_value, vector.begin + 2);
+        assert_eq!(memory.read_memory(index.return_value, 1).unwrap(), b"v");
+        let out_of_bounds = proxy_import(
+            CxxImportKind::VectorIndex,
+            &mut memory,
+            &args(&[object, 99]),
+        )
+        .expect("vector out-of-bounds index should be handled");
+        assert_eq!(out_of_bounds.return_value, 0);
         let empty = proxy_import(CxxImportKind::VectorEmpty, &mut memory, &args(&[object]))
             .expect("vector empty should be proxied");
         assert_eq!(empty.return_value, 0);
+
+        proxy_import(
+            CxxImportKind::VectorPushBackRef,
+            &mut memory,
+            &args(&[object, 0x2120]),
+        )
+        .expect("vector push_back should be proxied");
+        let pushed = decode_basic_vector(&mut memory, object).expect("vector should decode");
+        assert_eq!(pushed.len, 7);
+        assert!(pushed.capacity >= 8);
+        assert_eq!(memory.read_memory(pushed.begin, 7).unwrap(), b"vvvvvv!");
+
+        proxy_import(CxxImportKind::VectorPopBack, &mut memory, &args(&[object]))
+            .expect("vector pop_back should be proxied");
+        let popped = decode_basic_vector(&mut memory, object).expect("vector should decode");
+        assert_eq!(popped.len, 6);
+        assert!(popped.capacity >= 8);
+        assert_eq!(memory.read_memory(popped.begin, 6).unwrap(), b"vvvvvv");
 
         proxy_import(
             CxxImportKind::VectorResize,

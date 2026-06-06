@@ -804,9 +804,11 @@ typedef void (*string_resize_fill_fn)(void *, size_t, int);
 typedef size_t (*vector_size_fn)(const void *);
 typedef int (*vector_empty_fn)(const void *);
 typedef const char *(*vector_data_fn)(const void *);
+typedef const char *(*vector_index_fn)(const void *, size_t);
 typedef void (*vector_void_fn)(void *);
 typedef void (*vector_reserve_fn)(void *, size_t);
 typedef void (*vector_resize_fill_fn)(void *, size_t, const char *);
+typedef void (*vector_push_back_fn)(void *, const char *);
 
 #define COMPAT_STRING_OBJECT_SIZE 24
 #define COMPAT_VECTOR_OBJECT_SIZE 24
@@ -875,7 +877,14 @@ static int exercise_startup_glue(
     vector_data_fn vector_data_impl,
     vector_void_fn vector_clear_impl,
     vector_reserve_fn vector_reserve_impl,
-    vector_resize_fill_fn vector_resize_fill_impl
+    vector_resize_fill_fn vector_resize_fill_impl,
+    vector_data_fn vector_begin_impl,
+    vector_data_fn vector_end_impl,
+    vector_index_fn vector_index_impl,
+    vector_data_fn vector_front_impl,
+    vector_data_fn vector_back_impl,
+    vector_push_back_fn vector_push_back_impl,
+    vector_void_fn vector_pop_back_impl
 ) {
     static unsigned char page[4096] __attribute__((aligned(4096)));
     memset(page, 0x41, sizeof(page));
@@ -1002,9 +1011,14 @@ static int exercise_startup_glue(
     size_t vec_size = 0;
     size_t vec_capacity = 0;
     int vec_data_ok = 0;
+    int vec_access_proxy = 0;
+    int vec_access_ok = 0;
+    size_t vec_pushed_size = 0;
+    size_t vec_popped_size = 0;
     int vec_clear_ok = 0;
     if (vec_proxy) {
         const char vec_fill = 'V';
+        const char vec_push = '!';
         vector_reserve_impl(compat_vector, 8);
         vector_resize_fill_impl(compat_vector, 6, &vec_fill);
         vec_size = vector_size_impl(compat_vector);
@@ -1015,12 +1029,51 @@ static int exercise_startup_glue(
             && vec_capacity >= 8
             && vec_data
             && memcmp(vec_data, "VVVVVV", 6) == 0;
+        vec_access_proxy = vector_begin_impl
+            && vector_end_impl
+            && vector_index_impl
+            && vector_front_impl
+            && vector_back_impl
+            && vector_push_back_impl
+            && vector_pop_back_impl;
+        if (vec_access_proxy) {
+            const char *vec_begin = vector_begin_impl(compat_vector);
+            const char *vec_end = vector_end_impl(compat_vector);
+            const char *vec_index = vector_index_impl(compat_vector, 2);
+            const char *vec_front = vector_front_impl(compat_vector);
+            const char *vec_back = vector_back_impl(compat_vector);
+            vector_push_back_impl(compat_vector, &vec_push);
+            vec_pushed_size = vector_size_impl(compat_vector);
+            const char *vec_pushed_data = vector_data_impl(compat_vector);
+            int vec_push_ok = vec_pushed_size == 7
+                && vec_pushed_data
+                && memcmp(vec_pushed_data, "VVVVVV!", 7) == 0;
+            vector_pop_back_impl(compat_vector);
+            vec_popped_size = vector_size_impl(compat_vector);
+            const char *vec_popped_data = vector_data_impl(compat_vector);
+            vec_access_ok = vec_data
+                && vec_begin == vec_data
+                && vec_end == vec_data + 6
+                && vec_index == vec_data + 2
+                && vec_front == vec_data
+                && vec_back == vec_data + 5
+                && vec_front
+                && vec_back
+                && *vec_front == 'V'
+                && *vec_back == 'V'
+                && vec_index
+                && *vec_index == 'V'
+                && vec_push_ok
+                && vec_popped_size == 6
+                && vec_popped_data
+                && memcmp(vec_popped_data, "VVVVVV", 6) == 0;
+        }
         vector_clear_impl(compat_vector);
         vec_clear_ok = vector_empty_impl(compat_vector) == 1
             && vector_size_impl(compat_vector) == 0
             && vector_capacity_impl(compat_vector) >= 8;
     }
-    int vec_ok = !vec_proxy || (vec_data_ok && vec_clear_ok);
+    int vec_ok = !vec_proxy || (vec_data_ok && (!vec_access_proxy || vec_access_ok) && vec_clear_ok);
 
     int ok = mlock_ret == 0
         && munlock_ret == 0
@@ -1041,7 +1094,7 @@ static int exercise_startup_glue(
         && vec_ok;
 
     printf(
-        "compat startup glue %s mlock=%d munlock=%d madvise=%d mask=%d oldmask_size=%lu oldmask_sum=%u issetugid=%d execl=%d execl_errno=%d next_prime=%lu guard_first=%d guard_second=%d guard=0x%llx guard_abort_first=%d guard_abort_second=%d guard_abort=0x%llx str_len=%lu str_accessor_proxy=%d str_size=%lu str_length=%lu str_empty=%d str_text=%.*s str_find=%lu str_compare=%d cstr_ok=%d data_ok=%d str_mutator_proxy=%d str_capacity=%lu reserve_capacity=%lu reserve_ge_40=%d resize_ok=%d shrink_ok=%d clear_ok=%d str_ok=%d vec_proxy=%d vec_size=%lu vec_capacity=%lu vec_data_ok=%d vec_clear_ok=%d vec_ok=%d ok=%d\n",
+        "compat startup glue %s mlock=%d munlock=%d madvise=%d mask=%d oldmask_size=%lu oldmask_sum=%u issetugid=%d execl=%d execl_errno=%d next_prime=%lu guard_first=%d guard_second=%d guard=0x%llx guard_abort_first=%d guard_abort_second=%d guard_abort=0x%llx str_len=%lu str_accessor_proxy=%d str_size=%lu str_length=%lu str_empty=%d str_text=%.*s str_find=%lu str_compare=%d cstr_ok=%d data_ok=%d str_mutator_proxy=%d str_capacity=%lu reserve_capacity=%lu reserve_ge_40=%d resize_ok=%d shrink_ok=%d clear_ok=%d str_ok=%d vec_proxy=%d vec_size=%lu vec_capacity=%lu vec_data_ok=%d vec_access_proxy=%d vec_access_ok=%d vec_pushed_size=%lu vec_popped_size=%lu vec_clear_ok=%d vec_ok=%d ok=%d\n",
         label,
         mlock_ret,
         munlock_ret,
@@ -1082,6 +1135,10 @@ static int exercise_startup_glue(
         (unsigned long)vec_size,
         (unsigned long)vec_capacity,
         vec_data_ok,
+        vec_access_proxy,
+        vec_access_ok,
+        (unsigned long)vec_pushed_size,
+        (unsigned long)vec_popped_size,
         vec_clear_ok,
         vec_ok,
         ok
@@ -1108,6 +1165,13 @@ int main(void) {
         compat_string_push_back,
         compat_string_find_char,
         compat_string_compare,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0,
         0,
         0,
@@ -1163,9 +1227,16 @@ int main(void) {
     vector_void_fn dyn_vector_clear = (vector_void_fn)dlsym(string_handle, "_ZNSt3__16vectorIcNS_9allocatorIcEEE5clearEv");
     vector_reserve_fn dyn_vector_reserve = (vector_reserve_fn)dlsym(string_handle, "_ZNSt3__16vectorIcNS_9allocatorIcEEE7reserveEm");
     vector_resize_fill_fn dyn_vector_resize_fill = (vector_resize_fill_fn)dlsym(string_handle, "_ZNSt3__16vectorIcNS_9allocatorIcEEE6resizeEmRKc");
+    vector_data_fn dyn_vector_begin = (vector_data_fn)dlsym(string_handle, "_ZNKSt3__16vectorIcNS_9allocatorIcEEE5beginEv");
+    vector_data_fn dyn_vector_end = (vector_data_fn)dlsym(string_handle, "_ZNKSt3__16vectorIcNS_9allocatorIcEEE3endEv");
+    vector_index_fn dyn_vector_index = (vector_index_fn)dlsym(string_handle, "_ZNKSt3__16vectorIcNS_9allocatorIcEEEixEm");
+    vector_data_fn dyn_vector_front = (vector_data_fn)dlsym(string_handle, "_ZNKSt3__16vectorIcNS_9allocatorIcEEE5frontEv");
+    vector_data_fn dyn_vector_back = (vector_data_fn)dlsym(string_handle, "_ZNKSt3__16vectorIcNS_9allocatorIcEEE4backEv");
+    vector_push_back_fn dyn_vector_push_back = (vector_push_back_fn)dlsym(string_handle, "_ZNSt3__16vectorIcNS_9allocatorIcEEE9push_backERKc");
+    vector_void_fn dyn_vector_pop_back = (vector_void_fn)dlsym(string_handle, "_ZNSt3__16vectorIcNS_9allocatorIcEEE8pop_backEv");
 
     printf(
-        "compat startup glue dlsym ptrs mlock=%p munlock=%p madvise=%p pthread_sigmask=%p issetugid=%p execl=%p next_prime=%p cxa_guard_acquire=%p cxa_guard_release=%p cxa_guard_abort=%p string_init=%p string_append=%p string_push=%p string_find=%p string_compare=%p string_size=%p string_length=%p string_empty=%p string_cstr=%p string_data=%p string_capacity=%p string_clear=%p string_reserve=%p string_resize=%p string_resize_fill=%p vector_size=%p vector_capacity=%p vector_empty=%p vector_data=%p vector_clear=%p vector_reserve=%p vector_resize_fill=%p\n",
+        "compat startup glue dlsym ptrs mlock=%p munlock=%p madvise=%p pthread_sigmask=%p issetugid=%p execl=%p next_prime=%p cxa_guard_acquire=%p cxa_guard_release=%p cxa_guard_abort=%p string_init=%p string_append=%p string_push=%p string_find=%p string_compare=%p string_size=%p string_length=%p string_empty=%p string_cstr=%p string_data=%p string_capacity=%p string_clear=%p string_reserve=%p string_resize=%p string_resize_fill=%p vector_size=%p vector_capacity=%p vector_empty=%p vector_data=%p vector_clear=%p vector_reserve=%p vector_resize_fill=%p vector_begin=%p vector_end=%p vector_index=%p vector_front=%p vector_back=%p vector_push=%p vector_pop=%p\n",
         (void *)dyn_mlock,
         (void *)dyn_munlock,
         (void *)dyn_madvise,
@@ -1197,10 +1268,17 @@ int main(void) {
         (void *)dyn_vector_data,
         (void *)dyn_vector_clear,
         (void *)dyn_vector_reserve,
-        (void *)dyn_vector_resize_fill
+        (void *)dyn_vector_resize_fill,
+        (void *)dyn_vector_begin,
+        (void *)dyn_vector_end,
+        (void *)dyn_vector_index,
+        (void *)dyn_vector_front,
+        (void *)dyn_vector_back,
+        (void *)dyn_vector_push_back,
+        (void *)dyn_vector_pop_back
     );
 
-    if (!dyn_mlock || !dyn_munlock || !dyn_madvise || !dyn_pthread_sigmask || !dyn_issetugid || !dyn_execl || !dyn_next_prime || !dyn_cxa_guard_acquire || !dyn_cxa_guard_release || !dyn_cxa_guard_abort || !dyn_string_init || !dyn_string_append_cstr_len || !dyn_string_push_back || !dyn_string_find_char || !dyn_string_compare || !dyn_string_size || !dyn_string_length || !dyn_string_empty || !dyn_string_c_str || !dyn_string_data || !dyn_string_capacity || !dyn_string_clear || !dyn_string_reserve || !dyn_string_resize || !dyn_string_resize_fill || !dyn_vector_size || !dyn_vector_capacity || !dyn_vector_empty || !dyn_vector_data || !dyn_vector_clear || !dyn_vector_reserve || !dyn_vector_resize_fill) {
+    if (!dyn_mlock || !dyn_munlock || !dyn_madvise || !dyn_pthread_sigmask || !dyn_issetugid || !dyn_execl || !dyn_next_prime || !dyn_cxa_guard_acquire || !dyn_cxa_guard_release || !dyn_cxa_guard_abort || !dyn_string_init || !dyn_string_append_cstr_len || !dyn_string_push_back || !dyn_string_find_char || !dyn_string_compare || !dyn_string_size || !dyn_string_length || !dyn_string_empty || !dyn_string_c_str || !dyn_string_data || !dyn_string_capacity || !dyn_string_clear || !dyn_string_reserve || !dyn_string_resize || !dyn_string_resize_fill || !dyn_vector_size || !dyn_vector_capacity || !dyn_vector_empty || !dyn_vector_data || !dyn_vector_clear || !dyn_vector_reserve || !dyn_vector_resize_fill || !dyn_vector_begin || !dyn_vector_end || !dyn_vector_index || !dyn_vector_front || !dyn_vector_back || !dyn_vector_push_back || !dyn_vector_pop_back) {
         return 2;
     }
     failures += exercise_startup_glue(
@@ -1236,7 +1314,14 @@ int main(void) {
         dyn_vector_data,
         dyn_vector_clear,
         dyn_vector_reserve,
-        dyn_vector_resize_fill
+        dyn_vector_resize_fill,
+        dyn_vector_begin,
+        dyn_vector_end,
+        dyn_vector_index,
+        dyn_vector_front,
+        dyn_vector_back,
+        dyn_vector_push_back,
+        dyn_vector_pop_back
     );
     return failures == 0 ? 0 : 1;
 }
@@ -4854,7 +4939,7 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             && stdout.contains("guard_first=1 guard_second=0 guard=0x1")
             && stdout.contains("guard_abort_first=1 guard_abort_second=1")
             && stdout.contains("str_len=9 str_accessor_proxy=0 str_size=0 str_length=0 str_empty=-1 str_text=glue-cxx! str_find=4 str_compare=0 cstr_ok=0 data_ok=0 str_mutator_proxy=0 str_capacity=0 reserve_capacity=0 reserve_ge_40=0 resize_ok=0 shrink_ok=0 clear_ok=0 str_ok=1")
-            && stdout.contains("vec_proxy=0 vec_size=0 vec_capacity=0 vec_data_ok=0 vec_clear_ok=0 vec_ok=1")
+            && stdout.contains("vec_proxy=0 vec_size=0 vec_capacity=0 vec_data_ok=0 vec_access_proxy=0 vec_access_ok=0 vec_pushed_size=0 vec_popped_size=0 vec_clear_ok=0 vec_ok=1")
             && stdout.contains("ok=1"),
         "startup glue fixture did not complete static import roundtrip; stdout:\n{stdout}"
     );
@@ -4890,7 +4975,14 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             && stdout.contains(" vector_data=0x")
             && stdout.contains(" vector_clear=0x")
             && stdout.contains(" vector_reserve=0x")
-            && stdout.contains(" vector_resize_fill=0x"),
+            && stdout.contains(" vector_resize_fill=0x")
+            && stdout.contains(" vector_begin=0x")
+            && stdout.contains(" vector_end=0x")
+            && stdout.contains(" vector_index=0x")
+            && stdout.contains(" vector_front=0x")
+            && stdout.contains(" vector_back=0x")
+            && stdout.contains(" vector_push=0x")
+            && stdout.contains(" vector_pop=0x"),
         "startup glue fixture did not receive dlsym trampolines; stdout:\n{stdout}"
     );
     assert!(
@@ -4903,7 +4995,7 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             && stdout.contains("str_len=9 str_accessor_proxy=1 str_size=9 str_length=9 str_empty=0 str_text=glue-cxx! str_find=4 str_compare=0 cstr_ok=1 data_ok=1 str_mutator_proxy=1 str_capacity=22")
             && stdout.contains("reserve_ge_40=1 resize_ok=1 shrink_ok=1 clear_ok=1 str_ok=1")
             && stdout.contains("vec_proxy=1 vec_size=6")
-            && stdout.contains("vec_data_ok=1 vec_clear_ok=1 vec_ok=1")
+            && stdout.contains("vec_data_ok=1 vec_access_proxy=1 vec_access_ok=1 vec_pushed_size=7 vec_popped_size=6 vec_clear_ok=1 vec_ok=1")
             && stdout.contains("ok=1"),
         "startup glue fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"
     );
