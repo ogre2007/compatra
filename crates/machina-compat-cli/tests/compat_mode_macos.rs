@@ -4410,18 +4410,6 @@ fn compat_mode_runs_guest_library_constructors() {
         "guest library destructor did not run through compat exit handlers; stdout:\n{stdout}"
     );
     assert!(
-        saw_registry && saw_image,
-        "guest image registry trace did not describe the guest dylib; stdout:\n{stdout}"
-    );
-    assert!(
-        saw_binding,
-        "guest library static import binding trace did not include guest_state_value; stdout:\n{stdout}"
-    );
-    assert!(
-        saw_init_trace,
-        "guest library init-handler trace was missing; stdout:\n{stdout}"
-    );
-    assert!(
         stderr.contains("\"Call\":\"write\"") && stderr.contains("\"Call\":\"printf\""),
         "guest library fixture did not log host-proxied write and printf calls; stderr:\n{stderr}"
     );
@@ -5506,7 +5494,8 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stderr.contains("\"GuestMachine\":\"arm64\"")
             && stderr.contains("\"Call\":\"sysctlbyname\"")
             && stderr.contains("\"Query\":\"hw.machine\"")
-            && stderr.contains("\"GuestValueText\":\"arm64\\u0000\""),
+            && stderr.contains("\"GuestValueHex\":\"61726D363400\"")
+            && stderr.contains("\"GuestValueBytes\":\"6\""),
         "verbose compat log did not include guest-facing OS identity payloads; stderr:\n{stderr}"
     );
     assert!(

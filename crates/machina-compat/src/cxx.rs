@@ -306,13 +306,9 @@ fn decode_basic_string<M: GuestMemory + ?Sized>(
         return decode_long_string(memory, word0, word1, "libc++-alternate-long");
     }
 
-    if (word0 & 1) != 0 {
-        return decode_long_string(memory, word2, word1, "libc++-default-long");
-    }
-
     let alt_short_len = (header[23] & 0x7f) as usize;
     let alt_short_is_long = (header[23] & 0x80) != 0;
-    if !alt_short_is_long && alt_short_len <= LIBCPP_SHORT_MAX {
+    if is_alternate_short_string(&header, alt_short_len, alt_short_is_long) {
         return Some(DecodedString {
             bytes: header[0..alt_short_len].to_vec(),
             layout: "libc++-alternate-short",
@@ -330,11 +326,27 @@ fn decode_basic_string<M: GuestMemory + ?Sized>(
         });
     }
 
+    if (word0 & 1) != 0 {
+        return decode_long_string(memory, word2, word1, "libc++-default-long");
+    }
+
     Some(DecodedString {
         bytes: Vec::new(),
         layout: "unknown",
         data_ptr: None,
     })
+}
+
+fn is_alternate_short_string(header: &[u8], len: usize, is_long: bool) -> bool {
+    if is_long || len > LIBCPP_SHORT_MAX {
+        return false;
+    }
+    if len == 0 {
+        return header.first().copied().unwrap_or(0) == 0;
+    }
+    header
+        .get(len..LIBCPP_STRING_OBJECT_SIZE - 1)
+        .is_some_and(|tail| tail.iter().all(|byte| *byte == 0))
 }
 
 fn decode_long_string<M: GuestMemory + ?Sized>(
@@ -754,6 +766,37 @@ mod tests {
             decode_basic_string(&mut memory, copy).unwrap().bytes,
             b"helloworld!"
         );
+    }
+
+    #[test]
+    fn decodes_alternate_short_strings_starting_with_odd_ascii_bytes() {
+        let mut memory = TestMemory::default();
+        let object = 0x3000;
+        memory.write_at(0x2000, b"glue\0");
+        memory.write_at(0x2020, b"-cxx\0");
+
+        proxy_import(
+            CxxImportKind::StringInitCstrLen,
+            &mut memory,
+            &args(&[object, 0x2000, 4]),
+        )
+        .expect("string init should be proxied");
+        proxy_import(
+            CxxImportKind::StringAppendCstrLen,
+            &mut memory,
+            &args(&[object, 0x2020, 4]),
+        )
+        .expect("string append should be proxied");
+        proxy_import(
+            CxxImportKind::StringPushBack,
+            &mut memory,
+            &args(&[object, b'!' as u64]),
+        )
+        .expect("string push_back should be proxied");
+
+        let decoded = decode_basic_string(&mut memory, object).expect("string should decode");
+        assert_eq!(decoded.bytes, b"glue-cxx!");
+        assert_eq!(decoded.layout, "libc++-alternate-short");
     }
 
     #[test]
