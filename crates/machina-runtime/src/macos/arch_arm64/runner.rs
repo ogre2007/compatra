@@ -9,7 +9,8 @@ use crate::macos::arm64_import_stubs::arm64_import_can_resolve_to_guest_library;
 use crate::macos::binary_bootstrap::{map_binary_segments, setup_bootstrap_state};
 use crate::macos::binary_setup::{
     find_runtime_symbols, install_arm64_indirect_branch_hooks, install_arm64_lse_atomic_hooks,
-    log_runtime_symbols, patch_symbol_pointers, resolve_entry,
+    log_runtime_symbols, patch_arm64_symbol_pointers_with_slide, patch_symbol_pointers,
+    resolve_entry,
 };
 use crate::macos::diagnostics::{install_diagnostic_hooks, run_with_diagnostics, RunReport};
 use crate::macos::io_imports::install_io_imports;
@@ -532,6 +533,64 @@ fn register_guest_library_mod_term_handlers(
     }
 }
 
+fn patch_guest_library_symbol_pointers(
+    emulator: &mut UnicornEmulator,
+    guest_libraries: &GuestLibrarySet,
+    stub_map: &std::collections::HashMap<String, u64>,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    metadata: &TraceMetadata,
+    process_name: &str,
+) {
+    for image in guest_libraries.images() {
+        let image_undefs = image.binary.get_undefined_symbols();
+        match patch_arm64_symbol_pointers_with_slide(
+            emulator,
+            &image.binary,
+            image.slide,
+            &image_undefs,
+            stub_map,
+            done_addr,
+            trace_bus,
+            process_name,
+        ) {
+            Ok(()) => {
+                if let Some(bus) = trace_bus {
+                    let _ = bus.send(
+                        process_event(
+                            metadata,
+                            "guest-library-symbol-pointers",
+                            "patch_symbol_pointers",
+                        )
+                        .arg("Path", image.path.display().to_string())
+                        .arg(
+                            "InstallName",
+                            image
+                                .install_name
+                                .clone()
+                                .unwrap_or_else(|| "<none>".to_string()),
+                        )
+                        .arg("Slide", format!("0x{:X}", image.slide)),
+                    );
+                }
+            }
+            Err(err) => {
+                if let Some(bus) = trace_bus {
+                    let _ = bus.send(
+                        process_event(
+                            metadata,
+                            "guest-library-symbol-pointers-error",
+                            "patch_symbol_pointers",
+                        )
+                        .arg("Path", image.path.display().to_string())
+                        .arg("Error", format!("{}", err)),
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_mode = RuntimeMode::from_env().unwrap_or_default();
     emulate_macos_arm64_binary_with_mode(binary_path, runtime_mode)
@@ -907,6 +966,15 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &trace_bus,
         &process_name,
     )?;
+    patch_guest_library_symbol_pointers(
+        &mut emulator,
+        &guest_libraries,
+        &stub_map,
+        done_addr,
+        &trace_bus,
+        &metadata,
+        &process_name,
+    );
     install_arm64_lse_atomic_hooks(&mut emulator, &binary, &trace_bus, process_name)?;
     let (indirect_branch_mode, invalid_indirect_branch_mode) = IndirectBranchMode::from_env();
     if let Some(bus) = &trace_bus {

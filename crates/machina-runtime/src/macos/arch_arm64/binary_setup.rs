@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 
 use crate::macos::{
-    patch_section64_u64_slots, process_event, runtime_process_metadata, trim_name, SharedTraceBus,
+    process_event, runtime_process_metadata, section_indirect_symbol_name, trim_name,
+    SharedTraceBus,
 };
 use crate::{Emulator, MachoBinary, UnicornEmulator};
 use machina_arch_arm64::abi::{
@@ -83,25 +84,52 @@ pub fn patch_arm64_symbol_pointers(
     trace_bus: &Option<SharedTraceBus>,
     process_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    patch_arm64_symbol_pointers_with_slide(
+        emulator,
+        binary,
+        0,
+        undefs,
+        stub_map,
+        done_addr,
+        trace_bus,
+        process_name,
+    )
+}
+
+pub fn patch_arm64_symbol_pointers_with_slide(
+    emulator: &mut UnicornEmulator,
+    binary: &MachoBinary,
+    slide: u64,
+    undefs: &[(String, u8)],
+    stub_map: &HashMap<String, u64>,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    process_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let patch_section = |emulator: &mut UnicornEmulator,
                          section: &crate::macos::loader::command::Section64,
                          section_name: &str|
      -> Result<(), Box<dyn std::error::Error>> {
-        let addr = section.addr;
+        let addr = section.addr.wrapping_add(slide);
         let size = section.size;
         if size == 0 {
             return Ok(());
         }
         let page_size = 0x1000;
         let aligned_size = ((size + page_size - 1) / page_size) * page_size;
-        let _ = emulator.map_writable_code_memory(addr, aligned_size);
-        let patched = patch_section64_u64_slots(emulator, binary, section, |_, _, sym_name, _| {
-            Some(
-                sym_name
-                    .and_then(|name| stub_map.get(&name).copied())
-                    .unwrap_or(done_addr),
-            )
-        });
+        if slide == 0 {
+            let _ = emulator.map_writable_code_memory(addr, aligned_size);
+        }
+        let count = section.size / 8;
+        let mut patched = 0;
+        for i in 0..count {
+            let slot_addr = section.addr.wrapping_add(slide).wrapping_add(i * 8);
+            let value = section_indirect_symbol_name(binary, section, i)
+                .and_then(|name| stub_map.get(&name).copied())
+                .unwrap_or(done_addr);
+            let _ = emulator.write_memory(slot_addr, &value.to_le_bytes());
+            patched += 1;
+        }
         emit_arm64_binary_event(
             trace_bus,
             process_name,
@@ -110,6 +138,7 @@ pub fn patch_arm64_symbol_pointers(
             &[
                 ("Section", section_name.to_string()),
                 ("Address", format!("0x{:X}", addr)),
+                ("Slide", format!("0x{:X}", slide)),
                 ("Count", patched.to_string()),
             ],
         );
@@ -143,12 +172,18 @@ pub fn patch_arm64_symbol_pointers(
         .filter(|seg| seg.segname_str() != "__PAGEZERO" && seg.vmaddr != 0)
         .map(|seg| seg.vmaddr)
         .min()
-        .unwrap_or(DEFAULT_IMAGE_BASE);
+        .unwrap_or(DEFAULT_IMAGE_BASE)
+        .wrapping_add(slide);
     let mapped_ranges = binary
         .segments
         .iter()
         .filter(|seg| seg.segname_str() != "__PAGEZERO" && seg.vmsize != 0)
-        .map(|seg| (seg.vmaddr, seg.vmaddr.saturating_add(seg.vmsize)))
+        .map(|seg| {
+            (
+                seg.vmaddr.wrapping_add(slide),
+                seg.vmaddr.wrapping_add(slide).saturating_add(seg.vmsize),
+            )
+        })
         .collect::<Vec<_>>();
     let mut signed_code_ptrs_patched = 0u64;
     for segment in &binary.segments {
@@ -167,7 +202,7 @@ pub fn patch_arm64_symbol_pointers(
                 };
                 let count = section.size / 0x18;
                 for i in 0..count {
-                    let slot_addr = section.addr + i * 0x18;
+                    let slot_addr = section.addr.wrapping_add(slide).wrapping_add(i * 0x18);
                     let _ = emulator.write_memory(slot_addr, &tlv_bootstrap_addr.to_le_bytes());
                     chained_like_patched += 1;
                 }
@@ -181,7 +216,7 @@ pub fn patch_arm64_symbol_pointers(
             }
             let count = section.size / 8;
             for i in 0..count {
-                let slot_addr = section.addr + i * 8;
+                let slot_addr = section.addr.wrapping_add(slide).wrapping_add(i * 8);
                 let Ok(bytes) = emulator.read_memory(slot_addr, 8) else {
                     continue;
                 };

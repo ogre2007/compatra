@@ -5645,6 +5645,43 @@ fn render_printf_hex(arg: u64, long_count: usize, upper: bool, field: &PrintfFie
 }
 
 #[cfg(target_os = "macos")]
+fn printf_arg_sources(
+    register_args: &[u64],
+    stack_args: Option<&[u64]>,
+    index: usize,
+) -> (u64, Option<u64>, Option<u64>) {
+    let stack_arg = stack_args.and_then(|args| args.get(index).copied());
+    let register_arg = register_args.get(index).copied();
+    (
+        stack_arg.or(register_arg).unwrap_or(0),
+        stack_arg,
+        register_arg,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn take_printf_arg(
+    register_args: &[u64],
+    stack_args: Option<&[u64]>,
+    arg_index: &mut usize,
+) -> (u64, Option<u64>, Option<u64>) {
+    let arg = printf_arg_sources(register_args, stack_args, *arg_index);
+    *arg_index = (*arg_index).saturating_add(1);
+    arg
+}
+
+#[cfg(target_os = "macos")]
+fn apply_printf_dynamic_width(field: &mut PrintfField, raw: u64) {
+    let width = raw as i32 as i64;
+    if width < 0 {
+        field.left_align = true;
+        field.width = Some(width.unsigned_abs() as usize);
+    } else {
+        field.width = Some(width as usize);
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn render_arm64_printf<M: GuestMemory + ?Sized>(
     memory: &mut M,
     format: &str,
@@ -5677,30 +5714,46 @@ fn render_arm64_printf<M: GuestMemory + ?Sized>(
             }
             chars.next();
         }
-        let mut width = 0usize;
-        let mut has_width = false;
-        while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
-            has_width = true;
-            width = width
-                .saturating_mul(10)
-                .saturating_add(chars.peek().and_then(|ch| ch.to_digit(10)).unwrap_or(0) as usize);
+        if chars.peek() == Some(&'*') {
             chars.next();
-        }
-        if has_width {
-            field.width = Some(width);
-        }
-        if chars.peek() == Some(&'.') {
-            chars.next();
-            let mut precision = 0usize;
-            let mut has_precision = false;
+            let (width_arg, _, _) = take_printf_arg(register_args, stack_args, &mut arg_index);
+            apply_printf_dynamic_width(&mut field, width_arg);
+        } else {
+            let mut width = 0usize;
+            let mut has_width = false;
             while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
-                has_precision = true;
-                precision = precision.saturating_mul(10).saturating_add(
+                has_width = true;
+                width = width.saturating_mul(10).saturating_add(
                     chars.peek().and_then(|ch| ch.to_digit(10)).unwrap_or(0) as usize,
                 );
                 chars.next();
             }
-            field.precision = Some(if has_precision { precision } else { 0 });
+            if has_width {
+                field.width = Some(width);
+            }
+        }
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                let (precision_arg, _, _) =
+                    take_printf_arg(register_args, stack_args, &mut arg_index);
+                let precision = precision_arg as i32;
+                if precision >= 0 {
+                    field.precision = Some(precision as usize);
+                }
+            } else {
+                let mut precision = 0usize;
+                let mut has_precision = false;
+                while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                    has_precision = true;
+                    precision = precision.saturating_mul(10).saturating_add(
+                        chars.peek().and_then(|ch| ch.to_digit(10)).unwrap_or(0) as usize,
+                    );
+                    chars.next();
+                }
+                field.precision = Some(if has_precision { precision } else { 0 });
+            }
         }
         let mut long_count = 0usize;
         while chars.peek() == Some(&'l') {
@@ -5708,11 +5761,14 @@ fn render_arm64_printf<M: GuestMemory + ?Sized>(
             long_count += 1;
         }
         let spec = chars.next().unwrap_or('%');
-        let stack_arg = stack_args.and_then(|args| args.get(arg_index).copied());
-        let register_arg = register_args.get(arg_index).copied();
-        let arg = stack_arg.or(register_arg).unwrap_or(0);
-        if !matches!(spec, '%') {
-            arg_index = arg_index.saturating_add(1);
+        let (arg, stack_arg, register_arg) = if matches!(spec, '%') {
+            (0, None, None)
+        } else {
+            take_printf_arg(register_args, stack_args, &mut arg_index)
+        };
+        if matches!(spec, '%') {
+            out.push('%');
+            continue;
         }
         match spec {
             's' => {
@@ -10668,6 +10724,58 @@ mod tests {
                 None
             ),
             "addr=0x0100007f short=0x5713 ptr=0x0000000000000abc count=    7 left=7   \n"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn printf_renderer_consumes_dynamic_width_and_precision_args() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"glue-cxx!\0");
+        for (index, value) in [4u64, 0x1000, 77, 12, 0x1000].iter().enumerate() {
+            memory.write_guest(0x2000 + (index as u64 * 8), &value.to_le_bytes());
+        }
+        let stack_args = read_stack_u64_args(&mut memory, 0x2000, 5);
+
+        assert_eq!(
+            render_arm64_printf(
+                &mut memory,
+                "text=%.*s next=%d width=%*s\n",
+                &[99, 0x3000, 11, 2, 0x3000],
+                Some(&stack_args)
+            ),
+            "text=glue next=77 width=   glue-cxx!\n"
         );
     }
 
