@@ -4796,7 +4796,13 @@ fn read_execl_argv<M: GuestMemory + ?Sized>(
     args: &[u64; 8],
     stack_ptr: Option<u64>,
 ) -> Result<Vec<String>, u32> {
-    let mut ptrs = args[1..].to_vec();
+    let mut ptrs = Vec::new();
+    for ptr in args[1..].iter().copied() {
+        ptrs.push(ptr);
+        if ptr == 0 {
+            return read_cstring_pointer_list(memory, ptrs.into_iter(), 128);
+        }
+    }
     if let Some(stack_ptr) = stack_ptr {
         ptrs.extend(read_stack_u64_args(memory, stack_ptr, 128));
     }
@@ -10927,6 +10933,122 @@ mod tests {
         assert_eq!(compat_next_prime(31), 31);
         assert_eq!(compat_next_prime(32), 37);
         assert_eq!(compat_next_prime(1000), 1009);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn execl_argv_reader_stops_at_register_null() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"echo\0");
+        memory.write_guest(0x2000, b"compat exec child\0");
+        memory.write_guest(0x3000, b"stack-garbage\0");
+        memory.write_guest(0x8000, &0x3000u64.to_le_bytes());
+
+        let argv = read_execl_argv(
+            &mut memory,
+            &[0xAAAA, 0x1000, 0x2000, 0, 0xDEAD, 0xBEEF, 0xCAFE, 0xBABE],
+            Some(0x8000),
+        )
+        .expect("execl argv should parse register arguments");
+
+        assert_eq!(argv, vec!["echo", "compat exec child"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn execl_argv_reader_continues_to_stack_without_register_null() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        for (index, addr) in (0x1000u64..=0x7000).step_by(0x1000).enumerate() {
+            memory.write_guest(addr, format!("arg{index}\0").as_bytes());
+        }
+        memory.write_guest(0x9000, b"stack-arg\0");
+        memory.write_guest(0x8000, &0x9000u64.to_le_bytes());
+        memory.write_guest(0x8008, &0u64.to_le_bytes());
+
+        let argv = read_execl_argv(
+            &mut memory,
+            &[
+                0xAAAA, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000,
+            ],
+            Some(0x8000),
+        )
+        .expect("execl argv should continue onto stack arguments");
+
+        assert_eq!(
+            argv,
+            vec![
+                "arg0",
+                "arg1",
+                "arg2",
+                "arg3",
+                "arg4",
+                "arg5",
+                "arg6",
+                "stack-arg"
+            ]
+        );
     }
 
     #[cfg(target_os = "macos")]
