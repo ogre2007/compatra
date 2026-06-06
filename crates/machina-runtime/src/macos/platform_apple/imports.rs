@@ -1884,6 +1884,47 @@ fn path_is_executable(path: &Path) -> bool {
     }
 }
 
+fn synthetic_objc_class_known(name: &str) -> bool {
+    matches!(
+        name,
+        "NSObject"
+            | "NSString"
+            | "NSMutableString"
+            | "NSData"
+            | "NSMutableData"
+            | "NSArray"
+            | "NSMutableArray"
+            | "NSDictionary"
+            | "NSMutableDictionary"
+            | "NSNumber"
+            | "NSDate"
+            | "NSError"
+            | "NSURL"
+            | "NSBundle"
+            | "NSProcessInfo"
+            | "NSFileManager"
+            | "NSApplication"
+            | "NSThread"
+            | "NSRunLoop"
+            | "NSScreen"
+            | "NSWindow"
+    )
+}
+
+fn register_objc_class_lookup_result(
+    runtime: &mut crate::macos::AppleRuntime,
+    name: &str,
+    host_class: Option<u64>,
+) -> u64 {
+    host_class
+        .map(|host_class| runtime.register_host_objc_class(name.to_string(), host_class))
+        .or_else(|| {
+            synthetic_objc_class_known(name)
+                .then(|| runtime.register_host_objc_class(name.to_string(), 0))
+        })
+        .unwrap_or(0)
+}
+
 fn foundation_shim_supports_selector(receiver_kind: &str, selector: &str) -> bool {
     matches!(
         (receiver_kind, selector),
@@ -4372,9 +4413,7 @@ fn dispatch_apple_import(
             let host_class = host_objc_class_lookup(normalized_apple_symbol(symbol), &name);
             let class_ref = {
                 let mut runtime = apple_runtime.lock().ok()?;
-                host_class
-                    .map(|host_class| runtime.register_host_objc_class(name.clone(), host_class))
-                    .unwrap_or(0)
+                register_objc_class_lookup_result(&mut runtime, &name, host_class)
             };
             record_arm64_import(
                 tracker,
@@ -6605,6 +6644,32 @@ mod tests {
                 "{kind} {selector} should be shimmed"
             );
         }
+    }
+
+    #[test]
+    fn synthetic_objc_class_fallback_covers_appkit_startup_classes() {
+        let mut runtime = crate::macos::AppleRuntime::default();
+
+        for name in [
+            "NSApplication",
+            "NSScreen",
+            "NSWindow",
+            "NSThread",
+            "NSRunLoop",
+        ] {
+            let class_ref = register_objc_class_lookup_result(&mut runtime, name, None);
+            assert_ne!(
+                class_ref, 0,
+                "{name} should have a synthetic class fallback"
+            );
+            assert_eq!(runtime.objc_class_name(class_ref).as_deref(), Some(name));
+            assert_eq!(runtime.host_ptr_or_raw_unknown(class_ref), None);
+        }
+
+        assert_eq!(
+            register_objc_class_lookup_result(&mut runtime, "MachinaUnknownClass", None),
+            0
+        );
     }
 
     #[test]

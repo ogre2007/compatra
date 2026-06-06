@@ -6154,6 +6154,19 @@ fn render_arm64_printf<M: GuestMemory + ?Sized>(
             chars.next();
             long_count += 1;
         }
+        match chars.peek().copied() {
+            Some('z') | Some('t') | Some('j') => {
+                chars.next();
+                long_count = long_count.max(1);
+            }
+            Some('h') => {
+                chars.next();
+                if chars.peek() == Some(&'h') {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
         let spec = chars.next().unwrap_or('%');
         let (arg, stack_arg, register_arg) = if matches!(spec, '%') {
             (0, None, None)
@@ -11341,6 +11354,38 @@ mod tests {
                 None
             ),
             "addr=0x0100007f short=0x5713 ptr=0x0000000000000abc count=    7 left=7   \n"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn printf_renderer_supports_size_and_pointer_width_modifiers() {
+        #[derive(Default)]
+        struct TestMemory;
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(
+                &mut self,
+                _addr: u64,
+                _size: usize,
+            ) -> Result<Vec<u8>, GuestMemoryError> {
+                Err(GuestMemoryError)
+            }
+
+            fn write_memory(&mut self, _addr: u64, _data: &[u8]) -> Result<(), GuestMemoryError> {
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory;
+        assert_eq!(
+            render_arm64_printf(
+                &mut memory,
+                "size=%zu ptrdiff=%td intmax=%jx\n",
+                &[1440, (-3i64) as u64, 0x1234],
+                None
+            ),
+            "size=1440 ptrdiff=-3 intmax=1234\n"
         );
     }
 
