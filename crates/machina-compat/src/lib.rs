@@ -4797,14 +4797,24 @@ fn read_execl_argv<M: GuestMemory + ?Sized>(
     stack_ptr: Option<u64>,
 ) -> Result<Vec<String>, u32> {
     let mut ptrs = Vec::new();
-    for ptr in args[1..].iter().copied() {
+    ptrs.push(args[1]);
+    if args[1] == 0 {
+        return read_cstring_pointer_list(memory, ptrs.into_iter(), 128);
+    }
+
+    if let Some(stack_ptr) = stack_ptr {
+        let stack_args = read_stack_u64_args(memory, stack_ptr, 128);
+        if !stack_args.is_empty() {
+            ptrs.extend(stack_args);
+            return read_cstring_pointer_list(memory, ptrs.into_iter(), 128);
+        }
+    }
+
+    for ptr in args[2..].iter().copied() {
         ptrs.push(ptr);
         if ptr == 0 {
             return read_cstring_pointer_list(memory, ptrs.into_iter(), 128);
         }
-    }
-    if let Some(stack_ptr) = stack_ptr {
-        ptrs.extend(read_stack_u64_args(memory, stack_ptr, 128));
     }
     read_cstring_pointer_list(memory, ptrs.into_iter(), 128)
 }
@@ -10937,7 +10947,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn execl_argv_reader_stops_at_register_null() {
+    fn execl_argv_reader_uses_darwin_variadic_stack_tail() {
         #[derive(Default)]
         struct TestMemory {
             bytes: std::collections::HashMap<u64, u8>,
@@ -10971,23 +10981,24 @@ mod tests {
 
         let mut memory = TestMemory::default();
         memory.write_guest(0x1000, b"echo\0");
-        memory.write_guest(0x2000, b"compat exec child\0");
-        memory.write_guest(0x3000, b"stack-garbage\0");
+        memory.write_guest(0x2000, b"register-garbage\0");
+        memory.write_guest(0x3000, b"compat exec child\0");
         memory.write_guest(0x8000, &0x3000u64.to_le_bytes());
+        memory.write_guest(0x8008, &0u64.to_le_bytes());
 
         let argv = read_execl_argv(
             &mut memory,
             &[0xAAAA, 0x1000, 0x2000, 0, 0xDEAD, 0xBEEF, 0xCAFE, 0xBABE],
             Some(0x8000),
         )
-        .expect("execl argv should parse register arguments");
+        .expect("execl argv should parse Darwin variadic stack arguments");
 
         assert_eq!(argv, vec!["echo", "compat exec child"]);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn execl_argv_reader_continues_to_stack_without_register_null() {
+    fn execl_argv_reader_falls_back_to_register_tail_without_stack() {
         #[derive(Default)]
         struct TestMemory {
             bytes: std::collections::HashMap<u64, u8>,
@@ -11020,35 +11031,18 @@ mod tests {
         }
 
         let mut memory = TestMemory::default();
-        for (index, addr) in (0x1000u64..=0x7000).step_by(0x1000).enumerate() {
+        for (index, addr) in (0x1000u64..=0x4000).step_by(0x1000).enumerate() {
             memory.write_guest(addr, format!("arg{index}\0").as_bytes());
         }
-        memory.write_guest(0x9000, b"stack-arg\0");
-        memory.write_guest(0x8000, &0x9000u64.to_le_bytes());
-        memory.write_guest(0x8008, &0u64.to_le_bytes());
 
         let argv = read_execl_argv(
             &mut memory,
-            &[
-                0xAAAA, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000,
-            ],
-            Some(0x8000),
+            &[0xAAAA, 0x1000, 0x2000, 0x3000, 0x4000, 0, 0xDEAD, 0xBEEF],
+            None,
         )
-        .expect("execl argv should continue onto stack arguments");
+        .expect("execl argv should fall back to register arguments");
 
-        assert_eq!(
-            argv,
-            vec![
-                "arg0",
-                "arg1",
-                "arg2",
-                "arg3",
-                "arg4",
-                "arg5",
-                "arg6",
-                "stack-arg"
-            ]
-        );
+        assert_eq!(argv, vec!["arg0", "arg1", "arg2", "arg3"]);
     }
 
     #[cfg(target_os = "macos")]
