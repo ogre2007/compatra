@@ -82,6 +82,14 @@ fn arm64_proxy_compat_host_import(
         if let Some(errno) = result.errno {
             let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
         }
+        if let Some(reason) = machina_compat::take_pending_stop_reason() {
+            if let Ok(mut stop_reason) = shared_state.synthetic_stop_reason.lock() {
+                if stop_reason.is_none() {
+                    *stop_reason = Some(reason);
+                }
+            }
+            let _ = emu.stop_emulation();
+        }
     };
 }
 

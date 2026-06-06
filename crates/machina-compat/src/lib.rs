@@ -2,7 +2,7 @@
 
 mod cxx;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::OnceLock;
@@ -23,6 +23,10 @@ use std::io;
 use std::mem::{self, MaybeUninit};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::ptr;
 #[cfg(target_os = "macos")]
@@ -204,6 +208,18 @@ impl CompatLogConfig {
 
 thread_local! {
     static COMPAT_LOG_DEPTH: Cell<usize> = Cell::new(0);
+    static COMPAT_PENDING_STOP_REASON: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub fn take_pending_stop_reason() -> Option<String> {
+    COMPAT_PENDING_STOP_REASON.with(|reason| reason.borrow_mut().take())
+}
+
+#[cfg(target_os = "macos")]
+fn set_pending_stop_reason(reason: impl Into<String>) {
+    COMPAT_PENDING_STOP_REASON.with(|slot| {
+        *slot.borrow_mut() = Some(reason.into());
+    });
 }
 
 #[derive(Debug)]
@@ -874,6 +890,14 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     Execl,
     #[cfg(target_os = "macos")]
+    Execlp,
+    #[cfg(target_os = "macos")]
+    Execv,
+    #[cfg(target_os = "macos")]
+    Execve,
+    #[cfg(target_os = "macos")]
+    Execvp,
+    #[cfg(target_os = "macos")]
     GetProgName,
     #[cfg(target_os = "macos")]
     SetProgName,
@@ -986,7 +1010,8 @@ impl CompatibilityServices {
         #[cfg(target_os = "macos")]
         {
             let log_scope = CompatLogScope::enter();
-            let result = match host_import_kind(symbol)? {
+            let kind = host_import_kind(symbol)?;
+            let result = match kind {
                 HostImportKind::Puts => proxy_host_puts(memory, arg0_ptr),
                 HostImportKind::Printf => {
                     proxy_host_printf(memory, &[arg0_ptr, 0, 0, 0, 0, 0, 0, 0], None)
@@ -1024,7 +1049,8 @@ impl CompatibilityServices {
         #[cfg(target_os = "macos")]
         {
             let log_scope = CompatLogScope::enter();
-            let result = match host_import_kind(symbol)? {
+            let kind = host_import_kind(symbol)?;
+            let result = match kind {
                 HostImportKind::Puts => proxy_host_puts(memory, args[0]),
                 HostImportKind::Printf => {
                     let stack_args = stack_ptr.map(|sp| read_stack_u64_args(memory, sp, 64));
@@ -1373,7 +1399,21 @@ impl CompatibilityServices {
                     memory, args[0], args[1],
                 )?),
                 HostImportKind::IsSetUGid => Some(host_call_value(0)),
-                HostImportKind::Execl => Some(proxy_guest_execl(memory, args[0], args[1])?),
+                HostImportKind::Execl => {
+                    Some(proxy_guest_execl(memory, "execl", args, stack_ptr, false)?)
+                }
+                HostImportKind::Execlp => {
+                    Some(proxy_guest_execl(memory, "execlp", args, stack_ptr, true)?)
+                }
+                HostImportKind::Execv => Some(proxy_guest_execv(
+                    memory, "execv", args[0], args[1], 0, false,
+                )?),
+                HostImportKind::Execve => Some(proxy_guest_execv(
+                    memory, "execve", args[0], args[1], args[2], false,
+                )?),
+                HostImportKind::Execvp => Some(proxy_guest_execv(
+                    memory, "execvp", args[0], args[1], 0, true,
+                )?),
                 HostImportKind::GetProgName => Some(host_call_value(
                     memory
                         .guest_program_name_ptr()
@@ -1435,6 +1475,11 @@ impl CompatibilityServices {
                 .collect::<Vec<_>>();
             if let Some(stack_ptr) = stack_ptr {
                 log_arg_pairs.push(("sp".to_string(), hex_arg(stack_ptr)));
+            }
+            if matches!(kind, HostImportKind::Connect) {
+                for (name, value) in sockaddr_log_fields(memory, args[1], args[2]) {
+                    log_arg_pairs.push((name.to_string(), value));
+                }
             }
             let log_args = log_arg_pairs
                 .iter()
@@ -1684,11 +1729,12 @@ impl CompatibilityServices {
         #[cfg(target_os = "macos")]
         {
             let result = proxy_host_connect(memory, fd, sockaddr_ptr, sockaddr_len);
-            let log_args = [
+            let mut log_args = vec![
                 ("fd", fd.to_string()),
                 ("sockaddr", hex_arg(sockaddr_ptr)),
                 ("sockaddr_len", sockaddr_len.to_string()),
             ];
+            log_args.extend(sockaddr_log_fields(memory, sockaddr_ptr, sockaddr_len));
             log_scope.io_result("direct", "connect", &log_args, &result);
             return result;
         }
@@ -4529,32 +4575,345 @@ fn proxy_guest_madvise(addr: u64, len: u64, advice: u64) -> HostCallResult {
 #[cfg(target_os = "macos")]
 fn proxy_guest_execl<M: GuestMemory + ?Sized>(
     memory: &mut M,
-    path_ptr: u64,
-    arg0_ptr: u64,
+    call: &'static str,
+    args: &[u64; 8],
+    stack_ptr: Option<u64>,
+    search_path: bool,
 ) -> Option<HostCallResult> {
-    let path = read_cstring(memory, path_ptr, 4096)
-        .unwrap_or_else(|_| format!("<invalid:0x{path_ptr:X}>"));
-    let arg0 = if arg0_ptr == 0 {
-        "<null>".to_string()
-    } else {
-        read_cstring(memory, arg0_ptr, 4096).unwrap_or_else(|_| format!("<invalid:0x{arg0_ptr:X}>"))
+    let path_ptr = args[0];
+    let path = match read_cstring(memory, path_ptr, 4096) {
+        Ok(path) => path,
+        Err(_) => {
+            emit_exec_model_log(
+                call,
+                vec![("path", hex_arg(path_ptr))],
+                vec![
+                    ("Path", Some(format!("<invalid:0x{path_ptr:X}>"))),
+                    ("Model", Some("guest-read-error".to_string())),
+                    ("Reason", Some("path pointer could not be read".to_string())),
+                ],
+                &host_call_error(libc::EFAULT as u32),
+            );
+            return Some(host_call_error(libc::EFAULT as u32));
+        }
     };
-    let mut fields = [
-        ("Path", Some(path)),
-        ("Arg0", Some(arg0)),
+    let argv = match read_execl_argv(memory, args, stack_ptr) {
+        Ok(argv) => argv,
+        Err(errno) => {
+            emit_exec_model_log(
+                call,
+                vec![("path", hex_arg(path_ptr))],
+                vec![
+                    ("Path", Some(path)),
+                    ("Model", Some("guest-read-error".to_string())),
+                    ("Reason", Some("argv pointer could not be read".to_string())),
+                ],
+                &host_call_error(errno),
+            );
+            return Some(host_call_error(errno));
+        }
+    };
+    let mut log_args = vec![("path", hex_arg(path_ptr))];
+    if let Some(stack_ptr) = stack_ptr {
+        log_args.push(("sp", hex_arg(stack_ptr)));
+    }
+    Some(proxy_guest_exec_request(
+        call,
+        log_args,
+        path,
+        argv,
+        None,
+        search_path,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_execv<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    call: &'static str,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    search_path: bool,
+) -> Option<HostCallResult> {
+    let path = match read_cstring(memory, path_ptr, 4096) {
+        Ok(path) => path,
+        Err(_) => {
+            let result = host_call_error(libc::EFAULT as u32);
+            emit_exec_model_log(
+                call,
+                vec![("path", hex_arg(path_ptr)), ("argv", hex_arg(argv_ptr))],
+                vec![
+                    ("Path", Some(format!("<invalid:0x{path_ptr:X}>"))),
+                    ("Model", Some("guest-read-error".to_string())),
+                    ("Reason", Some("path pointer could not be read".to_string())),
+                ],
+                &result,
+            );
+            return Some(result);
+        }
+    };
+    let argv = match read_guest_cstring_array(memory, argv_ptr, 128) {
+        Ok(argv) => argv,
+        Err(errno) => {
+            let result = host_call_error(errno);
+            emit_exec_model_log(
+                call,
+                vec![("path", hex_arg(path_ptr)), ("argv", hex_arg(argv_ptr))],
+                vec![
+                    ("Path", Some(path)),
+                    ("Model", Some("guest-read-error".to_string())),
+                    ("Reason", Some("argv vector could not be read".to_string())),
+                ],
+                &result,
+            );
+            return Some(result);
+        }
+    };
+    let env = if envp_ptr == 0 {
+        None
+    } else {
+        match read_guest_env_array(memory, envp_ptr, 256) {
+            Ok(env) => Some(env),
+            Err(errno) => {
+                let result = host_call_error(errno);
+                emit_exec_model_log(
+                    call,
+                    vec![
+                        ("path", hex_arg(path_ptr)),
+                        ("argv", hex_arg(argv_ptr)),
+                        ("envp", hex_arg(envp_ptr)),
+                    ],
+                    vec![
+                        ("Path", Some(path)),
+                        ("Model", Some("guest-read-error".to_string())),
+                        ("Reason", Some("envp vector could not be read".to_string())),
+                    ],
+                    &result,
+                );
+                return Some(result);
+            }
+        }
+    };
+    let mut log_args = vec![("path", hex_arg(path_ptr)), ("argv", hex_arg(argv_ptr))];
+    if envp_ptr != 0 {
+        log_args.push(("envp", hex_arg(envp_ptr)));
+    }
+    Some(proxy_guest_exec_request(
+        call,
+        log_args,
+        path,
+        argv,
+        env,
+        search_path,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_exec_request(
+    call: &'static str,
+    log_args: Vec<(&'static str, String)>,
+    path: String,
+    mut argv: Vec<String>,
+    env: Option<Vec<(String, String)>>,
+    search_path: bool,
+) -> HostCallResult {
+    if argv.is_empty() {
+        argv.push(path.clone());
+    }
+    let resolved_path = resolve_exec_path(&path, env.as_deref(), search_path);
+    let mut fields = vec![
+        ("Path", Some(path.clone())),
+        ("ResolvedPath", Some(resolved_path.display().to_string())),
+        ("Argc", Some(argv.len().to_string())),
+        ("Argv", Some(argv.join("\u{1f}"))),
         (
-            "Reason",
-            Some("exec would replace the compatibility host process".to_string()),
+            "EnvCount",
+            env.as_ref()
+                .map(|env| env.len().to_string())
+                .or_else(|| (!matches!(call, "execve")).then(|| "inherit".to_string())),
+        ),
+        (
+            "PathSearch",
+            Some(if search_path { "1" } else { "0" }.to_string()),
         ),
     ];
-    emit_verbose_compat_payload(
-        "process",
-        "execl",
-        &[("path", hex_arg(path_ptr)), ("arg0", hex_arg(arg0_ptr))],
-        &mut fields,
-        None,
-    );
-    Some(host_call_error(libc::ENOSYS as u32))
+
+    let result = match fs::metadata(&resolved_path) {
+        Ok(metadata) if metadata.is_dir() => {
+            fields.push(("Model", Some("path-error".to_string())));
+            fields.push(("Reason", Some("target is a directory".to_string())));
+            host_call_error(libc::EACCES as u32)
+        }
+        Ok(metadata) if metadata.mode() & 0o111 == 0 => {
+            fields.push(("Model", Some("path-error".to_string())));
+            fields.push(("Reason", Some("target is not executable".to_string())));
+            host_call_error(libc::EACCES as u32)
+        }
+        Ok(_) => match spawn_exec_child(&resolved_path, &argv, env.as_deref()) {
+            Ok(exit_status) => {
+                fields.push(("Model", Some("spawn-wait-stop".to_string())));
+                fields.push(("ExitStatus", Some(exit_status.to_string())));
+                set_pending_stop_reason(format!(
+                    "compat exec replaced guest image call={call} path={} status={exit_status}",
+                    resolved_path.display()
+                ));
+                host_call_value(0)
+            }
+            Err((errno, reason)) => {
+                fields.push(("Model", Some("spawn-error".to_string())));
+                fields.push(("Reason", Some(reason)));
+                host_call_error(errno)
+            }
+        },
+        Err(error) => {
+            let errno = io_error_errno(&error);
+            fields.push(("Model", Some("path-error".to_string())));
+            fields.push(("Reason", Some(error.to_string())));
+            host_call_error(errno)
+        }
+    };
+    emit_exec_model_log(call, log_args, fields, &result);
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn emit_exec_model_log(
+    call: &str,
+    log_args: Vec<(&str, String)>,
+    mut fields: Vec<(&str, Option<String>)>,
+    result: &HostCallResult,
+) {
+    fields.push(("return", Some(format_return(result.return_value))));
+    fields.push(("return_hex", Some(format!("0x{:X}", result.return_value))));
+    fields.push(("errno", result.errno.map(|errno| errno.to_string())));
+    emit_verbose_compat_payload("process", call, &log_args, &mut fields, None);
+}
+
+#[cfg(target_os = "macos")]
+fn read_execl_argv<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    args: &[u64; 8],
+    stack_ptr: Option<u64>,
+) -> Result<Vec<String>, u32> {
+    let mut ptrs = args[1..].to_vec();
+    if let Some(stack_ptr) = stack_ptr {
+        ptrs.extend(read_stack_u64_args(memory, stack_ptr, 128));
+    }
+    read_cstring_pointer_list(memory, ptrs.into_iter(), 128)
+}
+
+#[cfg(target_os = "macos")]
+fn read_guest_cstring_array<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    ptr: u64,
+    max_entries: usize,
+) -> Result<Vec<String>, u32> {
+    if ptr == 0 {
+        return Err(libc::EFAULT as u32);
+    }
+    let mut ptrs = Vec::new();
+    for index in 0..max_entries {
+        let addr = ptr.saturating_add((index * 8) as u64);
+        let bytes = memory
+            .read_memory(addr, 8)
+            .map_err(|_| libc::EFAULT as u32)?;
+        let value = read_u64_at(&bytes, 0).ok_or(libc::EFAULT as u32)?;
+        ptrs.push(value);
+        if value == 0 {
+            return read_cstring_pointer_list(memory, ptrs.into_iter(), max_entries);
+        }
+    }
+    Err(libc::E2BIG as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn read_cstring_pointer_list<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    ptrs: impl Iterator<Item = u64>,
+    max_entries: usize,
+) -> Result<Vec<String>, u32> {
+    let mut out = Vec::new();
+    for ptr in ptrs.take(max_entries + 1) {
+        if ptr == 0 {
+            return Ok(out);
+        }
+        if out.len() >= max_entries {
+            return Err(libc::E2BIG as u32);
+        }
+        out.push(read_cstring(memory, ptr, 4096).map_err(|_| libc::EFAULT as u32)?);
+    }
+    Err(libc::E2BIG as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn read_guest_env_array<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    ptr: u64,
+    max_entries: usize,
+) -> Result<Vec<(String, String)>, u32> {
+    let entries = read_guest_cstring_array(memory, ptr, max_entries)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_exec_path(
+    path: &str,
+    env: Option<&[(String, String)]>,
+    search_path: bool,
+) -> std::path::PathBuf {
+    if !search_path || path.contains('/') {
+        return std::path::PathBuf::from(path);
+    }
+    let path_value = env
+        .and_then(|env| {
+            env.iter()
+                .find(|(name, _)| name == "PATH")
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        })
+        .or_else(|| std::env::var_os("PATH"));
+    if let Some(path_value) = path_value {
+        for base in std::env::split_paths(&path_value) {
+            let candidate = base.join(path);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_exec_child(
+    path: &std::path::Path,
+    argv: &[String],
+    env: Option<&[(String, String)]>,
+) -> Result<i32, (u32, String)> {
+    let mut command = Command::new(path);
+    if let Some(arg0) = argv.first() {
+        command.arg0(arg0);
+    }
+    command.args(argv.iter().skip(1));
+    if let Some(env) = env {
+        command.env_clear();
+        for (name, value) in env {
+            command.env(name, value);
+        }
+    }
+    match command.status() {
+        Ok(status) => Ok(status
+            .code()
+            .or_else(|| status.signal().map(|signal| 128 + signal))
+            .unwrap_or(0)),
+        Err(error) => Err((io_error_errno(&error), error.to_string())),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4950,6 +5309,10 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             }
             "issetugid" | "issetguid" => Some(HostImportKind::IsSetUGid),
             "execl" => Some(HostImportKind::Execl),
+            "execlp" => Some(HostImportKind::Execlp),
+            "execv" => Some(HostImportKind::Execv),
+            "execve" => Some(HostImportKind::Execve),
+            "execvp" => Some(HostImportKind::Execvp),
             "getprogname" => Some(HostImportKind::GetProgName),
             "setprogname" => Some(HostImportKind::SetProgName),
             "_dyld_image_count" | "dyld_image_count" => Some(HostImportKind::DyldImageCount),
@@ -6531,6 +6894,76 @@ fn read_sockaddr_storage<M: GuestMemory + ?Sized>(
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), storage.as_mut_ptr().cast::<u8>(), copy_len);
     }
     Some((storage, copy_len as libc::socklen_t))
+}
+
+#[cfg(target_os = "macos")]
+fn sockaddr_log_fields<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    len: u64,
+) -> Vec<(&'static str, String)> {
+    let mut fields = Vec::new();
+    if addr == 0 || len < 2 {
+        fields.push(("SockaddrDecode", "unavailable".to_string()));
+        return fields;
+    }
+    let Ok(bytes) = memory.read_memory(addr, (len as usize).min(256)) else {
+        fields.push(("SockaddrDecode", "read-error".to_string()));
+        return fields;
+    };
+    if bytes.len() < 2 {
+        fields.push(("SockaddrDecode", "short".to_string()));
+        return fields;
+    }
+
+    let family = bytes[1] as i32;
+    fields.push(("Family", sockaddr_family_name(family).to_string()));
+    match family {
+        libc::AF_INET if bytes.len() >= 8 => {
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let address = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+            fields.push(("Address", address.to_string()));
+            fields.push(("Port", port.to_string()));
+            fields.push(("Endpoint", format!("{address}:{port}")));
+        }
+        libc::AF_INET6 if bytes.len() >= 28 => {
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let mut raw = [0u8; 16];
+            raw.copy_from_slice(&bytes[8..24]);
+            let address = std::net::Ipv6Addr::from(raw);
+            let scope = read_u32_at(&bytes, 24).unwrap_or(0);
+            fields.push(("Address", address.to_string()));
+            fields.push(("Port", port.to_string()));
+            if scope != 0 {
+                fields.push(("ScopeId", scope.to_string()));
+                fields.push(("Endpoint", format!("[{address}%{scope}]:{port}")));
+            } else {
+                fields.push(("Endpoint", format!("[{address}]:{port}")));
+            }
+        }
+        libc::AF_UNIX if bytes.len() > 2 => {
+            let path = bytes[2..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|end| &bytes[2..2 + end])
+                .unwrap_or(&bytes[2..]);
+            fields.push(("Address", String::from_utf8_lossy(path).into_owned()));
+        }
+        _ => {
+            fields.push(("SockaddrDecode", "unsupported-family".to_string()));
+        }
+    }
+    fields
+}
+
+#[cfg(target_os = "macos")]
+fn sockaddr_family_name(family: i32) -> &'static str {
+    match family {
+        libc::AF_UNIX => "AF_UNIX",
+        libc::AF_INET => "AF_INET",
+        libc::AF_INET6 => "AF_INET6",
+        _ => "unknown",
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -10450,6 +10883,10 @@ mod tests {
             assert!(compat.should_proxy_import("_issetugid"));
             assert!(compat.should_proxy_import("_issetguid"));
             assert!(compat.should_proxy_import("_execl"));
+            assert!(compat.should_proxy_import("_execlp"));
+            assert!(compat.should_proxy_import("_execv"));
+            assert!(compat.should_proxy_import("_execve"));
+            assert!(compat.should_proxy_import("_execvp"));
             assert!(compat.should_proxy_import("_getprogname"));
             assert!(compat.should_proxy_import("_setprogname"));
             assert!(compat.should_proxy_import("__dyld_image_count"));

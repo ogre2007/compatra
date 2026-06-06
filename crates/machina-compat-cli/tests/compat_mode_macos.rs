@@ -272,6 +272,54 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_exec_model_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_exec_model.c");
+    let binary = out_dir.join("arm64_exec_model");
+    fs::write(
+        &source,
+        r#"#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    puts("compat exec before");
+    fflush(stdout);
+    execl("/bin/echo", "echo", "compat exec child", (char *)0);
+    printf("compat exec after errno=%d\n", errno);
+    return 7;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 exec model C fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 exec model fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 exec model fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_guest_library_init_fixture() -> (PathBuf, PathBuf) {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -1714,6 +1762,318 @@ int main(void) {
     assert!(
         output.status.success(),
         "failed to compile generated arm64 network fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
+fn compile_arm64_public_network_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_public_network_compat.c");
+    let binary = out_dir.join("arm64_public_network_compat");
+    fs::write(
+        &source,
+        r#"#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+typedef int (*getaddrinfo_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+typedef void (*freeaddrinfo_fn)(struct addrinfo *);
+typedef const char *(*gai_strerror_fn)(int);
+typedef int (*getnameinfo_fn)(const struct sockaddr *, socklen_t, char *, socklen_t, char *, socklen_t, int);
+typedef int (*socket_fn)(int, int, int);
+typedef int (*connect_fn)(int, const struct sockaddr *, socklen_t);
+typedef ssize_t (*send_fn)(int, const void *, size_t, int);
+typedef ssize_t (*recv_fn)(int, void *, size_t, int);
+typedef int (*close_fn)(int);
+typedef int (*fcntl_fn)(int, int, ...);
+typedef int (*poll_fn)(struct pollfd *, nfds_t, int);
+typedef int (*getsockopt_fn)(int, int, int, void *, socklen_t *);
+
+static int make_nonblocking(int fd, fcntl_fn fcntl_impl, int *old_flags) {
+    errno = 0;
+    int flags = fcntl_impl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    *old_flags = flags;
+    return fcntl_impl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int finish_nonblocking_connect(
+    int fd,
+    int connect_ret,
+    int connect_errno,
+    poll_fn poll_impl,
+    getsockopt_fn getsockopt_impl,
+    int *poll_ret_out,
+    short *revents_out,
+    int *so_error_out
+) {
+    *poll_ret_out = -1;
+    *revents_out = 0;
+    *so_error_out = 0;
+    if (connect_ret == 0) {
+        return 0;
+    }
+    if (connect_errno != EINPROGRESS) {
+        errno = connect_errno;
+        return -1;
+    }
+
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    errno = 0;
+    int poll_ret = poll_impl(&pfd, 1, 3000);
+    *poll_ret_out = poll_ret;
+    *revents_out = pfd.revents;
+    if (poll_ret <= 0) {
+        if (poll_ret == 0) {
+            errno = ETIMEDOUT;
+        }
+        return -1;
+    }
+
+    int so_error = 0;
+    socklen_t so_len = sizeof(so_error);
+    if (getsockopt_impl(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) != 0) {
+        return -1;
+    }
+    *so_error_out = so_error;
+    if (so_error != 0) {
+        errno = so_error;
+        return -1;
+    }
+    return 0;
+}
+
+static void sanitize_preview(char *buf, long len) {
+    if (len < 0) {
+        return;
+    }
+    for (long i = 0; i < len; i++) {
+        if (buf[i] == '\r' || buf[i] == '\n' || buf[i] == '\t') {
+            buf[i] = ' ';
+        }
+    }
+}
+
+static int probe_public_network(
+    const char *label,
+    getaddrinfo_fn gai_impl,
+    freeaddrinfo_fn free_impl,
+    gai_strerror_fn gai_error_impl,
+    getnameinfo_fn nameinfo_impl,
+    socket_fn socket_impl,
+    connect_fn connect_impl,
+    send_fn send_impl,
+    recv_fn recv_impl,
+    close_fn close_impl,
+    fcntl_fn fcntl_impl,
+    poll_fn poll_impl,
+    getsockopt_fn getsockopt_impl
+) {
+    const char *host = "example.com";
+    const char *service = "80";
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo *res = 0;
+    errno = 0;
+    int gai_ret = gai_impl(host, service, &hints, &res);
+    const char *gai_text = gai_ret == 0 ? "ok" : gai_error_impl(gai_ret);
+    printf("compat publicnet %s resolve host=%s service=%s ret=%d err=%s ptr=%p errno=%d\n",
+           label, host, service, gai_ret, gai_text ? gai_text : "<null>", (void *)res, errno);
+    if (gai_ret != 0 || res == 0) {
+        printf("compat publicnet %s summary attempted=1 resolved=0 connected=0 sent=-1 recv=-1 reason=gai:%d:%s\n",
+               label, gai_ret, gai_text ? gai_text : "<null>");
+        return 0;
+    }
+
+    char numeric_host[NI_MAXHOST] = {0};
+    char numeric_service[NI_MAXSERV] = {0};
+    int ni_ret = nameinfo_impl(res->ai_addr, res->ai_addrlen, numeric_host, sizeof(numeric_host), numeric_service, sizeof(numeric_service), NI_NUMERICHOST | NI_NUMERICSERV);
+    printf("compat publicnet %s resolved family=%d socktype=%d protocol=%d addrlen=%u nameinfo=%d addr=%s port=%s errno=%d\n",
+           label, res->ai_family, res->ai_socktype, res->ai_protocol, (unsigned)res->ai_addrlen, ni_ret, numeric_host, numeric_service, errno);
+
+    errno = 0;
+    int fd = socket_impl(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int socket_errno = errno;
+    printf("compat publicnet %s socket fd=%d errno=%d\n", label, fd, socket_errno);
+    if (fd < 0) {
+        printf("compat publicnet %s summary attempted=1 resolved=1 connected=0 sent=-1 recv=-1 reason=socket:%d\n",
+               label, socket_errno);
+        free_impl(res);
+        return 0;
+    }
+
+    int old_flags = 0;
+    int nb_ret = make_nonblocking(fd, fcntl_impl, &old_flags);
+    int nb_errno = errno;
+    int connect_ret = -1;
+    int connect_errno = nb_errno;
+    int poll_ret = -1;
+    short revents = 0;
+    int so_error = 0;
+    int connected = 0;
+    if (nb_ret == 0) {
+        errno = 0;
+        connect_ret = connect_impl(fd, res->ai_addr, res->ai_addrlen);
+        connect_errno = errno;
+        connected = finish_nonblocking_connect(fd, connect_ret, connect_errno, poll_impl, getsockopt_impl, &poll_ret, &revents, &so_error) == 0;
+    }
+    int final_connect_errno = connected ? 0 : errno;
+    printf("compat publicnet %s connect nb=%d/%d ret=%d errno=%d poll=%d revents=0x%x so_error=%d connected=%d final_errno=%d\n",
+           label, nb_ret, nb_errno, connect_ret, connect_errno, poll_ret, (unsigned)revents, so_error, connected, final_connect_errno);
+
+    long sent = -1;
+    long got = -1;
+    char preview[256];
+    memset(preview, 0, sizeof(preview));
+    const char *reason = connected ? "ok" : "connect";
+    if (connected) {
+        (void)fcntl_impl(fd, F_SETFL, old_flags);
+        const char request[] =
+            "GET / HTTP/1.0\r\n"
+            "Host: example.com\r\n"
+            "User-Agent: machina-compat-publicnet\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        errno = 0;
+        sent = (long)send_impl(fd, request, sizeof(request) - 1, 0);
+        int send_errno = errno;
+        printf("compat publicnet %s send bytes=%ld errno=%d\n", label, sent, send_errno);
+        if (sent > 0) {
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            errno = 0;
+            int read_poll = poll_impl(&pfd, 1, 3000);
+            int read_poll_errno = errno;
+            if (read_poll > 0) {
+                errno = 0;
+                got = (long)recv_impl(fd, preview, sizeof(preview) - 1, 0);
+                int recv_errno = errno;
+                if (got > 0 && got < (long)sizeof(preview)) {
+                    preview[got] = 0;
+                }
+                sanitize_preview(preview, got);
+                printf("compat publicnet %s recv poll=%d revents=0x%x bytes=%ld errno=%d preview=%.*s\n",
+                       label, read_poll, (unsigned)pfd.revents, got, recv_errno, got > 96 ? 96 : (int)(got > 0 ? got : 0), preview);
+                reason = got > 0 ? "response" : "recv";
+            } else {
+                printf("compat publicnet %s recv poll=%d revents=0x%x errno=%d preview=\n",
+                       label, read_poll, (unsigned)pfd.revents, read_poll_errno);
+                reason = read_poll == 0 ? "recv-timeout" : "poll";
+            }
+        } else {
+            reason = "send";
+        }
+    }
+
+    printf("compat publicnet %s summary attempted=1 resolved=1 connected=%d sent=%ld recv=%ld reason=%s addr=%s port=%s\n",
+           label, connected, sent, got, reason, numeric_host, numeric_service);
+    close_impl(fd);
+    free_impl(res);
+    return 0;
+}
+
+int main(void) {
+    int failures = 0;
+    failures += probe_public_network(
+        "static",
+        getaddrinfo,
+        freeaddrinfo,
+        gai_strerror,
+        getnameinfo,
+        socket,
+        connect,
+        send,
+        recv,
+        close,
+        fcntl,
+        poll,
+        getsockopt
+    );
+
+    void *self = dlopen(NULL, RTLD_NOW);
+    getaddrinfo_fn dyn_gai = (getaddrinfo_fn)dlsym(self, "getaddrinfo");
+    freeaddrinfo_fn dyn_free = (freeaddrinfo_fn)dlsym(self, "freeaddrinfo");
+    gai_strerror_fn dyn_gai_error = (gai_strerror_fn)dlsym(self, "gai_strerror");
+    getnameinfo_fn dyn_nameinfo = (getnameinfo_fn)dlsym(self, "getnameinfo");
+    socket_fn dyn_socket = (socket_fn)dlsym(self, "socket");
+    connect_fn dyn_connect = (connect_fn)dlsym(self, "connect");
+    send_fn dyn_send = (send_fn)dlsym(self, "send");
+    recv_fn dyn_recv = (recv_fn)dlsym(self, "recv");
+    close_fn dyn_close = (close_fn)dlsym(self, "close");
+    fcntl_fn dyn_fcntl = (fcntl_fn)dlsym(self, "fcntl");
+    poll_fn dyn_poll = (poll_fn)dlsym(self, "poll");
+    getsockopt_fn dyn_getsockopt = (getsockopt_fn)dlsym(self, "getsockopt");
+    printf("compat publicnet dlsym ptrs gai=%p free=%p gaierr=%p nameinfo=%p socket=%p connect=%p send=%p recv=%p close=%p fcntl=%p poll=%p getopt=%p\n",
+           (void *)dyn_gai, (void *)dyn_free, (void *)dyn_gai_error, (void *)dyn_nameinfo, (void *)dyn_socket, (void *)dyn_connect, (void *)dyn_send, (void *)dyn_recv, (void *)dyn_close, (void *)dyn_fcntl, (void *)dyn_poll, (void *)dyn_getsockopt);
+    if (dyn_gai && dyn_free && dyn_gai_error && dyn_nameinfo && dyn_socket && dyn_connect && dyn_send && dyn_recv && dyn_close && dyn_fcntl && dyn_poll && dyn_getsockopt) {
+        failures += probe_public_network(
+            "dlsym",
+            dyn_gai,
+            dyn_free,
+            dyn_gai_error,
+            dyn_nameinfo,
+            dyn_socket,
+            dyn_connect,
+            dyn_send,
+            dyn_recv,
+            dyn_close,
+            dyn_fcntl,
+            dyn_poll,
+            dyn_getsockopt
+        );
+    } else {
+        printf("compat publicnet dlsym summary attempted=0 resolved=0 connected=0 sent=-1 recv=-1 reason=missing-dlsym\n");
+    }
+    dlclose(self);
+    printf("compat publicnet final failures=%d\n", failures);
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 public network fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 public network fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 public network fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -4693,6 +5053,75 @@ fn compat_mode_runs_lifecycle_glue() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn compat_mode_models_exec_as_nonreturning_spawn() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode exec model diagnostic on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_exec_model_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("verbose")
+        .arg("--compat-log-filter")
+        .arg("execl")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    eprintln!(
+        "compat proof(exec): command={} --mode compat --compat-log verbose --compat-log-filter execl {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(exec): status={status}");
+    eprintln!("compat proof(exec): stdout={stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(exec): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "exec model fixture exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("compat exec before") && stdout.contains("compat exec child"),
+        "exec model fixture did not run pre-exec code and spawned /bin/echo child; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("compat exec after"),
+        "exec model returned to old guest image after successful execl; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"execl\"")
+            && stderr.contains("\"Model\":\"spawn-wait-stop\"")
+            && stderr.contains("\"Path\":\"/bin/echo\"")
+            && stderr.contains("\"ExitStatus\":\"0\""),
+        "exec model did not log spawned non-returning execl; stderr:\n{stderr}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn compat_mode_runs_guest_library_constructors() {
     if std::env::consts::ARCH != "x86_64" {
         eprintln!(
@@ -5389,6 +5818,93 @@ fn compat_mode_proxies_network_resolver_and_socket_imports() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn compat_mode_public_network_probe_reports_result_or_reason() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode public network probe on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_public_network_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("calls")
+        .arg("--compat-log-filter")
+        .arg("getaddrinfo,connect,send,recv,poll,getsockopt")
+        .arg("--compat-log-preview-bytes")
+        .arg("96")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let proof_lines = stdout
+        .lines()
+        .filter(|line| line.contains("compat publicnet"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    eprintln!(
+        "compat proof(publicnet): command={} --mode compat --compat-log calls --compat-log-filter getaddrinfo,connect,send,recv,poll,getsockopt --compat-log-preview-bytes 96 {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(publicnet): status={status}");
+    eprintln!("compat proof(publicnet): lines:\n{proof_lines}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(publicnet): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "public network probe fixture exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("compat publicnet static resolve host=example.com service=80 ret=")
+            && stdout.contains("compat publicnet static summary attempted=1"),
+        "public network probe did not report static outbound attempt; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat publicnet dlsym ptrs gai=0x")
+            && stdout.contains(" connect=0x")
+            && stdout.contains(" poll=0x"),
+        "public network probe did not receive dlsym network trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat publicnet dlsym summary attempted=1")
+            || stdout.contains("compat publicnet dlsym summary attempted=0"),
+        "public network probe did not report dynamic outbound attempt or reason; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"getaddrinfo\""),
+        "public network probe did not emit getaddrinfo compat log; stderr:\n{stderr}"
+    );
+    if stderr.contains("\"Call\":\"connect\"") {
+        assert!(
+            stderr.contains("\"Endpoint\":\""),
+            "public network probe connect log did not include decoded endpoint; stderr:\n{stderr}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 #[ignore = "deep Intel macOS network compatibility matrix; CI opts in with --include-ignored"]
 fn compat_mode_network_stack_matrix_manual() {
     if std::env::consts::ARCH != "x86_64" {
@@ -5404,6 +5920,10 @@ fn compat_mode_network_stack_matrix_manual() {
     let output = Command::new(&machina)
         .arg("--mode")
         .arg("compat")
+        .arg("--compat-log")
+        .arg("calls")
+        .arg("--compat-log-filter")
+        .arg("connect")
         .arg(&fixture)
         .env("MACHINA_PLUGIN_TRACE", "1")
         .env("MACHINA_TRACE_FORMAT", "jsonl")
@@ -5424,7 +5944,7 @@ fn compat_mode_network_stack_matrix_manual() {
         .join("\n");
 
     eprintln!(
-        "compat proof(netmatrix): command={} --mode compat {}",
+        "compat proof(netmatrix): command={} --mode compat --compat-log calls --compat-log-filter connect {}",
         machina.display(),
         fixture.display()
     );
@@ -5463,6 +5983,13 @@ fn compat_mode_network_stack_matrix_manual() {
             && stdout.contains("reply=5/5/reply")
             && stdout.contains("shutdown=0"),
         "network matrix did not complete TCP connect/accept/getpeername checks; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"connect\"")
+            && stderr.contains("\"Family\":\"AF_INET\"")
+            && stderr.contains("\"Address\":\"127.0.0.1\"")
+            && stderr.contains("\"Endpoint\":\"127.0.0.1:"),
+        "network matrix compat log did not include decoded connect endpoint; stderr:\n{stderr}"
     );
     assert!(
         stdout.contains("compat netmatrix summary failures=0"),
