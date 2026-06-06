@@ -1,0 +1,16 @@
+[package]
+name = "compatra-cli"
+version = "0.5.0"
+edition = "2021"
+description = "Compatra compatibility-only CLI for macOS arm64 userland"
+license = "GPL-2.0"
+
+[features]
+default = []
+
+[dependencies]
+compatra-runtime = { path = "../compatra-runtime", default-features = false }
+
+[[bin]]
+name = "compatra"
+path = "src/main.rs"

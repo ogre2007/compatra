@@ -5,32 +5,33 @@ repo. The intent is to keep direction stable across short, automated sessions.
 
 ## Project identity
 
-- Project name: `Machina` (Cargo package `machina`, lib `machina`, bin
-  `machina`; dedicated compat CLI package `machina-compat-cli`, bin
-  `machina-compat`).
+- Product split: `Compatra` is the compatibility-only runner (Cargo package
+  `compatra-cli`, bin `compatra`); `Machoscope` is the analysis-capable runner
+  (Cargo package `machoscope`, lib `machoscope`, bin `machoscope`). The root
+  manifest is a virtual Cargo workspace, not a package.
 - Language: Rust, edition 2021.
 - Workspace architecture crates:
-  - `crates/machina-arch` — architecture-neutral identifiers and traits.
-  - `crates/machina-arch-arm64` — pure arm64 ABI, stub-layout,
+  - `crates/compatra-arch` — architecture-neutral identifiers and traits.
+  - `crates/compatra-arch-arm64` — pure arm64 ABI, stub-layout,
     instruction-decoder, and pointer-sanitizer primitives with no dependency
-    on the main `machina` crate.
-- Workspace runtime-mode crates:
-  - `crates/machina-mode` — `RuntimeMode` parsing/defaults and mode
-    predicates.
-  - `crates/machina-analysis` — analysis-only services: capture artifact
+    on the main `compatra` crate.
+- Workspace product/runtime crates:
+  - `crates/machoscope-analysis` — analysis-only services: capture artifact
     writing, payload summaries, synthetic analyst fixtures such as log-stream
     output, synthetic guest artifact/bait data, and built-in analysis plugin
     preset specifications and operator hook env parsing.
-  - `crates/machina-compat` — compatibility-only host proxy services behind a
-    guest-memory trait; it must not depend on analysis services or the main
-    `machina` crate.
-  - `crates/machina-compat-cli` — compatibility-only CLI and Intel macOS
-    integration tests. It depends on `crates/machina-runtime` with default
+  - `crates/compatra` — compatibility-only host proxy services behind a
+    guest-memory trait; it must not depend on analysis services or
+    `compatra-runtime`.
+  - `crates/compatra-cli` — compatibility-only CLI and Intel macOS
+    integration tests. It depends on `crates/compatra-runtime` with default
     features disabled.
-  - `crates/machina-runtime` — macOS emulation runtime: Mach-O loader, Unicorn
+  - `crates/machoscope` — analysis-capable CLI/library and portable analysis
+    integration tests. It depends on `crates/compatra-runtime` with analysis
+    features enabled by default.
+  - `crates/compatra-runtime` — macOS emulation runtime: Mach-O loader, Unicorn
     wrapper, trace pipeline, runtime facades, arm64 execution flow, and
-    Apple/Darwin service modeling. The root `machina` crate re-exports this
-    public runtime API.
+    Apple/Darwin service modeling.
 - Scope: macOS `arm64` Mach-O userland emulation for malware analysis.
 - CPU backend: published `unicorn-engine` / `unicorn-engine-sys` crates (no
   vendored source, no submodule).
@@ -39,64 +40,64 @@ repo. The intent is to keep direction stable across short, automated sessions.
 
 ## Code organization rules
 
-`crates/machina-runtime/src/macos/mod.rs` is intentionally flat: each leaf file
+`crates/compatra-runtime/src/macos/mod.rs` is intentionally flat: each leaf file
 is declared once via `#[path = ".../foo.rs"] pub mod foo;` and then the grouped
 façades re-export the same modules under shorter names. When you add a new
 file:
 
 1. Decide which group it belongs to (see below).
 2. Add the `#[path]` declaration in
-   `crates/machina-runtime/src/macos/mod.rs`.
+   `crates/compatra-runtime/src/macos/mod.rs`.
 3. Re-export it from the matching group's `mod.rs` (`core`, `arch_arm64`,
    `analysis_arm64`, `platform_apple`, `guest_model`) using `pub use` so
    callers can keep importing through the façade.
 4. If the new symbol is part of the public surface, add a `pub use` entry to
-   `src/lib.rs` as well.
+   `crates/compatra-runtime/src/lib.rs` as well.
 
 Group ownership:
 
-- `crates/machina-runtime/src/macos/core` — architecture-neutral orchestration, analysis-service
+- `crates/compatra-runtime/src/macos/core` — architecture-neutral orchestration, analysis-service
   boundary (`analysis.rs`), compatibility-service boundary (`compat.rs`),
   tracing, plugin and runtime façades, batch
   emulation driver (`emulation.rs`), JSONL trace pipeline (`trace.rs`,
   `plugin_events.rs`, `runner_plugins.rs`).
-- `crates/machina-runtime/src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics,
+- `crates/compatra-runtime/src/macos/arch_arm64` — arm64-only runner, binary setup, diagnostics,
   shared arm64 runtime state (`state.rs`), import-stub plumbing
   (`import_stubs.rs`), dynamic import trampolines (`dynamic_imports.rs`),
   LSE atomic / indirect-branch hooks, and arm64 `*_imports.rs` thunk groups
   that are required by both runtime modes.
-- `crates/machina-runtime/src/macos/analysis_arm64` — arm64-only analysis hooks and diagnostic shims
+- `crates/compatra-runtime/src/macos/analysis_arm64` — arm64-only analysis hooks and diagnostic shims
   that are not part of the compatibility runtime. C++/libc++ synthetic hook
   models, fake analysis data symbols, and other operator-facing arm64 analysis
   glue belong here behind `AnalysisRuntimeHooks`/analysis-mode gating.
-- `crates/machina-runtime/src/macos/platform_apple` — CoreFoundation, Security, XPC, libobjc and
+- `crates/compatra-runtime/src/macos/platform_apple` — CoreFoundation, Security, XPC, libobjc and
   other Apple-facing synthetic runtime services.
-- `crates/machina-runtime/src/macos/guest_model` — guest filesystem (`files.rs`), guest memory
+- `crates/compatra-runtime/src/macos/guest_model` — guest filesystem (`files.rs`), guest memory
   (`memory.rs`), and synthetic OS-visible resources.
-- `crates/machina-runtime/src/macos/loader` — Mach-O parser, command/header decoding, and the
-  no-dyld vs dyld load-path switch (`MACHINA_USE_DYLD`).
+- `crates/compatra-runtime/src/macos/loader` — Mach-O parser, command/header decoding, and the
+  no-dyld vs dyld load-path switch (`COMPATRA_USE_DYLD`).
 
 Architecture-neutral logic should not live in `arch_arm64`. Prefer reusable
 services or plugins over one-off hook-local hacks.
 
-Pure architecture facts should not live in the main `machina` crate. Put
+Pure architecture facts should not live in the runtime crate. Put
 arm64 instruction masks/decoders, ABI constants, register naming/layout, and
-stub-layout constants in `crates/machina-arch-arm64`. Keep emulator lifecycle,
+stub-layout constants in `crates/compatra-arch-arm64`. Keep emulator lifecycle,
 Unicorn hooks, trace events, guest filesystem, and Apple/Darwin service
 modeling in the main crate until their runtime dependencies are split cleanly.
 
 Analysis and compatibility behavior should not live in the same implementation
-module. `crates/machina-runtime/src/macos/core/analysis.rs`, `compat.rs`,
+module. `crates/compatra-runtime/src/macos/core/analysis.rs`, `compat.rs`,
 `capture.rs`, `mode.rs`, and
-`crates/machina-runtime/src/macos/guest_model/analysis_artifacts.rs` are
-facades/adapters only; real behavior belongs in `crates/machina-analysis`,
-`crates/machina-compat`, or `crates/machina-mode`. Compatibility code must not
+`crates/compatra-runtime/src/macos/guest_model/analysis_artifacts.rs` are
+facades/adapters only; real behavior belongs in `crates/machoscope-analysis`
+or `crates/compatra`. Compatibility code must not
 emit detections, write captures, synthesize analyst bait data, or depend on the
 analysis crate.
 If arm64 code needs analysis behavior, route it through
 `AnalysisRuntimeHooks` or an `analysis_arm64` module instead of storing
 capture state or parsing analysis-only env knobs directly in
-`crates/machina-runtime/src/macos/arch_arm64`.
+`crates/compatra-runtime/src/macos/arch_arm64`.
 
 ## Logging rules
 
@@ -105,32 +106,32 @@ capture state or parsing analysis-only env knobs directly in
 - Raw `println!` / `eprintln!` output is legacy debug output and should not
   be the primary logging surface.
 - If a hook needs extra debug-only text, gate it (typically via
-  `MACHINA_DEBUG_STDOUT`) so it does not pollute the default analysis stream.
+  `COMPATRA_DEBUG_STDOUT`) so it does not pollute the default analysis stream.
 
 Environment knobs the code currently honors (keep this list in sync if you
 add new ones):
 
-- `MACHINA_PLUGIN_TRACE` — enable/disable the plugin trace bus (default on).
-- `MACHINA_MODE` — `analysis` (default) or `compat`. Analysis mode keeps
+- `COMPATRA_PLUGIN_TRACE` — enable/disable the plugin trace bus (default on).
+- `COMPATRA_MODE` — `analysis` (default) or `compat`. Analysis mode keeps
   malware-analysis defaults; compat mode disables analysis-only synthetic
   artifacts, captures, detections, and built-in trace plugin presets.
-  The dedicated `machina-compat` binary always runs compat mode and is built
-  with `--no-default-features` in Intel macOS CI so `machina-analysis` is not
+  The dedicated `compatra` binary always runs compat mode and is built
+  with `--no-default-features` in Intel macOS CI so `machoscope-analysis` is not
   linked into the compatibility utility.
-- `MACHINA_TRACE_FORMAT` — `jsonl` (default) or `human`.
-- `MACHINA_TRACE_PROFILE` — `compact` (default), `full`, or `debug`.
-- `MACHINA_COMPAT_LOG` — compat-only JSONL logs to stderr: `off`
+- `COMPATRA_TRACE_FORMAT` — `jsonl` (default) or `human`.
+- `COMPATRA_TRACE_PROFILE` — `compact` (default), `full`, or `debug`.
+- `COMPATRA_COMPAT_LOG` — compat-only JSONL logs to stderr: `off`
   (default), `summary`, `calls`, or `verbose`. Any non-`off` level also
   reports unhandled import-stub hits and unresolved `dlsym` requests so
-  missing compatibility glue is visible in a concrete run. The `machina` and
-  `machina-compat` CLIs also expose this as `--compat-log`.
-- `MACHINA_COMPAT_LOG_FILTER` — comma-separated normalized compat call names
+  missing compatibility glue is visible in a concrete run. The `machoscope`
+  and `compatra` CLIs also expose this as `--compat-log`.
+- `COMPATRA_COMPAT_LOG_FILTER` — comma-separated normalized compat call names
   such as `write,open,getaddrinfo`; this limits host-call logs, while
   missing-import diagnostics still emit at any non-`off` log level. CLI form
   is `--compat-log-filter`.
-- `MACHINA_COMPAT_LOG_PREVIEW_BYTES` — byte cap for escaped text/hex previews
+- `COMPATRA_COMPAT_LOG_PREVIEW_BYTES` — byte cap for escaped text/hex previews
   in compat I/O logs; CLI form is `--compat-log-preview-bytes`.
-- `MACHINA_GUEST_LIBS` — opt-in guest-side arm64 Mach-O dylib support for the
+- `COMPATRA_GUEST_LIBS` — opt-in guest-side arm64 Mach-O dylib support for the
   no-dyld runner. Values use the host path-list separator and may also contain
   comma-separated entries; entries can be dylib files, directories of dylibs, or
   `.framework` directories. Loaded guest-library exports are mapped into guest
@@ -138,26 +139,26 @@ add new ones):
   lookups. The loader also records these images in `GuestImageRegistry` and
   emits `guest-image-registry` / `guest-image` trace events. This is not a full
   dyld replacement.
-- `MACHINA_TRACE_WINDOW_START` / `_END` / `_HITS` — bounded instruction trace
+- `COMPATRA_TRACE_WINDOW_START` / `_END` / `_HITS` — bounded instruction trace
   window for arm64 diagnostics.
-- `MACHINA_INDIRECT_BRANCH_MODE` — `fast` (default) or `sanitize`.
-- `MACHINA_AUTH_DISPATCH_DIAG` / `_HITS` — pointer-auth dispatch diagnostics.
-- `MACHINA_PROFILE` — pre-set budget bundle: `default` (60 s / 50 M instr,
+- `COMPATRA_INDIRECT_BRANCH_MODE` — `fast` (default) or `sanitize`.
+- `COMPATRA_AUTH_DISPATCH_DIAG` / `_HITS` — pointer-auth dispatch diagnostics.
+- `COMPATRA_PROFILE` — pre-set budget bundle: `default` (60 s / 50 M instr,
   current behavior), `short` (15 s / 10 M, legacy cap), `long`
   (120 s / 200 M, recommended for RustDoor and other Rust binaries with
   heavy startup graphs), `extended` (300 s / 1 B, deep analysis runs).
   The runner emits a `run-profile` trace event with the resolved values.
-- `MACHINA_TIMEOUT_USECS` / `MACHINA_MAX_INSTRUCTIONS` — explicit emulation
-  budgets; always override the active `MACHINA_PROFILE`.
-- `MACHINA_ARGV_APPEND` — extra guest argv tokens appended at bootstrap.
-- `MACHINA_BYPASS_USAGE_CHECK` — analysis helper for selected arm64 call
+- `COMPATRA_TIMEOUT_USECS` / `COMPATRA_MAX_INSTRUCTIONS` — explicit emulation
+  budgets; always override the active `COMPATRA_PROFILE`.
+- `COMPATRA_ARGV_APPEND` — extra guest argv tokens appended at bootstrap.
+- `COMPATRA_BYPASS_USAGE_CHECK` — analysis helper for selected arm64 call
   sites; tokens are `0xADDR`, `0xADDR=VAL0,VAL1`, or
   `0xADDR@0xLR=VAL` to apply a return override only when LR matches.
-- `MACHINA_TRACE_FN_ENTRY` — comma-separated `<label>:<hex addr>` hooks that
+- `COMPATRA_TRACE_FN_ENTRY` — comma-separated `<label>:<hex addr>` hooks that
   emit structured `function-entry` trace events without changing execution.
-- `MACHINA_USE_DYLD` — opt-in to dyld load path; default is the no-dyld
+- `COMPATRA_USE_DYLD` — opt-in to dyld load path; default is the no-dyld
   fallback.
-- `MACHINA_DEBUG_STDOUT` — gate legacy human-readable debug prints.
+- `COMPATRA_DEBUG_STDOUT` — gate legacy human-readable debug prints.
 
 ## Dependency rules
 
@@ -166,7 +167,7 @@ add new ones):
   source copies.
 - Do not introduce new architecture features into `unicorn-engine` unless
   the project scope changes explicitly.
-- `crates/machina-runtime/build.rs` is intentionally minimal: it only locates
+- `crates/compatra-runtime/build.rs` is intentionally minimal: it only locates
   and copies `unicorn.dll` on Windows builds. Do not extend it with
   project-specific build logic.
 
@@ -197,17 +198,18 @@ add new ones):
 - CI (`.github/workflows/rust.yml`) runs the full `cargo test` suite on
   Ubuntu and a focused compatibility-mode smoke test on Intel macOS
   (`macos-15-intel`). The AMOS regression contract lives in
-  `tests/amos_private_access.rs`, the RustDoor fast-mode contract lives in
-  `tests/rustdoor_fast_mode.rs`, and the Intel macOS compatibility smoke
-  lives in `crates/machina-compat-cli/tests/compat_mode_macos.rs`.
+  `crates/machoscope/tests/amos_private_access.rs`, the RustDoor fast-mode
+  contract lives in `crates/machoscope/tests/rustdoor_fast_mode.rs`, and the
+  Intel macOS compatibility smoke lives in
+  `crates/compatra-cli/tests/compat_mode_macos.rs`.
 - Canonical local smoke flow:
-  - `cargo build --bin machina`
-  - `cargo run --bin machina -- fixtures/macos/bin/arm64_hello`
-  - `cargo build -p machina-compat-cli --no-default-features --bin machina-compat`
+  - `cargo build -p machoscope --bin machoscope`
+  - `cargo run -p machoscope --bin machoscope -- fixtures/macos/bin/arm64_hello`
+  - `cargo build -p compatra-cli --no-default-features --bin compatra`
     for the compatibility-only utility
-  - `cargo test --test amos_private_access` for the AMOS regression
-  - `cargo test --test rustdoor_fast_mode` for the RustDoor milestones
-  - `cargo test -p machina-compat-cli --release --no-default-features --test compat_mode_macos -- --nocapture`
+  - `cargo test -p machoscope --test amos_private_access` for the AMOS regression
+  - `cargo test -p machoscope --test rustdoor_fast_mode` for the RustDoor milestones
+  - `cargo test -p compatra-cli --release --no-default-features --test compat_mode_macos -- --nocapture`
     on Intel macOS for compat mode
 
 ## Repo hygiene

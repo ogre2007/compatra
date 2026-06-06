@@ -1,0 +1,13 @@
+[package]
+name = "compatra"
+version = "0.5.0"
+edition = "2021"
+description = "Compatra host proxy services for macOS arm64 userland"
+license = "GPL-2.0"
+
+[dependencies]
+libc = "0.2"
+
+[lib]
+name = "compatra"
+path = "src/lib.rs"

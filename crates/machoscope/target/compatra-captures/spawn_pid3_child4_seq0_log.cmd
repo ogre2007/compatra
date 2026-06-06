@@ -1,0 +1,10 @@
+# parent_pid=3
+# child_pid=4
+# sequence=0
+# envp=0x7FFFFFFFFFA0
+path=log
+argv[0]=log
+argv[1]=stream
+argv[2]=--predicate
+argv[3]=eventMessage contains "com.apple.restartInitiated" or eventMessage contains "com.apple.shutdownInitiated"
+argv[4]=--info

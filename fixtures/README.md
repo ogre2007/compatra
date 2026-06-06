@@ -1,4 +1,4 @@
-Machina keeps its local sample corpus in [fixtures/macos/bin](D:/dev/quiling/qiling/fixtures/macos/bin).
+Compatra keeps its local sample corpus in [fixtures/macos/bin](D:/dev/quiling/qiling/fixtures/macos/bin).
 
 This corpus is intentionally small and is used for:
 

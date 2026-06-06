@@ -1,0 +1,13 @@
+[package]
+name = "compatra-arch-arm64"
+version = "0.5.0"
+edition = "2021"
+description = "arm64 architecture primitives for Compatra"
+license = "GPL-2.0"
+
+[dependencies]
+compatra-arch = { path = "../compatra-arch" }
+
+[lib]
+name = "compatra_arch_arm64"
+path = "src/lib.rs"

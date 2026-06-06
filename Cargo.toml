@@ -1,36 +1,12 @@
-[package]
-name = "machina"
-version = "0.5.0"
-edition = "2021"
-description = "Machina - macOS-focused Mach-O emulation in Rust"
-license = "GPL-2.0"
-
 [workspace]
 members = [
-    ".",
-    "crates/machina-arch",
-    "crates/machina-arch-arm64",
-    "crates/machina-analysis",
-    "crates/machina-compat",
-    "crates/machina-compat-cli",
-    "crates/machina-mode",
-    "crates/machina-runtime",
-    "crates/machina-threading",
+    "crates/compatra",
+    "crates/compatra-arch",
+    "crates/compatra-arch-arm64",
+    "crates/compatra-cli",
+    "crates/compatra-runtime",
+    "crates/compatra-threading",
+    "crates/machoscope",
+    "crates/machoscope-analysis",
 ]
 resolver = "2"
-
-[features]
-default = ["analysis"]
-analysis = ["machina-runtime/analysis"]
-
-[dependencies]
-machina-runtime = { path = "crates/machina-runtime", default-features = false }
-
-
-[lib]
-name = "machina"
-path = "src/lib.rs"
-
-[[bin]]
-name = "machina"
-path = "src/bin/machina.rs"

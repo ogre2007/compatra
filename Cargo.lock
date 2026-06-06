@@ -89,6 +89,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "compatra"
+version = "0.5.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "compatra-arch"
+version = "0.5.0"
+
+[[package]]
+name = "compatra-arch-arm64"
+version = "0.5.0"
+dependencies = [
+ "compatra-arch",
+]
+
+[[package]]
+name = "compatra-cli"
+version = "0.5.0"
+dependencies = [
+ "compatra-runtime",
+]
+
+[[package]]
+name = "compatra-runtime"
+version = "0.5.0"
+dependencies = [
+ "bitflags",
+ "byteorder",
+ "compatra",
+ "compatra-arch-arm64",
+ "compatra-threading",
+ "libc",
+ "log",
+ "machoscope-analysis",
+ "thiserror",
+ "unicorn-engine",
+ "unicorn-engine-sys",
+]
+
+[[package]]
+name = "compatra-threading"
+version = "0.5.0"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -144,70 +190,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
-name = "machina"
+name = "machoscope"
 version = "0.5.0"
 dependencies = [
- "machina-runtime",
+ "compatra-runtime",
 ]
 
 [[package]]
-name = "machina-analysis"
+name = "machoscope-analysis"
 version = "0.5.0"
 dependencies = [
- "machina-mode",
+ "compatra",
 ]
-
-[[package]]
-name = "machina-arch"
-version = "0.5.0"
-
-[[package]]
-name = "machina-arch-arm64"
-version = "0.5.0"
-dependencies = [
- "machina-arch",
-]
-
-[[package]]
-name = "machina-compat"
-version = "0.5.0"
-dependencies = [
- "libc",
- "machina-mode",
-]
-
-[[package]]
-name = "machina-compat-cli"
-version = "0.5.0"
-dependencies = [
- "machina-runtime",
-]
-
-[[package]]
-name = "machina-mode"
-version = "0.5.0"
-
-[[package]]
-name = "machina-runtime"
-version = "0.5.0"
-dependencies = [
- "bitflags",
- "byteorder",
- "libc",
- "log",
- "machina-analysis",
- "machina-arch-arm64",
- "machina-compat",
- "machina-mode",
- "machina-threading",
- "thiserror",
- "unicorn-engine",
- "unicorn-engine-sys",
-]
-
-[[package]]
-name = "machina-threading"
-version = "0.5.0"
 
 [[package]]
 name = "memchr"

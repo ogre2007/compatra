@@ -1,0 +1,13 @@
+[package]
+name = "machoscope-analysis"
+version = "0.5.0"
+edition = "2021"
+description = "Analysis-mode services for Machoscope"
+license = "GPL-2.0"
+
+[dependencies]
+compatra = { path = "../compatra" }
+
+[lib]
+name = "machoscope_analysis"
+path = "src/lib.rs"

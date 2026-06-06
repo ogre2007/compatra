@@ -1,0 +1,21 @@
+[package]
+name = "machoscope"
+version = "0.5.0"
+edition = "2021"
+description = "Machoscope macOS-focused Mach-O malware analysis runner"
+license = "GPL-2.0"
+
+[features]
+default = ["analysis"]
+analysis = ["compatra-runtime/analysis"]
+
+[dependencies]
+compatra-runtime = { path = "../compatra-runtime", default-features = false }
+
+[lib]
+name = "machoscope"
+path = "src/lib.rs"
+
+[[bin]]
+name = "machoscope"
+path = "src/main.rs"

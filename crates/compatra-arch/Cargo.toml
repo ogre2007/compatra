@@ -1,0 +1,10 @@
+[package]
+name = "compatra-arch"
+version = "0.5.0"
+edition = "2021"
+description = "Architecture-neutral traits and identifiers for Compatra"
+license = "GPL-2.0"
+
+[lib]
+name = "compatra_arch"
+path = "src/lib.rs"
