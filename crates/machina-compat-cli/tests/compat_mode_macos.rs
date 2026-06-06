@@ -913,9 +913,15 @@ static int exercise_startup_glue(
     const char *str_data = str_accessor_proxy ? string_data_impl(compat_string) : 0;
     int str_cstr_ok = str_accessor_proxy && str_cstr && memcmp(str_cstr, "glue-cxx!", 9) == 0;
     int str_data_ok = str_accessor_proxy && str_data && memcmp(str_data, "glue-cxx!", 9) == 0;
+    char str_preview[32];
+    memset(str_preview, 0, sizeof(str_preview));
+    size_t str_preview_len = str_text && str_len < sizeof(str_preview) ? str_len : sizeof(str_preview) - 1;
+    if (str_text && str_preview_len > 0) {
+        memcpy(str_preview, str_text, str_preview_len);
+    }
     int str_base_ok = str_text
         && str_len == 9
-        && memcmp(str_text, "glue-cxx!", 9) == 0
+        && memcmp(str_preview, "glue-cxx!", 9) == 0
         && str_find == 4
         && str_compare == 0
         && (!str_accessor_proxy
@@ -1010,8 +1016,8 @@ static int exercise_startup_glue(
         (unsigned long)str_size,
         (unsigned long)str_length,
         str_empty,
-        (int)(str_len < 64 ? str_len : 64),
-        str_text ? str_text : "",
+        (int)str_preview_len,
+        str_preview,
         (unsigned long)str_find,
         str_compare,
         str_cstr_ok,
