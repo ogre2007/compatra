@@ -457,6 +457,21 @@ fn hex_arg(value: u64) -> String {
     format!("0x{value:X}")
 }
 
+#[cfg(target_os = "macos")]
+fn json_string_array(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape(value));
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
 fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -4726,7 +4741,7 @@ fn proxy_guest_exec_request(
         ("Path", Some(path.clone())),
         ("ResolvedPath", Some(resolved_path.display().to_string())),
         ("Argc", Some(argv.len().to_string())),
-        ("Argv", Some(argv.join("\u{1f}"))),
+        ("Argv", Some(json_string_array(&argv))),
         (
             "EnvCount",
             env.as_ref()
@@ -10943,6 +10958,21 @@ mod tests {
         assert_eq!(compat_next_prime(31), 31);
         assert_eq!(compat_next_prime(32), 37);
         assert_eq!(compat_next_prime(1000), 1009);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exec_argv_log_formats_as_json_array_text() {
+        let argv = vec![
+            "/bin/zsh".to_string(),
+            "-s".to_string(),
+            "quote\"backslash\\".to_string(),
+        ];
+
+        assert_eq!(
+            json_string_array(&argv),
+            r#"["/bin/zsh","-s","quote\"backslash\\"]"#
+        );
     }
 
     #[cfg(target_os = "macos")]

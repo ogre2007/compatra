@@ -231,6 +231,13 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_CFRetain"
             | "_CFStringCreateExternalRepresentation"
             | "_CFStringCreateWithBytes"
+            | "_CGMainDisplayID"
+            | "_CGDisplayPixelsWide"
+            | "_CGDisplayPixelsHigh"
+            | "_CGDisplayIsActive"
+            | "_CGDisplayIsOnline"
+            | "_NSApplicationLoad"
+            | "_NSApplicationMain"
             | "_SecCertificateCopyData"
             | "_SecCertificateCreateWithData"
             | "_SecPolicyCreateSSL"
@@ -388,6 +395,24 @@ mod tests {
             assert!(
                 arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
                 "{symbol} should be dispatched by the arm64 compat runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_hook_classifier_covers_ui_compat_imports() {
+        for symbol in [
+            "_NSApplicationLoad",
+            "_NSApplicationMain",
+            "_CGMainDisplayID",
+            "_CGDisplayPixelsWide",
+            "_CGDisplayPixelsHigh",
+            "_CGDisplayIsActive",
+            "_CGDisplayIsOnline",
+        ] {
+            assert!(
+                arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
+                "{symbol} should be dispatched by the arm64 UI compat runtime"
             );
         }
     }

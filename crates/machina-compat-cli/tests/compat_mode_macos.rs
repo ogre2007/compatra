@@ -4624,6 +4624,260 @@ int main(void) {
     binary
 }
 
+#[cfg(target_os = "macos")]
+fn compile_arm64_appkit_startup_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_appkit_startup_compat.c");
+    let binary = out_dir.join("arm64_appkit_startup_compat");
+    fs::write(
+        &source,
+        r#"#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+extern int NSApplicationLoad(void);
+extern int NSApplicationMain(int, const char **);
+extern uint32_t CGMainDisplayID(void);
+extern size_t CGDisplayPixelsWide(uint32_t);
+extern size_t CGDisplayPixelsHigh(uint32_t);
+extern int CGDisplayIsActive(uint32_t);
+extern int CGDisplayIsOnline(uint32_t);
+extern void *objc_getClass(const char *);
+extern void *sel_registerName(const char *);
+extern uintptr_t objc_msgSend(void *, void *, ...);
+
+typedef int (*ns_application_load_fn)(void);
+typedef int (*ns_application_main_fn)(int, const char **);
+typedef uint32_t (*cg_main_display_id_fn)(void);
+typedef size_t (*cg_display_pixels_fn)(uint32_t);
+typedef int (*cg_display_predicate_fn)(uint32_t);
+
+static void *cls(const char *name) {
+    return objc_getClass(name);
+}
+
+static void *sel(const char *name) {
+    return sel_registerName(name);
+}
+
+static void *msg0_obj(void *receiver, const char *selector) {
+    return (void *)objc_msgSend(receiver, sel(selector));
+}
+
+static void *msg1_obj(void *receiver, const char *selector, void *arg0) {
+    return (void *)objc_msgSend(receiver, sel(selector), arg0);
+}
+
+static uintptr_t msg0_uint(void *receiver, const char *selector) {
+    return objc_msgSend(receiver, sel(selector));
+}
+
+static uintptr_t msg1_uint(void *receiver, const char *selector, uintptr_t arg0) {
+    return objc_msgSend(receiver, sel(selector), arg0);
+}
+
+static uintptr_t msg2_uint(void *receiver, const char *selector, void *arg0, void *arg1) {
+    return objc_msgSend(receiver, sel(selector), arg0, arg1);
+}
+
+static const char *utf8_or_null(void *value) {
+    if (!value) {
+        return "<null>";
+    }
+    const char *text = (const char *)objc_msgSend(value, sel("UTF8String"));
+    return text ? text : "<null>";
+}
+
+static int has_text(void *value) {
+    const char *text = utf8_or_null(value);
+    return text && text[0] != 0 && strcmp(text, "<null>") != 0;
+}
+
+static void *ns_string(const char *text) {
+    return msg1_obj(cls("NSString"), "stringWithUTF8String:", (void *)text);
+}
+
+int main(void) {
+    int load = NSApplicationLoad();
+    void *app_class = cls("NSApplication");
+    void *app = msg0_obj(app_class, "sharedApplication");
+    uintptr_t set_policy = msg1_uint(app, "setActivationPolicy:", 1);
+    uintptr_t policy = msg0_uint(app, "activationPolicy");
+    uintptr_t running = msg0_uint(app, "isRunning");
+
+    void *thread_class = cls("NSThread");
+    void *main_thread = msg0_obj(thread_class, "mainThread");
+    uintptr_t class_main = msg0_uint(thread_class, "isMainThread");
+    uintptr_t object_main = msg0_uint(main_thread, "isMainThread");
+
+    void *runloop = msg0_obj(cls("NSRunLoop"), "currentRunLoop");
+    void *mode = ns_string("compat-ui-mode");
+    void *date = msg0_obj(cls("NSDate"), "date");
+    uintptr_t run_mode = msg2_uint(runloop, "runMode:beforeDate:", mode, date);
+
+    void *screen = msg0_obj(cls("NSScreen"), "mainScreen");
+    void *screens = msg0_obj(cls("NSScreen"), "screens");
+    uintptr_t screen_count = msg0_uint(screens, "count");
+    void *screen_name = msg0_obj(screen, "localizedName");
+
+    void *window = msg0_obj(cls("NSWindow"), "alloc");
+    window = msg0_obj(window, "init");
+    msg1_uint(window, "setTitle:", (uintptr_t)ns_string("Compat UI"));
+    void *window_title = msg0_obj(window, "title");
+    msg1_uint(window, "orderFront:", 0);
+    uintptr_t can_key = msg0_uint(window, "canBecomeKeyWindow");
+    uintptr_t visible = msg0_uint(window, "isVisible");
+    msg0_uint(window, "close");
+
+    uint32_t display = CGMainDisplayID();
+    size_t width = CGDisplayPixelsWide(display);
+    size_t height = CGDisplayPixelsHigh(display);
+    int active = CGDisplayIsActive(display);
+    int online = CGDisplayIsOnline(display);
+
+    const char *main_argv[] = {"compat-ui", 0};
+    int appmain = NSApplicationMain(1, main_argv);
+
+    int static_ok = load
+        && app
+        && set_policy
+        && policy <= 2
+        && running == 0
+        && main_thread
+        && class_main
+        && object_main
+        && runloop
+        && run_mode <= 1
+        && screen
+        && screen_count > 0
+        && has_text(screen_name)
+        && window
+        && has_text(window_title)
+        && can_key
+        && visible
+        && display != 0
+        && width > 0
+        && height > 0
+        && active
+        && online
+        && appmain == 0;
+
+    printf(
+        "compat appkit static load=%d app=%p set=%lu policy=%lu running=%lu main=%lu/%lu runloop=%p runmode=%lu screen=%p screens=%lu name=%s window=%p title=%s cankey=%lu visible=%lu display=%u size=%zux%zu active=%d online=%d appmain=%d pass=%d\n",
+        load,
+        app,
+        (unsigned long)set_policy,
+        (unsigned long)policy,
+        (unsigned long)running,
+        (unsigned long)class_main,
+        (unsigned long)object_main,
+        runloop,
+        (unsigned long)run_mode,
+        screen,
+        (unsigned long)screen_count,
+        utf8_or_null(screen_name),
+        window,
+        utf8_or_null(window_title),
+        (unsigned long)can_key,
+        (unsigned long)visible,
+        display,
+        width,
+        height,
+        active,
+        online,
+        appmain,
+        static_ok
+    );
+
+    void *appkit = dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_NOW);
+    void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW);
+    ns_application_load_fn dyn_load = (ns_application_load_fn)dlsym(appkit, "NSApplicationLoad");
+    ns_application_main_fn dyn_main = (ns_application_main_fn)dlsym(appkit, "NSApplicationMain");
+    cg_main_display_id_fn dyn_display = (cg_main_display_id_fn)dlsym(cg, "CGMainDisplayID");
+    cg_display_pixels_fn dyn_width = (cg_display_pixels_fn)dlsym(cg, "CGDisplayPixelsWide");
+    cg_display_pixels_fn dyn_height = (cg_display_pixels_fn)dlsym(cg, "CGDisplayPixelsHigh");
+    cg_display_predicate_fn dyn_active = (cg_display_predicate_fn)dlsym(cg, "CGDisplayIsActive");
+    cg_display_predicate_fn dyn_online = (cg_display_predicate_fn)dlsym(cg, "CGDisplayIsOnline");
+
+    uint32_t dyn_did = dyn_display ? dyn_display() : 0;
+    size_t dyn_w = dyn_width ? dyn_width(dyn_did) : 0;
+    size_t dyn_h = dyn_height ? dyn_height(dyn_did) : 0;
+    int dyn_load_ret = dyn_load ? dyn_load() : 0;
+    int dyn_main_ret = dyn_main ? dyn_main(1, main_argv) : -1;
+    int dyn_ok = dyn_load
+        && dyn_main
+        && dyn_display
+        && dyn_width
+        && dyn_height
+        && dyn_active
+        && dyn_online
+        && dyn_load_ret
+        && dyn_main_ret == 0
+        && dyn_did != 0
+        && dyn_w > 0
+        && dyn_h > 0
+        && dyn_active(dyn_did)
+        && dyn_online(dyn_did);
+
+    printf(
+        "compat appkit dlsym ptrs load=%p main=%p display=%p width=%p height=%p active=%p online=%p\n",
+        (void *)dyn_load,
+        (void *)dyn_main,
+        (void *)dyn_display,
+        (void *)dyn_width,
+        (void *)dyn_height,
+        (void *)dyn_active,
+        (void *)dyn_online
+    );
+    printf(
+        "compat appkit dlsym load=%d main=%d display=%u size=%zux%zu pass=%d\n",
+        dyn_load_ret,
+        dyn_main_ret,
+        dyn_did,
+        dyn_w,
+        dyn_h,
+        dyn_ok
+    );
+    return static_ok && dyn_ok ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 AppKit startup fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-framework")
+        .arg("AppKit")
+        .arg("-framework")
+        .arg("CoreGraphics")
+        .arg("-framework")
+        .arg("Foundation")
+        .arg("-lobjc")
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 AppKit startup fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 AppKit startup fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn compat_mode_smoke_is_macos_only() {
@@ -5705,6 +5959,103 @@ fn compat_mode_proxies_foundation_startup_glue() {
                 && line.contains(" sel=processName")
                 && line.contains(" pass=1")),
         "Foundation startup fixture did not complete dlsym Foundation calls; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_proxies_appkit_startup_glue() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode AppKit startup test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_appkit_startup_fixture();
+    let machina = machina_binary();
+    let output = Command::new(&machina)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("MACHINA_PLUGIN_TRACE", "1")
+        .env("MACHINA_TRACE_FORMAT", "jsonl")
+        .env("MACHINA_PROFILE", "short")
+        .env("MACHINA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch machina binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("machina stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let proof_lines = stdout
+        .lines()
+        .filter(|line| line.contains("compat appkit"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    eprintln!(
+        "compat proof(appkit startup): command={} --mode compat {}",
+        machina.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(appkit startup): status={status}");
+    eprintln!("compat proof(appkit startup): lines:\n{proof_lines}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(appkit startup): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "machina exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat appkit static ")
+                && line.contains(" load=1 ")
+                && line.contains(" app=0x")
+                && line.contains(" set=1 ")
+                && line.contains(" running=0 ")
+                && line.contains(" main=1/1 ")
+                && line.contains(" runloop=0x")
+                && line.contains(" screen=0x")
+                && line.contains(" screens=1")
+                && line.contains(" name=Compatibility Display")
+                && line.contains(" window=0x")
+                && line.contains(" title=Compatibility Window")
+                && line.contains(" display=1")
+                && line.contains(" active=1 online=1 ")
+                && line.contains(" appmain=0 ")
+                && line.contains(" pass=1")),
+        "AppKit startup fixture did not complete static UI glue; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat appkit dlsym ptrs load=0x")
+            && stdout.contains(" main=0x")
+            && stdout.contains(" display=0x")
+            && stdout.contains(" width=0x")
+            && stdout.contains(" height=0x")
+            && stdout.contains(" active=0x")
+            && stdout.contains(" online=0x"),
+        "AppKit startup fixture did not receive dlsym UI trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat appkit dlsym ")
+                && line.contains(" load=1 ")
+                && line.contains(" main=0 ")
+                && line.contains(" display=1 ")
+                && line.contains(" size=1440x900 ")
+                && line.contains(" pass=1")),
+        "AppKit startup fixture did not complete dlsym UI glue; stdout:\n{stdout}"
     );
 }
 

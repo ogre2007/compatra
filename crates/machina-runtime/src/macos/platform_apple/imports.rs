@@ -108,6 +108,13 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "NSStringFromClass"
             | "NSStringFromSelector"
             | "NSLog"
+            | "NSApplicationLoad"
+            | "NSApplicationMain"
+            | "CGMainDisplayID"
+            | "CGDisplayPixelsWide"
+            | "CGDisplayPixelsHigh"
+            | "CGDisplayIsActive"
+            | "CGDisplayIsOnline"
             | "SecRandomCopyBytes"
             | "SecCopyErrorMessageString"
             | "SecCertificateCreateWithData"
@@ -244,6 +251,13 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_NSStringFromClass",
     "_NSStringFromSelector",
     "_NSLog",
+    "_NSApplicationLoad",
+    "_NSApplicationMain",
+    "_CGMainDisplayID",
+    "_CGDisplayPixelsWide",
+    "_CGDisplayPixelsHigh",
+    "_CGDisplayIsActive",
+    "_CGDisplayIsOnline",
     "_SecRandomCopyBytes",
     "_SecCopyErrorMessageString",
 ];
@@ -1282,6 +1296,17 @@ fn objc_selector_returns_raw_value(selector: &str) -> bool {
             | "longLongValue"
             | "unsignedIntegerValue"
             | "boolValue"
+            | "setActivationPolicy:"
+            | "activationPolicy"
+            | "isRunning"
+            | "isActive"
+            | "isHidden"
+            | "isMainThread"
+            | "isMultiThreaded"
+            | "runMode:beforeDate:"
+            | "canBecomeKeyWindow"
+            | "canBecomeMainWindow"
+            | "isVisible"
             | "respondsToSelector:"
             | "instancesRespondToSelector:"
             | "isKindOfClass:"
@@ -1881,6 +1906,42 @@ fn foundation_shim_supports_selector(receiver_kind: &str, selector: &str) -> boo
             | ("NSProcessInfo", "activeProcessorCount")
             | ("NSProcessInfo", "processIdentifier")
             | ("NSProcessInfo", "isOperatingSystemAtLeastVersion:")
+            | ("NSApplication", "sharedApplication")
+            | ("NSApplication", "setActivationPolicy:")
+            | ("NSApplication", "activationPolicy")
+            | ("NSApplication", "isRunning")
+            | ("NSApplication", "isActive")
+            | ("NSApplication", "isHidden")
+            | ("NSApplication", "run")
+            | ("NSApplication", "stop:")
+            | ("NSApplication", "terminate:")
+            | ("NSApplication", "setDelegate:")
+            | ("NSApplication", "delegate")
+            | ("NSApplication", "setMainMenu:")
+            | ("NSThread", "mainThread")
+            | ("NSThread", "currentThread")
+            | ("NSThread", "isMainThread")
+            | ("NSThread", "isMultiThreaded")
+            | ("NSRunLoop", "currentRunLoop")
+            | ("NSRunLoop", "mainRunLoop")
+            | ("NSRunLoop", "runMode:beforeDate:")
+            | ("NSRunLoop", "runUntilDate:")
+            | ("NSDate", "date")
+            | ("NSDate", "distantFuture")
+            | ("NSDate", "distantPast")
+            | ("NSScreen", "mainScreen")
+            | ("NSScreen", "screens")
+            | ("NSScreen", "localizedName")
+            | ("NSScreen", "deviceDescription")
+            | ("NSWindow", "init")
+            | ("NSWindow", "title")
+            | ("NSWindow", "setTitle:")
+            | ("NSWindow", "orderFront:")
+            | ("NSWindow", "makeKeyAndOrderFront:")
+            | ("NSWindow", "close")
+            | ("NSWindow", "canBecomeKeyWindow")
+            | ("NSWindow", "canBecomeMainWindow")
+            | ("NSWindow", "isVisible")
             | ("NSBundle", "mainBundle")
             | ("NSBundle", "bundleWithPath:")
             | ("NSBundle", "bundlePath")
@@ -1941,6 +2002,24 @@ fn dispatch_foundation_msg_send_shim(
             shim: "NSObjectSelf",
             host_proxy: false,
             preview: None,
+        }),
+        "alloc" | "new" if !receiver_kind.is_empty() => {
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_objc_object(receiver_kind.clone())
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSObjectAlloc",
+                host_proxy: false,
+                preview: Some(receiver_kind.as_bytes().to_vec()),
+            })
+        }
+        "init" if !receiver_kind.is_empty() => Some(ObjcMsgSendShimResult {
+            result: receiver_ref,
+            shim: "NSObjectInit",
+            host_proxy: false,
+            preview: Some(receiver_kind.as_bytes().to_vec()),
         }),
         "class" if !receiver_kind.is_empty() => {
             let (result, host_proxy) = {
@@ -2036,6 +2115,207 @@ fn dispatch_foundation_msg_send_shim(
                 shim: "NSBundleMainBundle",
                 host_proxy: false,
                 preview: Some(path),
+            })
+        }
+        "sharedApplication" if receiver_kind == "NSApplication" => {
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.objc_singleton("NSApplication")
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSApplicationShared",
+                host_proxy: false,
+                preview: None,
+            })
+        }
+        "setActivationPolicy:" if receiver_kind == "NSApplication" => Some(ObjcMsgSendShimResult {
+            result: 1,
+            shim: "NSApplicationSetActivationPolicy",
+            host_proxy: false,
+            preview: None,
+        }),
+        "activationPolicy" if receiver_kind == "NSApplication" => Some(ObjcMsgSendShimResult {
+            result: 0,
+            shim: "NSApplicationActivationPolicy",
+            host_proxy: false,
+            preview: None,
+        }),
+        "isRunning" | "isActive" | "isHidden" if receiver_kind == "NSApplication" => {
+            Some(ObjcMsgSendShimResult {
+                result: 0,
+                shim: "NSApplicationStatePredicate",
+                host_proxy: false,
+                preview: Some(selector_name.as_bytes().to_vec()),
+            })
+        }
+        "run" | "stop:" | "terminate:" | "setDelegate:" | "setMainMenu:"
+            if receiver_kind == "NSApplication" =>
+        {
+            Some(ObjcMsgSendShimResult {
+                result: 0,
+                shim: "NSApplicationNoop",
+                host_proxy: false,
+                preview: Some(selector_name.as_bytes().to_vec()),
+            })
+        }
+        "delegate" if receiver_kind == "NSApplication" => Some(ObjcMsgSendShimResult {
+            result: 0,
+            shim: "NSApplicationDelegate",
+            host_proxy: false,
+            preview: None,
+        }),
+        "mainThread" | "currentThread" if receiver_kind == "NSThread" => {
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.objc_singleton("NSThread")
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSThreadSingleton",
+                host_proxy: false,
+                preview: Some(selector_name.as_bytes().to_vec()),
+            })
+        }
+        "isMainThread" if receiver_kind == "NSThread" => Some(ObjcMsgSendShimResult {
+            result: 1,
+            shim: "NSThreadIsMain",
+            host_proxy: false,
+            preview: None,
+        }),
+        "isMultiThreaded" if receiver_kind == "NSThread" => Some(ObjcMsgSendShimResult {
+            result: 0,
+            shim: "NSThreadIsMultiThreaded",
+            host_proxy: false,
+            preview: None,
+        }),
+        "currentRunLoop" | "mainRunLoop" if receiver_kind == "NSRunLoop" => {
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.objc_singleton("NSRunLoop")
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSRunLoopSingleton",
+                host_proxy: false,
+                preview: Some(selector_name.as_bytes().to_vec()),
+            })
+        }
+        "runMode:beforeDate:" if receiver_kind == "NSRunLoop" => Some(ObjcMsgSendShimResult {
+            result: 0,
+            shim: "NSRunLoopRunMode",
+            host_proxy: false,
+            preview: None,
+        }),
+        "runUntilDate:" if receiver_kind == "NSRunLoop" => Some(ObjcMsgSendShimResult {
+            result: 0,
+            shim: "NSRunLoopRunUntilDate",
+            host_proxy: false,
+            preview: None,
+        }),
+        "date" | "distantFuture" | "distantPast" if receiver_kind == "NSDate" => {
+            let absolute_time = match selector_name {
+                "distantFuture" => 63_113_904_000.0,
+                "distantPast" => -63_113_904_000.0,
+                _ => SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_secs_f64() - 978_307_200.0)
+                    .unwrap_or(0.0),
+            };
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_date(absolute_time)
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSDateCreate",
+                host_proxy: false,
+                preview: Some(selector_name.as_bytes().to_vec()),
+            })
+        }
+        "mainScreen" if receiver_kind == "NSScreen" => {
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.objc_singleton("NSScreen")
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSScreenMain",
+                host_proxy: false,
+                preview: None,
+            })
+        }
+        "screens" if receiver_kind == "NSScreen" => {
+            let (result, host_proxy) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let screen = runtime.objc_singleton("NSScreen");
+                make_foundation_array_result(&mut runtime, vec![screen])
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSScreenArray",
+                host_proxy,
+                preview: None,
+            })
+        }
+        "localizedName" if receiver_kind == "NSScreen" => {
+            let data = b"Compatibility Display".to_vec();
+            let (result, host_proxy) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                make_foundation_string_result(&mut runtime, data.clone())
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSScreenName",
+                host_proxy,
+                preview: Some(data),
+            })
+        }
+        "deviceDescription" if receiver_kind == "NSScreen" => {
+            let (result, host_proxy) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let key = make_foundation_string_result(&mut runtime, b"NSScreenNumber".to_vec()).0;
+                let value = runtime.alloc_number(1);
+                make_foundation_dictionary_result(&mut runtime, vec![(key, value)])
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSScreenDeviceDescription",
+                host_proxy,
+                preview: None,
+            })
+        }
+        "title" if receiver_kind == "NSWindow" => {
+            let data = b"Compatibility Window".to_vec();
+            let (result, host_proxy) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                make_foundation_string_result(&mut runtime, data.clone())
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSWindowTitle",
+                host_proxy,
+                preview: Some(data),
+            })
+        }
+        "setTitle:" | "orderFront:" | "makeKeyAndOrderFront:" | "close"
+            if receiver_kind == "NSWindow" =>
+        {
+            Some(ObjcMsgSendShimResult {
+                result: 0,
+                shim: "NSWindowNoop",
+                host_proxy: false,
+                preview: Some(selector_name.as_bytes().to_vec()),
+            })
+        }
+        "canBecomeKeyWindow" | "canBecomeMainWindow" | "isVisible"
+            if receiver_kind == "NSWindow" =>
+        {
+            Some(ObjcMsgSendShimResult {
+                result: 1,
+                shim: "NSWindowPredicate",
+                host_proxy: false,
+                preview: Some(selector_name.as_bytes().to_vec()),
             })
         }
         "bundleWithPath:" if receiver_kind == "NSBundle" => {
@@ -4369,22 +4649,32 @@ fn dispatch_apple_import(
         }
         "objc_alloc" | "objc_alloc_init" | "objc_opt_new" => {
             let class_ref = emu.read_reg("x0").unwrap_or(0);
-            let host_class = {
+            let (host_class, class_name) = {
                 let runtime = apple_runtime.lock().ok()?;
-                runtime.host_ptr_or_raw_unknown(class_ref).unwrap_or(0)
+                (
+                    runtime.host_ptr_or_raw_unknown(class_ref).unwrap_or(0),
+                    runtime
+                        .objc_class_name(class_ref)
+                        .unwrap_or_else(|| normalized_apple_symbol(symbol).to_string()),
+                )
             };
             let init = !matches!(normalized_apple_symbol(symbol), "objc_alloc");
             let raw_object = host_objc_alloc(host_class, init).unwrap_or(0);
             let object_ref = {
                 let mut runtime = apple_runtime.lock().ok()?;
-                runtime.register_host_objc_object(normalized_apple_symbol(symbol), raw_object)
+                if raw_object != 0 {
+                    runtime.register_host_objc_object(class_name.clone(), raw_object)
+                } else {
+                    runtime.alloc_objc_object(class_name.clone())
+                }
             };
             record_arm64_import(
                 tracker,
                 format!(
-                    "_{}(class=0x{:X}) -> 0x{:X}",
+                    "_{}(class=0x{:X} {}) -> 0x{:X}",
                     normalized_apple_symbol(symbol),
                     class_ref,
+                    class_name,
                     object_ref
                 ),
             );
@@ -4392,6 +4682,7 @@ fn dispatch_apple_import(
                 trace,
                 process_event(metadata, "objc", normalized_apple_symbol(symbol))
                     .arg("Class", format!("0x{:X}", class_ref))
+                    .arg("ClassName", class_name)
                     .arg("Result", format!("0x{:X}", object_ref))
                     .arg(
                         "HostProxy",
@@ -4806,6 +5097,85 @@ fn dispatch_apple_import(
                     .arg("HostProxy", "false"),
             );
             Some(0)
+        }
+        "NSApplicationLoad" => {
+            record_arm64_import(tracker, "_NSApplicationLoad() -> 1".to_string());
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "appkit", "NSApplicationLoad")
+                    .arg("Result", "1")
+                    .arg("Model", "synthetic-ui-startup"),
+            );
+            Some(1)
+        }
+        "NSApplicationMain" => {
+            let argc = emu.read_reg("x0").unwrap_or(0);
+            let argv = emu.read_reg("x1").unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!("_NSApplicationMain(argc={}, argv=0x{:X}) -> 0", argc, argv),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "appkit", "NSApplicationMain")
+                    .arg("Argc", argc.to_string())
+                    .arg("Argv", format!("0x{:X}", argv))
+                    .arg("Result", "0")
+                    .arg("Model", "synthetic-no-event-loop"),
+            );
+            Some(0)
+        }
+        "CGMainDisplayID" => {
+            record_arm64_import(tracker, "_CGMainDisplayID() -> 1".to_string());
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "coregraphics", "CGMainDisplayID").arg("Result", "1"),
+            );
+            Some(1)
+        }
+        "CGDisplayPixelsWide" | "CGDisplayPixelsHigh" => {
+            let display = emu.read_reg("x0").unwrap_or(0);
+            let result = if normalized_apple_symbol(symbol) == "CGDisplayPixelsWide" {
+                1440
+            } else {
+                900
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_{}(display={}) -> {}",
+                    normalized_apple_symbol(symbol),
+                    display,
+                    result
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "coregraphics", normalized_apple_symbol(symbol))
+                    .arg("Display", display.to_string())
+                    .arg("Result", result.to_string())
+                    .arg("Model", "synthetic-display"),
+            );
+            Some(result)
+        }
+        "CGDisplayIsActive" | "CGDisplayIsOnline" => {
+            let display = emu.read_reg("x0").unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_{}(display={}) -> 1",
+                    normalized_apple_symbol(symbol),
+                    display
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "coregraphics", normalized_apple_symbol(symbol))
+                    .arg("Display", display.to_string())
+                    .arg("Result", "1")
+                    .arg("Model", "synthetic-display"),
+            );
+            Some(1)
         }
         "CFRelease" => {
             let object_ref = emu.read_reg("x0").unwrap_or(0);
@@ -6209,6 +6579,54 @@ mod tests {
             "NSFileManager",
             "machinaUnknownSelector"
         ));
+    }
+
+    #[test]
+    fn ui_selector_classifier_covers_appkit_startup_glue() {
+        for (kind, selector) in [
+            ("NSApplication", "sharedApplication"),
+            ("NSApplication", "setActivationPolicy:"),
+            ("NSApplication", "activationPolicy"),
+            ("NSApplication", "isRunning"),
+            ("NSThread", "mainThread"),
+            ("NSThread", "isMainThread"),
+            ("NSRunLoop", "currentRunLoop"),
+            ("NSRunLoop", "runMode:beforeDate:"),
+            ("NSDate", "date"),
+            ("NSScreen", "mainScreen"),
+            ("NSScreen", "screens"),
+            ("NSScreen", "localizedName"),
+            ("NSWindow", "title"),
+            ("NSWindow", "setTitle:"),
+            ("NSWindow", "orderFront:"),
+        ] {
+            assert!(
+                foundation_shim_supports_selector(kind, selector),
+                "{kind} {selector} should be shimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn apple_direct_dispatch_imports_cover_ui_startup_glue() {
+        for symbol in [
+            "_NSApplicationLoad",
+            "_NSApplicationMain",
+            "_CGMainDisplayID",
+            "_CGDisplayPixelsWide",
+            "_CGDisplayPixelsHigh",
+            "_CGDisplayIsActive",
+            "_CGDisplayIsOnline",
+        ] {
+            assert!(
+                is_apple_import_symbol(symbol),
+                "{symbol} should be Apple-dispatched"
+            );
+            assert!(
+                APPLE_DIRECT_DISPATCH_IMPORTS.contains(&symbol),
+                "{symbol} must be installed by install_apple_imports for static imports"
+            );
+        }
     }
 
     #[test]
