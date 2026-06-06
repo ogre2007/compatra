@@ -4,7 +4,9 @@ use crate::{GuestMemory, HostCallResult};
 
 const LIBCPP_STRING_OBJECT_SIZE: usize = 24;
 const LIBCPP_SHORT_MAX: usize = 22;
+const LIBCPP_VECTOR_OBJECT_SIZE: usize = 24;
 const MAX_COMPAT_STRING_LEN: usize = 0x10_000;
+const MAX_COMPAT_VECTOR_LEN: usize = 0x10_000;
 const ALT_LONG_FLAG: u64 = 1u64 << 63;
 const NPOS: usize = usize::MAX;
 
@@ -60,6 +62,10 @@ const STRING_RESIZE_SYMBOL: &str =
     "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEm";
 const STRING_RESIZE_FILL_SYMBOL: &str =
     "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc";
+const VECTOR_CHAR_MUT_PREFIX: &str = "ZNSt3__16vectorIcNS_9allocatorIcEEE";
+const VECTOR_CHAR_CONST_PREFIX: &str = "ZNKSt3__16vectorIcNS_9allocatorIcEEE";
+const VECTOR_UCHAR_MUT_PREFIX: &str = "ZNSt3__16vectorIhNS_9allocatorIhEEE";
+const VECTOR_UCHAR_CONST_PREFIX: &str = "ZNKSt3__16vectorIhNS_9allocatorIhEEE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CxxImportKind {
@@ -91,6 +97,15 @@ pub(crate) enum CxxImportKind {
     StringReserve,
     StringResize,
     StringResizeFill,
+    VectorSize,
+    VectorEmpty,
+    VectorCapacity,
+    VectorData,
+    VectorClear,
+    VectorReserve,
+    VectorResize,
+    VectorResizeFill,
+    VectorResizeFillRef,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +119,14 @@ struct DecodedString {
     bytes: Vec<u8>,
     layout: &'static str,
     data_ptr: Option<u64>,
+    capacity: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedVector {
+    begin: u64,
+    end: u64,
+    len: usize,
     capacity: usize,
 }
 
@@ -121,7 +144,7 @@ pub(crate) fn classify_import(symbol: &str) -> Option<CxxImportKind> {
     if is_cxa_guard_symbol(symbol, "abort") {
         return Some(CxxImportKind::CxaGuardAbort);
     }
-    classify_libcpp_string_import(symbol)
+    classify_libcpp_string_import(symbol).or_else(|| classify_libcpp_vector_import(symbol))
 }
 
 pub(crate) fn diagnose_symbol(symbol: &str) -> Option<CxxDiagnostic> {
@@ -281,6 +304,46 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
             resize_basic_string(memory, args[0], args[1], args[2] as u8)?;
             Some(call_value(args[0]))
         }
+        CxxImportKind::VectorSize => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(vector.len as u64))
+        }
+        CxxImportKind::VectorEmpty => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(u64::from(vector.len == 0)))
+        }
+        CxxImportKind::VectorCapacity => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(vector.capacity as u64))
+        }
+        CxxImportKind::VectorData => {
+            let vector = decode_basic_vector(memory, args[0])?;
+            Some(call_value(vector.begin))
+        }
+        CxxImportKind::VectorClear => {
+            clear_basic_vector(memory, args[0])?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorReserve => {
+            reserve_basic_vector(memory, args[0], args[1])?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorResize => {
+            resize_basic_vector(memory, args[0], args[1], 0)?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorResizeFill => {
+            resize_basic_vector(memory, args[0], args[1], args[2] as u8)?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::VectorResizeFillRef => {
+            let fill = read_guest_bytes(memory, args[2], 1)?
+                .first()
+                .copied()
+                .unwrap_or(0);
+            resize_basic_vector(memory, args[0], args[1], fill)?;
+            Some(call_value(args[0]))
+        }
         _ => None,
     }
 }
@@ -313,6 +376,38 @@ fn classify_libcpp_string_import(symbol: &str) -> Option<CxxImportKind> {
         STRING_RESIZE_FILL_SYMBOL => CxxImportKind::StringResizeFill,
         _ => return None,
     })
+}
+
+fn classify_libcpp_vector_import(symbol: &str) -> Option<CxxImportKind> {
+    let suffix = symbol
+        .strip_prefix(VECTOR_CHAR_CONST_PREFIX)
+        .or_else(|| symbol.strip_prefix(VECTOR_UCHAR_CONST_PREFIX));
+    if let Some(suffix) = suffix {
+        return match suffix {
+            "4sizeEv" => Some(CxxImportKind::VectorSize),
+            "5emptyEv" => Some(CxxImportKind::VectorEmpty),
+            "8capacityEv" => Some(CxxImportKind::VectorCapacity),
+            "4dataEv" => Some(CxxImportKind::VectorData),
+            _ => None,
+        };
+    }
+
+    let suffix = symbol
+        .strip_prefix(VECTOR_CHAR_MUT_PREFIX)
+        .or_else(|| symbol.strip_prefix(VECTOR_UCHAR_MUT_PREFIX));
+    if let Some(suffix) = suffix {
+        return match suffix {
+            "4dataEv" => Some(CxxImportKind::VectorData),
+            "5clearEv" => Some(CxxImportKind::VectorClear),
+            "7reserveEm" => Some(CxxImportKind::VectorReserve),
+            "6resizeEm" => Some(CxxImportKind::VectorResize),
+            "6resizeEmc" | "6resizeEmh" => Some(CxxImportKind::VectorResizeFill),
+            "6resizeEmRKc" | "6resizeEmRKh" => Some(CxxImportKind::VectorResizeFillRef),
+            _ => None,
+        };
+    }
+
+    None
 }
 
 fn normalize_cxx_symbol(symbol: &str) -> &str {
@@ -556,6 +651,111 @@ fn resize_basic_string<M: GuestMemory + ?Sized>(
     let new_len = capped_len(requested_len).min(MAX_COMPAT_STRING_LEN);
     bytes.resize(new_len, fill);
     write_basic_string_with_capacity(memory, this, &bytes, string.capacity)
+}
+
+fn decode_basic_vector<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+) -> Option<DecodedVector> {
+    let header = memory.read_memory(this, LIBCPP_VECTOR_OBJECT_SIZE).ok()?;
+    if header.len() < LIBCPP_VECTOR_OBJECT_SIZE {
+        return None;
+    }
+
+    let begin = read_u64(&header, 0);
+    let end = read_u64(&header, 8);
+    let cap = read_u64(&header, 16);
+    if begin == 0 && end == 0 && cap == 0 {
+        return Some(DecodedVector {
+            begin: 0,
+            end: 0,
+            len: 0,
+            capacity: 0,
+        });
+    }
+    if begin < 0x1000 || end < begin || cap < end {
+        return None;
+    }
+    let len = capped_len(end.saturating_sub(begin));
+    let capacity = capped_len(cap.saturating_sub(begin));
+    if len > MAX_COMPAT_VECTOR_LEN || capacity > MAX_COMPAT_VECTOR_LEN {
+        return None;
+    }
+    Some(DecodedVector {
+        begin,
+        end,
+        len,
+        capacity,
+    })
+}
+
+fn write_basic_vector_header<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+    begin: u64,
+    len: usize,
+    capacity: usize,
+) -> Option<()> {
+    let end = begin.checked_add(len as u64)?;
+    let cap = begin.checked_add(capacity as u64)?;
+    let mut object = [0u8; LIBCPP_VECTOR_OBJECT_SIZE];
+    object[0..8].copy_from_slice(&begin.to_le_bytes());
+    object[8..16].copy_from_slice(&end.to_le_bytes());
+    object[16..24].copy_from_slice(&cap.to_le_bytes());
+    memory.write_memory(this, &object).ok()?;
+    Some(())
+}
+
+fn clear_basic_vector<M: GuestMemory + ?Sized>(memory: &mut M, this: u64) -> Option<()> {
+    let vector = decode_basic_vector(memory, this)?;
+    write_basic_vector_header(memory, this, vector.begin, 0, vector.capacity)
+}
+
+fn reserve_basic_vector<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+    requested_capacity: u64,
+) -> Option<()> {
+    let vector = decode_basic_vector(memory, this)?;
+    let capacity = capped_len(requested_capacity)
+        .min(MAX_COMPAT_VECTOR_LEN)
+        .max(vector.capacity);
+    if capacity == vector.capacity {
+        return Some(());
+    }
+
+    let begin = memory.allocate_memory(capacity.max(1), 16).ok()?;
+    if vector.len > 0 {
+        let bytes = memory.read_memory(vector.begin, vector.len).ok()?;
+        memory.write_memory(begin, &bytes).ok()?;
+    }
+    write_basic_vector_header(memory, this, begin, vector.len, capacity)
+}
+
+fn resize_basic_vector<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+    requested_len: u64,
+    fill: u8,
+) -> Option<()> {
+    let vector = decode_basic_vector(memory, this)?;
+    let new_len = capped_len(requested_len).min(MAX_COMPAT_VECTOR_LEN);
+    if new_len > vector.capacity {
+        reserve_basic_vector(memory, this, new_len as u64)?;
+    }
+    let vector = decode_basic_vector(memory, this)?;
+    if new_len > vector.len {
+        let grow_len = new_len - vector.len;
+        let fill_bytes = vec![fill; grow_len];
+        memory.write_memory(vector.end, &fill_bytes).ok()?;
+    }
+    write_basic_vector_header(
+        memory,
+        this,
+        vector.begin,
+        new_len,
+        vector.capacity.max(new_len),
+    )
 }
 
 fn read_capped_cstring<M: GuestMemory + ?Sized>(
@@ -819,6 +1019,22 @@ mod tests {
             ),
             Some(CxxImportKind::StringResizeFill)
         );
+        assert_eq!(
+            classify_import("__ZNKSt3__16vectorIcNS_9allocatorIcEEE4sizeEv"),
+            Some(CxxImportKind::VectorSize)
+        );
+        assert_eq!(
+            classify_import("__ZNKSt3__16vectorIhNS_9allocatorIhEEE4dataEv"),
+            Some(CxxImportKind::VectorData)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE6resizeEmc"),
+            Some(CxxImportKind::VectorResizeFill)
+        );
+        assert_eq!(
+            classify_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE6resizeEmRKc"),
+            Some(CxxImportKind::VectorResizeFillRef)
+        );
     }
 
     #[test]
@@ -1066,5 +1282,65 @@ mod tests {
             memory.read_memory(data.return_value, text.len()).unwrap(),
             text
         );
+    }
+
+    #[test]
+    fn proxies_basic_libcpp_vector_char_operations() {
+        let mut memory = TestMemory::default();
+        let object = 0x4000;
+        memory.write_at(object, &[0; LIBCPP_VECTOR_OBJECT_SIZE]);
+        memory.write_at(0x2100, b"v");
+
+        let empty = proxy_import(CxxImportKind::VectorEmpty, &mut memory, &args(&[object]))
+            .expect("vector empty should be proxied");
+        assert_eq!(empty.return_value, 1);
+        let size = proxy_import(CxxImportKind::VectorSize, &mut memory, &args(&[object]))
+            .expect("vector size should be proxied");
+        assert_eq!(size.return_value, 0);
+
+        proxy_import(
+            CxxImportKind::VectorReserve,
+            &mut memory,
+            &args(&[object, 8]),
+        )
+        .expect("vector reserve should be proxied");
+        let capacity = proxy_import(CxxImportKind::VectorCapacity, &mut memory, &args(&[object]))
+            .expect("vector capacity should be proxied");
+        assert!(capacity.return_value >= 8);
+
+        proxy_import(
+            CxxImportKind::VectorResizeFillRef,
+            &mut memory,
+            &args(&[object, 6, 0x2100]),
+        )
+        .expect("vector resize fill should be proxied");
+        let vector = decode_basic_vector(&mut memory, object).expect("vector should decode");
+        assert_eq!(vector.len, 6);
+        assert!(vector.capacity >= 8);
+        assert_eq!(memory.read_memory(vector.begin, 6).unwrap(), b"vvvvvv");
+
+        let data = proxy_import(CxxImportKind::VectorData, &mut memory, &args(&[object]))
+            .expect("vector data should be proxied");
+        assert_eq!(data.return_value, vector.begin);
+        let empty = proxy_import(CxxImportKind::VectorEmpty, &mut memory, &args(&[object]))
+            .expect("vector empty should be proxied");
+        assert_eq!(empty.return_value, 0);
+
+        proxy_import(
+            CxxImportKind::VectorResize,
+            &mut memory,
+            &args(&[object, 3]),
+        )
+        .expect("vector resize should be proxied");
+        let vector = decode_basic_vector(&mut memory, object).expect("vector should decode");
+        assert_eq!(vector.len, 3);
+        assert!(vector.capacity >= 8);
+        assert_eq!(memory.read_memory(vector.begin, 3).unwrap(), b"vvv");
+
+        proxy_import(CxxImportKind::VectorClear, &mut memory, &args(&[object]))
+            .expect("vector clear should be proxied");
+        let vector = decode_basic_vector(&mut memory, object).expect("vector should decode");
+        assert_eq!(vector.len, 0);
+        assert!(vector.capacity >= 8);
     }
 }

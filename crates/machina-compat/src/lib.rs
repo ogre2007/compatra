@@ -10411,6 +10411,10 @@ mod tests {
             assert!(compat.should_proxy_import(
                 "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm"
             ));
+            assert!(compat.should_proxy_import("__ZNKSt3__16vectorIcNS_9allocatorIcEEE4sizeEv"));
+            assert!(compat.should_proxy_import("__ZNKSt3__16vectorIhNS_9allocatorIhEEE4dataEv"));
+            assert!(compat.should_proxy_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE7reserveEm"));
+            assert!(compat.should_proxy_import("__ZNSt3__16vectorIcNS_9allocatorIcEEE6resizeEmRKc"));
             assert!(compat.should_proxy_import("_opendir"));
             assert!(compat.should_proxy_import("_fdopendir"));
             assert!(compat.should_proxy_import("_readdir"));
