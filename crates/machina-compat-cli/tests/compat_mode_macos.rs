@@ -798,6 +798,9 @@ typedef int (*string_compare_fn)(const void *, size_t, size_t, const char *);
 typedef size_t (*string_size_fn)(const void *);
 typedef int (*string_empty_fn)(const void *);
 typedef const char *(*string_data_fn)(const void *);
+typedef void (*string_void_fn)(void *);
+typedef void (*string_reserve_fn)(void *, size_t);
+typedef void (*string_resize_fill_fn)(void *, size_t, int);
 
 #define COMPAT_STRING_OBJECT_SIZE 24
 #define COMPAT_ALT_LONG_FLAG (1ULL << 63)
@@ -853,7 +856,12 @@ static int exercise_startup_glue(
     string_size_fn string_length_impl,
     string_empty_fn string_empty_impl,
     string_data_fn string_c_str_impl,
-    string_data_fn string_data_impl
+    string_data_fn string_data_impl,
+    string_size_fn string_capacity_impl,
+    string_void_fn string_clear_impl,
+    string_reserve_fn string_reserve_impl,
+    string_reserve_fn string_resize_impl,
+    string_resize_fill_fn string_resize_fill_impl
 ) {
     static unsigned char page[4096] __attribute__((aligned(4096)));
     memset(page, 0x41, sizeof(page));
@@ -905,7 +913,7 @@ static int exercise_startup_glue(
     const char *str_data = str_accessor_proxy ? string_data_impl(compat_string) : 0;
     int str_cstr_ok = str_accessor_proxy && str_cstr && memcmp(str_cstr, "glue-cxx!", 9) == 0;
     int str_data_ok = str_accessor_proxy && str_data && memcmp(str_data, "glue-cxx!", 9) == 0;
-    int str_ok = str_text
+    int str_base_ok = str_text
         && str_len == 9
         && memcmp(str_text, "glue-cxx!", 9) == 0
         && str_find == 4
@@ -916,6 +924,50 @@ static int exercise_startup_glue(
                 && str_empty == 0
                 && str_cstr_ok
                 && str_data_ok));
+    int str_mutator_proxy = str_accessor_proxy
+        && string_capacity_impl
+        && string_clear_impl
+        && string_reserve_impl
+        && string_resize_impl
+        && string_resize_fill_impl;
+    size_t str_capacity = str_mutator_proxy ? string_capacity_impl(compat_string) : 0;
+    size_t str_reserve_capacity = 0;
+    int str_reserve_ok = 0;
+    int str_resize_ok = 0;
+    int str_shrink_ok = 0;
+    int str_clear_ok = 0;
+    if (str_mutator_proxy) {
+        string_reserve_impl(compat_string, 40);
+        str_reserve_capacity = string_capacity_impl(compat_string);
+        str_reserve_ok = str_reserve_capacity >= 40;
+
+        string_resize_fill_impl(compat_string, 12, '?');
+        size_t resized_len = compat_string_len(compat_string);
+        const char *resized_text = compat_string_object_data(compat_string);
+        str_resize_ok = resized_len == 12
+            && resized_text
+            && memcmp(resized_text, "glue-cxx!???", 12) == 0;
+
+        string_resize_impl(compat_string, 4);
+        size_t shrunk_len = compat_string_len(compat_string);
+        const char *shrunk_text = compat_string_object_data(compat_string);
+        str_shrink_ok = shrunk_len == 4
+            && shrunk_text
+            && memcmp(shrunk_text, "glue", 4) == 0
+            && string_capacity_impl(compat_string) >= 40;
+
+        string_clear_impl(compat_string);
+        str_clear_ok = compat_string_len(compat_string) == 0
+            && string_empty_impl(compat_string) == 1
+            && string_capacity_impl(compat_string) >= 40;
+    }
+    int str_ok = str_base_ok
+        && (!str_mutator_proxy
+            || (str_capacity == 22
+                && str_reserve_ok
+                && str_resize_ok
+                && str_shrink_ok
+                && str_clear_ok));
 
     int ok = mlock_ret == 0
         && munlock_ret == 0
@@ -935,7 +987,7 @@ static int exercise_startup_glue(
         && str_ok;
 
     printf(
-        "compat startup glue %s mlock=%d munlock=%d madvise=%d mask=%d oldmask_size=%lu oldmask_sum=%u issetugid=%d execl=%d execl_errno=%d next_prime=%lu guard_first=%d guard_second=%d guard=0x%llx guard_abort_first=%d guard_abort_second=%d guard_abort=0x%llx str_len=%lu str_accessor_proxy=%d str_size=%lu str_length=%lu str_empty=%d str_text=%.*s str_find=%lu str_compare=%d cstr_ok=%d data_ok=%d str_ok=%d ok=%d\n",
+        "compat startup glue %s mlock=%d munlock=%d madvise=%d mask=%d oldmask_size=%lu oldmask_sum=%u issetugid=%d execl=%d execl_errno=%d next_prime=%lu guard_first=%d guard_second=%d guard=0x%llx guard_abort_first=%d guard_abort_second=%d guard_abort=0x%llx str_len=%lu str_accessor_proxy=%d str_size=%lu str_length=%lu str_empty=%d str_text=%.*s str_find=%lu str_compare=%d cstr_ok=%d data_ok=%d str_mutator_proxy=%d str_capacity=%lu reserve_capacity=%lu reserve_ge_40=%d resize_ok=%d shrink_ok=%d clear_ok=%d str_ok=%d ok=%d\n",
         label,
         mlock_ret,
         munlock_ret,
@@ -964,6 +1016,13 @@ static int exercise_startup_glue(
         str_compare,
         str_cstr_ok,
         str_data_ok,
+        str_mutator_proxy,
+        (unsigned long)str_capacity,
+        (unsigned long)str_reserve_capacity,
+        str_reserve_ok,
+        str_resize_ok,
+        str_shrink_ok,
+        str_clear_ok,
         str_ok,
         ok
     );
@@ -989,6 +1048,11 @@ int main(void) {
         compat_string_push_back,
         compat_string_find_char,
         compat_string_compare,
+        0,
+        0,
+        0,
+        0,
+        0,
         0,
         0,
         0,
@@ -1020,9 +1084,14 @@ int main(void) {
     string_empty_fn dyn_string_empty = (string_empty_fn)dlsym(string_handle, "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5emptyEv");
     string_data_fn dyn_string_c_str = (string_data_fn)dlsym(string_handle, "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5c_strEv");
     string_data_fn dyn_string_data = (string_data_fn)dlsym(string_handle, "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4dataEv");
+    string_size_fn dyn_string_capacity = (string_size_fn)dlsym(string_handle, "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE8capacityEv");
+    string_void_fn dyn_string_clear = (string_void_fn)dlsym(string_handle, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5clearEv");
+    string_reserve_fn dyn_string_reserve = (string_reserve_fn)dlsym(string_handle, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm");
+    string_reserve_fn dyn_string_resize = (string_reserve_fn)dlsym(string_handle, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEm");
+    string_resize_fill_fn dyn_string_resize_fill = (string_resize_fill_fn)dlsym(string_handle, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc");
 
     printf(
-        "compat startup glue dlsym ptrs mlock=%p munlock=%p madvise=%p pthread_sigmask=%p issetugid=%p execl=%p next_prime=%p cxa_guard_acquire=%p cxa_guard_release=%p cxa_guard_abort=%p string_init=%p string_append=%p string_push=%p string_find=%p string_compare=%p string_size=%p string_length=%p string_empty=%p string_cstr=%p string_data=%p\n",
+        "compat startup glue dlsym ptrs mlock=%p munlock=%p madvise=%p pthread_sigmask=%p issetugid=%p execl=%p next_prime=%p cxa_guard_acquire=%p cxa_guard_release=%p cxa_guard_abort=%p string_init=%p string_append=%p string_push=%p string_find=%p string_compare=%p string_size=%p string_length=%p string_empty=%p string_cstr=%p string_data=%p string_capacity=%p string_clear=%p string_reserve=%p string_resize=%p string_resize_fill=%p\n",
         (void *)dyn_mlock,
         (void *)dyn_munlock,
         (void *)dyn_madvise,
@@ -1042,10 +1111,15 @@ int main(void) {
         (void *)dyn_string_length,
         (void *)dyn_string_empty,
         (void *)dyn_string_c_str,
-        (void *)dyn_string_data
+        (void *)dyn_string_data,
+        (void *)dyn_string_capacity,
+        (void *)dyn_string_clear,
+        (void *)dyn_string_reserve,
+        (void *)dyn_string_resize,
+        (void *)dyn_string_resize_fill
     );
 
-    if (!dyn_mlock || !dyn_munlock || !dyn_madvise || !dyn_pthread_sigmask || !dyn_issetugid || !dyn_execl || !dyn_next_prime || !dyn_cxa_guard_acquire || !dyn_cxa_guard_release || !dyn_cxa_guard_abort || !dyn_string_init || !dyn_string_append_cstr_len || !dyn_string_push_back || !dyn_string_find_char || !dyn_string_compare || !dyn_string_size || !dyn_string_length || !dyn_string_empty || !dyn_string_c_str || !dyn_string_data) {
+    if (!dyn_mlock || !dyn_munlock || !dyn_madvise || !dyn_pthread_sigmask || !dyn_issetugid || !dyn_execl || !dyn_next_prime || !dyn_cxa_guard_acquire || !dyn_cxa_guard_release || !dyn_cxa_guard_abort || !dyn_string_init || !dyn_string_append_cstr_len || !dyn_string_push_back || !dyn_string_find_char || !dyn_string_compare || !dyn_string_size || !dyn_string_length || !dyn_string_empty || !dyn_string_c_str || !dyn_string_data || !dyn_string_capacity || !dyn_string_clear || !dyn_string_reserve || !dyn_string_resize || !dyn_string_resize_fill) {
         return 2;
     }
     failures += exercise_startup_glue(
@@ -1069,7 +1143,12 @@ int main(void) {
         dyn_string_length,
         dyn_string_empty,
         dyn_string_c_str,
-        dyn_string_data
+        dyn_string_data,
+        dyn_string_capacity,
+        dyn_string_clear,
+        dyn_string_reserve,
+        dyn_string_resize,
+        dyn_string_resize_fill
     );
     return failures == 0 ? 0 : 1;
 }
@@ -4686,7 +4765,7 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             && stdout.contains("next_prime=1009")
             && stdout.contains("guard_first=1 guard_second=0 guard=0x1")
             && stdout.contains("guard_abort_first=1 guard_abort_second=1")
-            && stdout.contains("str_len=9 str_accessor_proxy=0 str_size=0 str_length=0 str_empty=-1 str_text=glue-cxx! str_find=4 str_compare=0 cstr_ok=0 data_ok=0 str_ok=1")
+            && stdout.contains("str_len=9 str_accessor_proxy=0 str_size=0 str_length=0 str_empty=-1 str_text=glue-cxx! str_find=4 str_compare=0 cstr_ok=0 data_ok=0 str_mutator_proxy=0 str_capacity=0 reserve_capacity=0 reserve_ge_40=0 resize_ok=0 shrink_ok=0 clear_ok=0 str_ok=1")
             && stdout.contains("ok=1"),
         "startup glue fixture did not complete static import roundtrip; stdout:\n{stdout}"
     );
@@ -4710,7 +4789,12 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             && stdout.contains(" string_length=0x")
             && stdout.contains(" string_empty=0x")
             && stdout.contains(" string_cstr=0x")
-            && stdout.contains(" string_data=0x"),
+            && stdout.contains(" string_data=0x")
+            && stdout.contains(" string_capacity=0x")
+            && stdout.contains(" string_clear=0x")
+            && stdout.contains(" string_reserve=0x")
+            && stdout.contains(" string_resize=0x")
+            && stdout.contains(" string_resize_fill=0x"),
         "startup glue fixture did not receive dlsym trampolines; stdout:\n{stdout}"
     );
     assert!(
@@ -4720,7 +4804,8 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             && stdout.contains("next_prime=1009")
             && stdout.contains("guard_first=1 guard_second=0 guard=0x1")
             && stdout.contains("guard_abort_first=1 guard_abort_second=1")
-            && stdout.contains("str_len=9 str_accessor_proxy=1 str_size=9 str_length=9 str_empty=0 str_text=glue-cxx! str_find=4 str_compare=0 cstr_ok=1 data_ok=1 str_ok=1")
+            && stdout.contains("str_len=9 str_accessor_proxy=1 str_size=9 str_length=9 str_empty=0 str_text=glue-cxx! str_find=4 str_compare=0 cstr_ok=1 data_ok=1 str_mutator_proxy=1 str_capacity=22")
+            && stdout.contains("reserve_ge_40=1 resize_ok=1 shrink_ok=1 clear_ok=1 str_ok=1")
             && stdout.contains("ok=1"),
         "startup glue fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"
     );

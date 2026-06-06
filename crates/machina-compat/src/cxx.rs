@@ -50,6 +50,16 @@ const STRING_DATA_MUT_SYMBOL: &str =
     "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4dataEv";
 const STRING_C_STR_SYMBOL: &str =
     "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5c_strEv";
+const STRING_CAPACITY_SYMBOL: &str =
+    "ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE8capacityEv";
+const STRING_CLEAR_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5clearEv";
+const STRING_RESERVE_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm";
+const STRING_RESIZE_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEm";
+const STRING_RESIZE_FILL_SYMBOL: &str =
+    "ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CxxImportKind {
@@ -76,6 +86,11 @@ pub(crate) enum CxxImportKind {
     StringEmpty,
     StringData,
     StringCStr,
+    StringCapacity,
+    StringClear,
+    StringReserve,
+    StringResize,
+    StringResizeFill,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +104,7 @@ struct DecodedString {
     bytes: Vec<u8>,
     layout: &'static str,
     data_ptr: Option<u64>,
+    capacity: usize,
 }
 
 pub(crate) fn classify_import(symbol: &str) -> Option<CxxImportKind> {
@@ -245,6 +261,26 @@ pub(crate) fn proxy_import<M: GuestMemory + ?Sized>(
             let string = decode_basic_string(memory, args[0])?;
             Some(call_value(string_data_pointer(args[0], &string)))
         }
+        CxxImportKind::StringCapacity => {
+            let string = decode_basic_string(memory, args[0])?;
+            Some(call_value(string.capacity as u64))
+        }
+        CxxImportKind::StringClear => {
+            clear_basic_string(memory, args[0])?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::StringReserve => {
+            reserve_basic_string(memory, args[0], args[1])?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::StringResize => {
+            resize_basic_string(memory, args[0], args[1], 0)?;
+            Some(call_value(args[0]))
+        }
+        CxxImportKind::StringResizeFill => {
+            resize_basic_string(memory, args[0], args[1], args[2] as u8)?;
+            Some(call_value(args[0]))
+        }
         _ => None,
     }
 }
@@ -270,6 +306,11 @@ fn classify_libcpp_string_import(symbol: &str) -> Option<CxxImportKind> {
         STRING_EMPTY_SYMBOL => CxxImportKind::StringEmpty,
         STRING_DATA_CONST_SYMBOL | STRING_DATA_MUT_SYMBOL => CxxImportKind::StringData,
         STRING_C_STR_SYMBOL => CxxImportKind::StringCStr,
+        STRING_CAPACITY_SYMBOL => CxxImportKind::StringCapacity,
+        STRING_CLEAR_SYMBOL => CxxImportKind::StringClear,
+        STRING_RESERVE_SYMBOL => CxxImportKind::StringReserve,
+        STRING_RESIZE_SYMBOL => CxxImportKind::StringResize,
+        STRING_RESIZE_FILL_SYMBOL => CxxImportKind::StringResizeFill,
         _ => return None,
     })
 }
@@ -337,7 +378,8 @@ fn decode_basic_string<M: GuestMemory + ?Sized>(
     let word2 = read_u64(&header, 16);
 
     if (word2 & ALT_LONG_FLAG) != 0 {
-        return decode_long_string(memory, word0, word1, "libc++-alternate-long");
+        let capacity = capped_len((word2 & !ALT_LONG_FLAG).saturating_sub(1));
+        return decode_long_string(memory, word0, word1, capacity, "libc++-alternate-long");
     }
 
     let alt_short_len = (header[23] & 0x7f) as usize;
@@ -347,6 +389,7 @@ fn decode_basic_string<M: GuestMemory + ?Sized>(
             bytes: header[0..alt_short_len].to_vec(),
             layout: "libc++-alternate-short",
             data_ptr: None,
+            capacity: LIBCPP_SHORT_MAX,
         });
     }
 
@@ -357,17 +400,20 @@ fn decode_basic_string<M: GuestMemory + ?Sized>(
             bytes: header[1..1 + default_short_len].to_vec(),
             layout: "libc++-default-short",
             data_ptr: None,
+            capacity: LIBCPP_SHORT_MAX,
         });
     }
 
     if (word0 & 1) != 0 {
-        return decode_long_string(memory, word2, word1, "libc++-default-long");
+        let capacity = capped_len((word0 & !1).saturating_sub(1));
+        return decode_long_string(memory, word2, word1, capacity, "libc++-default-long");
     }
 
     Some(DecodedString {
         bytes: Vec::new(),
         layout: "unknown",
         data_ptr: None,
+        capacity: 0,
     })
 }
 
@@ -387,6 +433,7 @@ fn decode_long_string<M: GuestMemory + ?Sized>(
     memory: &mut M,
     data_ptr: u64,
     len: u64,
+    capacity: usize,
     layout: &'static str,
 ) -> Option<DecodedString> {
     if len > MAX_COMPAT_STRING_LEN as u64 {
@@ -397,6 +444,7 @@ fn decode_long_string<M: GuestMemory + ?Sized>(
         bytes,
         layout,
         data_ptr: Some(data_ptr),
+        capacity: capacity.max(len as usize),
     })
 }
 
@@ -415,16 +463,26 @@ fn write_basic_string<M: GuestMemory + ?Sized>(
     this: u64,
     bytes: &[u8],
 ) -> Option<()> {
+    write_basic_string_with_capacity(memory, this, bytes, bytes.len())
+}
+
+fn write_basic_string_with_capacity<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+    bytes: &[u8],
+    min_capacity: usize,
+) -> Option<()> {
     let bytes = capped_bytes(bytes);
+    let min_capacity = min_capacity.min(MAX_COMPAT_STRING_LEN).max(bytes.len());
     let mut object = [0u8; LIBCPP_STRING_OBJECT_SIZE];
-    if bytes.len() <= LIBCPP_SHORT_MAX {
+    if bytes.len() <= LIBCPP_SHORT_MAX && min_capacity <= LIBCPP_SHORT_MAX {
         object[0..bytes.len()].copy_from_slice(bytes);
         object[23] = bytes.len() as u8;
         memory.write_memory(this, &object).ok()?;
         return Some(());
     }
 
-    let alloc_len = align_up(bytes.len().saturating_add(1), 16);
+    let alloc_len = align_up(min_capacity.saturating_add(1), 16);
     let data_ptr = memory.allocate_memory(alloc_len, 16).ok()?;
     let mut storage = Vec::with_capacity(alloc_len);
     storage.extend_from_slice(bytes);
@@ -444,10 +502,11 @@ fn append_basic_string<M: GuestMemory + ?Sized>(
     this: u64,
     suffix: &[u8],
 ) -> Option<()> {
-    let mut string = decode_basic_string(memory, this)?.bytes;
-    let available = MAX_COMPAT_STRING_LEN.saturating_sub(string.len());
-    string.extend_from_slice(&suffix[..suffix.len().min(available)]);
-    write_basic_string(memory, this, &string)
+    let string = decode_basic_string(memory, this)?;
+    let mut bytes = string.bytes;
+    let available = MAX_COMPAT_STRING_LEN.saturating_sub(bytes.len());
+    bytes.extend_from_slice(&suffix[..suffix.len().min(available)]);
+    write_basic_string_with_capacity(memory, this, &bytes, string.capacity)
 }
 
 fn erase_basic_string<M: GuestMemory + ?Sized>(
@@ -456,7 +515,8 @@ fn erase_basic_string<M: GuestMemory + ?Sized>(
     pos: u64,
     len: u64,
 ) -> Option<()> {
-    let mut string = decode_basic_string(memory, this)?.bytes;
+    let decoded = decode_basic_string(memory, this)?;
+    let mut string = decoded.bytes;
     let pos = capped_len(pos).min(string.len());
     let requested = capped_len(len);
     let end = if requested == NPOS {
@@ -465,7 +525,37 @@ fn erase_basic_string<M: GuestMemory + ?Sized>(
         pos.saturating_add(requested).min(string.len())
     };
     string.drain(pos..end);
-    write_basic_string(memory, this, &string)
+    write_basic_string_with_capacity(memory, this, &string, decoded.capacity)
+}
+
+fn clear_basic_string<M: GuestMemory + ?Sized>(memory: &mut M, this: u64) -> Option<()> {
+    let string = decode_basic_string(memory, this)?;
+    write_basic_string_with_capacity(memory, this, &[], string.capacity)
+}
+
+fn reserve_basic_string<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+    requested_capacity: u64,
+) -> Option<()> {
+    let string = decode_basic_string(memory, this)?;
+    let capacity = capped_len(requested_capacity)
+        .min(MAX_COMPAT_STRING_LEN)
+        .max(string.capacity);
+    write_basic_string_with_capacity(memory, this, &string.bytes, capacity)
+}
+
+fn resize_basic_string<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    this: u64,
+    requested_len: u64,
+    fill: u8,
+) -> Option<()> {
+    let string = decode_basic_string(memory, this)?;
+    let mut bytes = string.bytes;
+    let new_len = capped_len(requested_len).min(MAX_COMPAT_STRING_LEN);
+    bytes.resize(new_len, fill);
+    write_basic_string_with_capacity(memory, this, &bytes, string.capacity)
 }
 
 fn read_capped_cstring<M: GuestMemory + ?Sized>(
@@ -717,12 +807,24 @@ mod tests {
             ),
             Some(CxxImportKind::StringCStr)
         );
+        assert_eq!(
+            classify_import(
+                "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE8capacityEv"
+            ),
+            Some(CxxImportKind::StringCapacity)
+        );
+        assert_eq!(
+            classify_import(
+                "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc"
+            ),
+            Some(CxxImportKind::StringResizeFill)
+        );
     }
 
     #[test]
     fn diagnostics_classify_unhandled_object_abi_symbols() {
         let diagnostic = diagnose_symbol(
-            "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE8capacityEv",
+            "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE8max_sizeEv",
         )
         .expect("libc++ string symbol should be diagnosed");
         assert_eq!(diagnostic.category, "libc++-basic-string-object-abi");
@@ -783,6 +885,9 @@ mod tests {
         let empty = proxy_import(CxxImportKind::StringEmpty, &mut memory, &args(&[object]))
             .expect("string empty should be proxied");
         assert_eq!(empty.return_value, 0);
+        let capacity = proxy_import(CxxImportKind::StringCapacity, &mut memory, &args(&[object]))
+            .expect("string capacity should be proxied");
+        assert_eq!(capacity.return_value, LIBCPP_SHORT_MAX as u64);
         let data = proxy_import(CxxImportKind::StringData, &mut memory, &args(&[object]))
             .expect("string data should be proxied");
         assert_eq!(data.return_value, object);
@@ -849,6 +954,45 @@ mod tests {
             b"helloworld!"
         );
 
+        proxy_import(
+            CxxImportKind::StringReserve,
+            &mut memory,
+            &args(&[object, 40]),
+        )
+        .expect("string reserve should be proxied");
+        let reserved = decode_basic_string(&mut memory, object).unwrap();
+        assert_eq!(reserved.bytes, b"helloworld!");
+        assert!(reserved.capacity >= 40);
+        let capacity = proxy_import(CxxImportKind::StringCapacity, &mut memory, &args(&[object]))
+            .expect("reserved string capacity should be proxied");
+        assert!(capacity.return_value >= 40);
+
+        proxy_import(
+            CxxImportKind::StringResizeFill,
+            &mut memory,
+            &args(&[object, 14, b'?' as u64]),
+        )
+        .expect("string resize fill should be proxied");
+        assert_eq!(
+            decode_basic_string(&mut memory, object).unwrap().bytes,
+            b"helloworld!???"
+        );
+        proxy_import(
+            CxxImportKind::StringResize,
+            &mut memory,
+            &args(&[object, 5]),
+        )
+        .expect("string resize should be proxied");
+        let resized = decode_basic_string(&mut memory, object).unwrap();
+        assert_eq!(resized.bytes, b"hello");
+        assert!(resized.capacity >= 40);
+
+        proxy_import(CxxImportKind::StringClear, &mut memory, &args(&[object]))
+            .expect("string clear should be proxied");
+        let cleared = decode_basic_string(&mut memory, object).unwrap();
+        assert!(cleared.bytes.is_empty());
+        assert!(cleared.capacity >= 40);
+
         let empty_object = 0x3080;
         proxy_import(
             CxxImportKind::StringInitCstrLen,
@@ -914,6 +1058,7 @@ mod tests {
         assert_eq!(decoded.bytes, text);
         assert_eq!(decoded.layout, "libc++-alternate-long");
         assert!(decoded.data_ptr.unwrap_or(0) >= 0x10_000);
+        assert!(decoded.capacity >= text.len());
 
         let data = proxy_import(CxxImportKind::StringCStr, &mut memory, &args(&[object]))
             .expect("long string c_str should be proxied");
