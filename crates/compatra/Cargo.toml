@@ -1,6 +1,6 @@
 [package]
 name = "compatra"
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 description = "Compatra host proxy services for macOS arm64 userland"
 license = "GPL-2.0"

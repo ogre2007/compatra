@@ -4,6 +4,7 @@ use std::io::Write;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::report::record_compat_call_result;
 use crate::{HostCallResult, HostIoResult, HostOpenResult, HostPipeResult};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -29,7 +30,7 @@ impl CompatLogLevel {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Summary => "summary",
@@ -140,6 +141,9 @@ impl CompatLogScope {
         let error = result.as_ref().map_or(true, |result| {
             result.errno.unwrap_or(0) != 0 || result.return_value == u64::MAX
         });
+        if self.outermost {
+            record_compat_call_result(kind, call, result.is_some(), error);
+        }
         if !self.outermost || !compat_log_config().should_emit(call, error) {
             return;
         }
@@ -178,6 +182,9 @@ impl CompatLogScope {
         let error = result.as_ref().map_or(true, |result| {
             result.errno != 0 || result.return_value == u64::MAX
         });
+        if self.outermost {
+            record_compat_call_result(kind, call, result.is_some(), error);
+        }
         if !self.outermost || !compat_log_config().should_emit(call, error) {
             return;
         }
@@ -222,6 +229,9 @@ impl CompatLogScope {
         let error = result.as_ref().map_or(true, |result| {
             result.errno != 0 || result.return_value == u64::MAX
         });
+        if self.outermost {
+            record_compat_call_result(kind, call, result.is_some(), error);
+        }
         if !self.outermost || !compat_log_config().should_emit(call, error) {
             return;
         }
@@ -256,6 +266,9 @@ impl CompatLogScope {
         result: &Option<HostPipeResult>,
     ) {
         let error = result.as_ref().map_or(true, |result| result.errno != 0);
+        if self.outermost {
+            record_compat_call_result(kind, call, result.is_some(), error);
+        }
         if !self.outermost || !compat_log_config().should_emit(call, error) {
             return;
         }
@@ -292,7 +305,7 @@ pub(crate) fn compat_log_config() -> &'static CompatLogConfig {
     CONFIG.get_or_init(CompatLogConfig::from_env)
 }
 
-fn normalize_log_call_name(call: &str) -> String {
+pub(crate) fn normalize_log_call_name(call: &str) -> String {
     let mut normalized = call.trim();
     while let Some(rest) = normalized.strip_prefix('_') {
         normalized = rest;
@@ -365,7 +378,7 @@ pub(crate) fn json_string_array(values: &[String]) -> String {
     out
 }
 
-fn json_escape(input: &str) -> String {
+pub(crate) fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
@@ -383,7 +396,7 @@ fn json_escape(input: &str) -> String {
     out
 }
 
-fn compat_log_timestamp_us() -> u64 {
+pub(crate) fn compat_log_timestamp_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)

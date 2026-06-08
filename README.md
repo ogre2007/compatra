@@ -83,6 +83,7 @@ Useful knobs:
 - `COMPATRA_COMPAT_LOG=off|summary|calls|verbose`: emit compatibility-layer JSONL logs to stderr; default is `off`. Any non-`off` level also reports unhandled import-stub hits and unresolved `dlsym` requests.
 - `COMPATRA_COMPAT_LOG_FILTER=write,open,getaddrinfo`: limit compat host-call logs to comma-separated normalized call names; missing-import diagnostics still emit at any non-`off` log level
 - `COMPATRA_COMPAT_LOG_PREVIEW_BYTES=96`: cap escaped text/hex previews for host-proxied I/O payloads
+- `COMPATRA_COMPAT_REPORT=1`: emit a final compat capability JSONL summary with proxied call counts, failed proxies, unresolved imports, unresolved `dlsym` symbols, and top framework families. Any non-`off` compat log level enables this automatically unless `COMPATRA_COMPAT_REPORT=0`.
 - `COMPATRA_GUEST_LIBS=/path/libhelper.dylib`: opt in guest-side arm64 Mach-O dylibs for the no-dyld runner. Values use the host path-list separator, may include comma-separated entries, and may point at dylib files, directories of dylibs, or `.framework` directories. Guest-library exports are mapped into guest memory and used for otherwise unhandled static/chained imports and `dlsym` lookups. The loader also records a guest image registry and emits `guest-image-registry` / `guest-image` trace events with image ranges, slides, and export counts.
 - `COMPATRA_INDIRECT_BRANCH_MODE=fast`: default; skip expensive indirect-branch sanitizers
 - `COMPATRA_INDIRECT_BRANCH_MODE=sanitize`: enable indirect-branch sanitizers for debugging signed or tagged branch targets
@@ -136,7 +137,7 @@ compat imports, or `calls`/`verbose` when you also want successful host-proxy
 calls:
 
 ```powershell
-cargo run -p compatra-cli --no-default-features --bin compatra -- --compat-log calls --compat-log-filter write,getaddrinfo --compat-log-preview-bytes 96 fixtures\macos\bin\arm64_hello
+cargo run -p compatra-cli --no-default-features --bin compatra -- --compat-log calls --compat-log-filter write,getaddrinfo --compat-log-preview-bytes 96 --compat-report fixtures\macos\bin\arm64_hello
 ```
 
 ## Local compat smoke check

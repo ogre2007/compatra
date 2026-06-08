@@ -1,3 +1,4 @@
+use compatra_runtime::emit_compat_capability_report;
 use compatra_runtime::macos::{
     cpu_type_name, emulate_macos_binary_with_mode, macho_cputype, run_target_batch_with_mode,
     targets_from_args, MacosCpu, RuntimeMode,
@@ -13,6 +14,7 @@ struct CompatLogOptions {
     level: Option<String>,
     filter: Option<String>,
     preview_bytes: Option<String>,
+    report: Option<bool>,
 }
 
 impl CompatLogOptions {
@@ -25,6 +27,9 @@ impl CompatLogOptions {
         }
         if let Some(preview_bytes) = &self.preview_bytes {
             std::env::set_var("COMPATRA_COMPAT_LOG_PREVIEW_BYTES", preview_bytes);
+        }
+        if let Some(report) = self.report {
+            std::env::set_var("COMPATRA_COMPAT_REPORT", if report { "1" } else { "0" });
         }
     }
 }
@@ -111,7 +116,7 @@ fn emulate_macos_binary_with_stub_resolver(
 }
 
 fn usage() -> &'static str {
-    "Usage: compatra [--compat|--mode compat] [--compat-log off|summary|calls|verbose] [--compat-log-filter calls] [--compat-log-preview-bytes n] [targets...]\n\nRuns the macOS arm64 compatibility layer without analysis mode.\n\nCompat logs are JSONL lines written to stderr. Any non-off level reports unhandled imports and unresolved dlsym requests. Filters limit host-call logs to normalized call names such as write,open,getaddrinfo."
+    "Usage: compatra [--compat|--mode compat] [--compat-log off|summary|calls|verbose] [--compat-log-filter calls] [--compat-log-preview-bytes n] [--compat-report|--no-compat-report] [targets...]\n\nRuns the macOS arm64 compatibility layer without analysis mode.\n\nCompat logs are JSONL lines written to stderr. Any non-off level reports unhandled imports and unresolved dlsym requests. Filters limit host-call logs to normalized call names such as write,open,getaddrinfo. The capability report is a final JSONL summary; it is enabled by --compat-report or by any non-off compat log level."
 }
 
 fn parse_compat_log_level(value: String) -> Result<String, String> {
@@ -181,6 +186,10 @@ fn parse_args(args: Vec<String>) -> Result<CompatCliArgs, String> {
             log.preview_bytes = Some(parse_preview_bytes(value)?);
         } else if let Some(value) = arg.strip_prefix("--compat-log-preview-bytes=") {
             log.preview_bytes = Some(parse_preview_bytes(value.to_string())?);
+        } else if arg == "--compat-report" {
+            log.report = Some(true);
+        } else if arg == "--no-compat-report" {
+            log.report = Some(false);
         } else {
             targets.push(arg);
         }
@@ -204,6 +213,7 @@ fn main() {
     let summary = run_target_batch_with_mode(targets, RuntimeMode::Compat, |path| {
         emulate_macos_binary_with_stub_resolver(path)
     });
+    emit_compat_capability_report();
     if summary.failed > 0 {
         std::process::exit(1);
     }
@@ -221,6 +231,7 @@ mod tests {
             "write,getaddrinfo".to_string(),
             "--compat-log-preview-bytes".to_string(),
             "128".to_string(),
+            "--compat-report".to_string(),
             "sample".to_string(),
         ])
         .unwrap();
@@ -229,5 +240,20 @@ mod tests {
         assert_eq!(parsed.log.level.as_deref(), Some("verbose"));
         assert_eq!(parsed.log.filter.as_deref(), Some("write,getaddrinfo"));
         assert_eq!(parsed.log.preview_bytes.as_deref(), Some("128"));
+        assert_eq!(parsed.log.report, Some(true));
+    }
+
+    #[test]
+    fn parses_compat_report_disable_flag() {
+        let parsed = parse_args(vec![
+            "--compat-log=summary".to_string(),
+            "--no-compat-report".to_string(),
+            "sample".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.targets, vec!["sample"]);
+        assert_eq!(parsed.log.level.as_deref(), Some("summary"));
+        assert_eq!(parsed.log.report, Some(false));
     }
 }

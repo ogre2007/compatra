@@ -1,3 +1,4 @@
+use compatra_runtime::emit_compat_capability_report;
 use compatra_runtime::macos::{
     cpu_type_name, emulate_macos_binary_with_mode, macho_cputype, run_target_batch_with_mode,
     targets_from_args, MacosCpu, RuntimeMode,
@@ -13,6 +14,7 @@ struct CompatLogOptions {
     level: Option<String>,
     filter: Option<String>,
     preview_bytes: Option<String>,
+    report: Option<bool>,
 }
 
 impl CompatLogOptions {
@@ -25,6 +27,9 @@ impl CompatLogOptions {
         }
         if let Some(preview_bytes) = &self.preview_bytes {
             std::env::set_var("COMPATRA_COMPAT_LOG_PREVIEW_BYTES", preview_bytes);
+        }
+        if let Some(report) = self.report {
+            std::env::set_var("COMPATRA_COMPAT_REPORT", if report { "1" } else { "0" });
         }
     }
 }
@@ -106,7 +111,7 @@ fn emulate_macos_binary_with_stub_resolver(
 }
 
 fn usage() -> &'static str {
-    "Usage: machoscope [--mode analysis|compat] [--compat-log off|summary|calls|verbose] [--compat-log-filter calls] [--compat-log-preview-bytes n] [targets...]\n\nModes:\n  analysis  malware-analysis defaults with JSONL plugins and synthetic artifacts\n  compat    compatibility defaults without analysis bait data or detections; prefer compatra for compatibility-only builds\n\nCompat logs are JSONL lines written to stderr. Any non-off level reports unhandled imports and unresolved dlsym requests. Filters limit host-call logs to normalized call names such as write,open,getaddrinfo."
+    "Usage: machoscope [--mode analysis|compat] [--compat-log off|summary|calls|verbose] [--compat-log-filter calls] [--compat-log-preview-bytes n] [--compat-report|--no-compat-report] [targets...]\n\nModes:\n  analysis  malware-analysis defaults with JSONL plugins and synthetic artifacts\n  compat    compatibility defaults without analysis bait data or detections; prefer compatra for compatibility-only builds\n\nCompat logs are JSONL lines written to stderr. Any non-off level reports unhandled imports and unresolved dlsym requests. Filters limit host-call logs to normalized call names such as write,open,getaddrinfo. The capability report is a final JSONL summary; it is enabled by --compat-report or by any non-off compat log level."
 }
 
 fn parse_compat_log_level(value: String) -> Result<String, String> {
@@ -171,6 +176,10 @@ fn parse_args(args: Vec<String>) -> Result<(RuntimeMode, CompatLogOptions, Vec<S
             compat_log.preview_bytes = Some(parse_preview_bytes(value)?);
         } else if let Some(value) = arg.strip_prefix("--compat-log-preview-bytes=") {
             compat_log.preview_bytes = Some(parse_preview_bytes(value.to_string())?);
+        } else if arg == "--compat-report" {
+            compat_log.report = Some(true);
+        } else if arg == "--no-compat-report" {
+            compat_log.report = Some(false);
         } else {
             targets.push(arg);
         }
@@ -194,6 +203,9 @@ pub fn run_from_env() {
     let summary = run_target_batch_with_mode(targets, runtime_mode, |path| {
         emulate_macos_binary_with_stub_resolver(path, runtime_mode)
     });
+    if runtime_mode.is_compat() {
+        emit_compat_capability_report();
+    }
     if summary.failed > 0 {
         std::process::exit(1);
     }

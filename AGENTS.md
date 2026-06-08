@@ -131,6 +131,13 @@ add new ones):
   is `--compat-log-filter`.
 - `COMPATRA_COMPAT_LOG_PREVIEW_BYTES` — byte cap for escaped text/hex previews
   in compat I/O logs; CLI form is `--compat-log-preview-bytes`.
+- `COMPATRA_COMPAT_REPORT` — emit a final compat capability JSONL summary to
+  stderr with proxied call counts, failed proxies, unresolved import-stub hits,
+  unresolved `dlsym` symbols, and top framework families. Values `1`, `true`,
+  `yes`, `on`, `summary`, or `report` enable it; `0`, `false`, `no`, `off`, or
+  `none` disable it. Any non-`off` `COMPATRA_COMPAT_LOG` level enables the
+  report automatically unless this is explicitly disabled. CLI forms are
+  `--compat-report` and `--no-compat-report`.
 - `COMPATRA_GUEST_LIBS` — opt-in guest-side arm64 Mach-O dylib support for the
   no-dyld runner. Values use the host path-list separator and may also contain
   comma-separated entries; entries can be dylib files, directories of dylibs, or

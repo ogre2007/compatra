@@ -5,6 +5,7 @@ mod filesystem;
 mod logging;
 mod mode;
 mod network;
+mod report;
 
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -13,6 +14,10 @@ use std::sync::OnceLock;
 use cxx::CxxImportKind;
 pub use logging::{take_pending_stop_reason, CompatLogLevel};
 pub use mode::RuntimeMode;
+pub use report::{
+    compat_capability_report_enabled, compat_capability_report_json, emit_compat_capability_report,
+    reset_compat_capability_report,
+};
 
 #[cfg(target_os = "macos")]
 use logging::CompatLogScope;
@@ -24,6 +29,7 @@ use logging::{
 use logging::{emit_compat_log_line, hex_arg};
 #[cfg(target_os = "macos")]
 use network::sockaddr_log_fields;
+use report::{record_unhandled_import, record_unknown_import_address, record_unresolved_dlsym};
 
 #[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
@@ -497,6 +503,7 @@ impl CompatibilityServices {
     }
 
     pub fn log_unhandled_import(&self, symbol: &str, address: u64, lr: u64, reason: &str) {
+        record_unhandled_import(symbol);
         let args = [
             ("ImportSymbol", symbol.to_string()),
             ("Address", hex_arg(address)),
@@ -514,6 +521,7 @@ impl CompatibilityServices {
     }
 
     pub fn log_unknown_import_address(&self, address: u64, lr: u64) {
+        record_unknown_import_address();
         let args = [("Address", hex_arg(address)), ("Lr", hex_arg(lr))];
         let mut fields = [
             ("status", Some("unhandled".to_string())),
@@ -532,6 +540,7 @@ impl CompatibilityServices {
     }
 
     pub fn log_unresolved_dlsym(&self, handle: u64, symbol: &str, reason: &str) {
+        record_unresolved_dlsym(symbol);
         let args = [
             ("Handle", hex_arg(handle)),
             ("ImportSymbol", symbol.to_string()),

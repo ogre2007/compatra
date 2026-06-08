@@ -3,6 +3,10 @@ extern crate self as compatra_runtime;
 pub mod macos;
 pub mod unicorn;
 
+pub use compatra::{
+    compat_capability_report_enabled, compat_capability_report_json, emit_compat_capability_report,
+    reset_compat_capability_report,
+};
 pub use macos::arm64_runtime::{
     restore_arm64_context, save_arm64_context, wake_arm64_cond_waiters, wake_one_arm64_cond_waiter,
     Arm64SyntheticOsRuntime, Arm64ThreadContext,
