@@ -19,12 +19,13 @@ use crate::macos::arm64_runner_support::{
 };
 use crate::macos::arm64_state::{Arm64ExitHandler, Arm64ExitHandlerKind};
 use crate::macos::byte_preview::lossy_data_preview;
+use crate::macos::compat::CompatibilityServices;
 use crate::macos::{
     close_synthetic_fd, dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id,
     read_arm64_argv, read_cstring, resolve_process_fd_target, restore_arm64_context,
     save_arm64_context, terminate_synthetic_process, Emulator, ForkParentResume,
-    PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticPopenStream, SyntheticProcess,
-    MAX_SYNTHETIC_THREADS,
+    PendingArm64Thread, RuntimeMode, SharedTraceBus, SyntheticFdTarget, SyntheticPopenStream,
+    SyntheticProcess, MAX_SYNTHETIC_THREADS,
 };
 use crate::UnicornEmulator;
 
@@ -86,6 +87,79 @@ fn checked_stdio_byte_count(size: u64, nmemb: u64) -> Option<(usize, usize, usiz
     Some((item_size, item_count, byte_count.min(0x10000)))
 }
 
+#[derive(Clone, Debug)]
+struct ProcessSyntheticOutput {
+    label: String,
+    output: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessSyntheticLogStream {
+    messages: Vec<String>,
+    output: Vec<u8>,
+}
+
+fn synthetic_popen_output_for_mode(
+    analysis: &crate::macos::analysis::AnalysisRuntimeHooks,
+    _runtime_mode: RuntimeMode,
+    command: &str,
+) -> Option<ProcessSyntheticOutput> {
+    analysis
+        .synthetic_popen_output(command)
+        .map(|output| ProcessSyntheticOutput {
+            label: output.label,
+            output: output.output,
+        })
+}
+
+fn synthetic_log_stream_for_mode(
+    analysis: &crate::macos::analysis::AnalysisRuntimeHooks,
+    runtime_mode: RuntimeMode,
+    path: &str,
+    argv: &[String],
+) -> Option<ProcessSyntheticLogStream> {
+    analysis
+        .synthetic_log_stream(path, argv)
+        .map(|stream| ProcessSyntheticLogStream {
+            messages: stream.messages,
+            output: stream.output,
+        })
+        .or_else(|| {
+            runtime_mode
+                .is_compat()
+                .then(|| compatra::synthetic_log_stream(path, argv))
+                .flatten()
+                .map(|stream| ProcessSyntheticLogStream {
+                    messages: stream.messages,
+                    output: stream.output,
+                })
+        })
+}
+
+fn proxy_compat_stdio_import(
+    emu: &mut compatra_runtime::UnicornEmulator,
+    runtime_mode: RuntimeMode,
+    symbol: &str,
+    args: &[u64; 8],
+    errno_ptr: u64,
+) -> bool {
+    let Some(compat) = CompatibilityServices::for_mode(runtime_mode) else {
+        return false;
+    };
+    let Some(result) = compat.proxy_arm64_import(emu, symbol, args) else {
+        return false;
+    };
+    let _ = emu.write_reg("x0", result.return_value);
+    if let Some(errno) = result.errno {
+        let _ = emu.write_memory(errno_ptr, &errno.to_le_bytes());
+    }
+    let lr = emu.read_reg("lr").unwrap_or(0);
+    if lr != 0 {
+        let _ = emu.write_reg("pc", lr);
+    }
+    true
+}
+
 fn install_posix_spawn_hook(
     emulator: &mut UnicornEmulator,
     addr: u64,
@@ -101,6 +175,7 @@ fn install_posix_spawn_hook(
     let import_tracker = import_tracker.clone();
     let trace_bus_for_hook = trace_bus.clone();
     let analysis = shared_state.analysis.clone();
+    let runtime_mode = shared_state.runtime_mode;
     // Per-installation sequence counter so multiple `posix_spawnp`
     // calls from the same parent get distinct dump files.
     let spawn_sequence = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -125,7 +200,7 @@ fn install_posix_spawn_hook(
                 .ok()
                 .and_then(|actions| actions.get(&file_actions_ptr).cloned())
                 .unwrap_or_default();
-            let log_stream = analysis.synthetic_log_stream(&path, &argv);
+            let log_stream = synthetic_log_stream_for_mode(&analysis, runtime_mode, &path, &argv);
             let log_stream_messages = log_stream
                 .as_ref()
                 .map(|stream| stream.messages.clone())
@@ -399,6 +474,7 @@ pub fn install_arm64_process_imports(
         let import_tracker = import_tracker.clone();
         let trace_bus_for_hook = trace_bus.clone();
         let analysis_for_hook = analysis.clone();
+        let runtime_mode = shared_state.runtime_mode;
         let malloc_next_addr = shared_state.malloc_next_addr.clone();
         let malloc_mapped_until = shared_state.malloc_mapped_until.clone();
         let malloc_allocations = shared_state.malloc_allocations.clone();
@@ -430,7 +506,8 @@ pub fn install_arm64_process_imports(
                 )
                 .map(|(addr, _)| addr)
                 .unwrap_or(0);
-                let synthetic_output = analysis_for_hook.synthetic_popen_output(&command);
+                let synthetic_output =
+                    synthetic_popen_output_for_mode(&analysis_for_hook, runtime_mode, &command);
                 let synthetic_label = synthetic_output.as_ref().map(|output| output.label.clone());
                 let output = synthetic_output
                     .as_ref()
@@ -537,12 +614,15 @@ pub fn install_arm64_process_imports(
         )?;
     }
 
-    if analysis.is_enabled() {
+    let process_stdio_hooks_enabled =
+        analysis.is_enabled() || shared_state.runtime_mode.is_compat();
+    if process_stdio_hooks_enabled {
         if let Some(&addr) = stub_map.get("_fgets") {
             let os_runtime = shared_state.os_runtime.clone();
             let thread_runtime = shared_state.thread_runtime.clone();
             let import_tracker = import_tracker.clone();
             let trace_bus_for_hook = trace_bus.clone();
+            let runtime_mode = shared_state.runtime_mode;
             emulator.add_code_hook(
             addr,
             addr + 4,
@@ -581,6 +661,13 @@ pub fn install_arm64_process_imports(
                         })
                         .unwrap_or((false, Vec::new(), false, None, 0usize))
                 };
+
+                if !synthetic && runtime_mode.is_compat() {
+                    let args = [buf_ptr, size_raw, stream, 0, 0, 0, 0, 0];
+                    if proxy_compat_stdio_import(emu, runtime_mode, "_fgets", &args, errno_ptr) {
+                        return;
+                    }
+                }
 
                 let mut errno = 0u32;
                 let result = if synthetic && !data.is_empty() {
@@ -640,6 +727,7 @@ pub fn install_arm64_process_imports(
             let thread_runtime = shared_state.thread_runtime.clone();
             let import_tracker = import_tracker.clone();
             let trace_bus_for_hook = trace_bus.clone();
+            let runtime_mode = shared_state.runtime_mode;
             emulator.add_code_hook(
             addr,
             addr + 4,
@@ -680,6 +768,13 @@ pub fn install_arm64_process_imports(
                         })
                         .unwrap_or((false, Vec::new(), false, None, 0usize))
                 };
+
+                if !synthetic && runtime_mode.is_compat() {
+                    let args = [buf_ptr, size, nmemb, stream, 0, 0, 0, 0];
+                    if proxy_compat_stdio_import(emu, runtime_mode, "_fread", &args, errno_ptr) {
+                        return;
+                    }
+                }
 
                 let mut errno = 0u32;
                 let result_items = if synthetic && !data.is_empty() {
@@ -745,6 +840,7 @@ pub fn install_arm64_process_imports(
             let thread_runtime = shared_state.thread_runtime.clone();
             let import_tracker = import_tracker.clone();
             let trace_bus_for_hook = trace_bus.clone();
+            let runtime_mode = shared_state.runtime_mode;
             emulator.add_code_hook(
                 addr,
                 addr + 4,
@@ -768,6 +864,12 @@ pub fn install_arm64_process_imports(
                             Some((true, stream_state.eof, stream_state.label.clone()))
                         })
                         .unwrap_or((false, false, None));
+                    if !synthetic && runtime_mode.is_compat() {
+                        let args = [stream, 0, 0, 0, 0, 0, 0, 0];
+                        if proxy_compat_stdio_import(emu, runtime_mode, "_feof", &args, errno_ptr) {
+                            return;
+                        }
+                    }
                     let result = u64::from(synthetic && eof);
                     let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
                     let lr = emu.read_reg("lr").unwrap_or(0);
@@ -798,6 +900,7 @@ pub fn install_arm64_process_imports(
             let thread_runtime = shared_state.thread_runtime.clone();
             let import_tracker = import_tracker.clone();
             let trace_bus_for_hook = trace_bus.clone();
+            let runtime_mode = shared_state.runtime_mode;
             emulator.add_code_hook(
                 addr,
                 addr + 4,
@@ -821,6 +924,13 @@ pub fn install_arm64_process_imports(
                             Some((true, stream_state.error, stream_state.label.clone()))
                         })
                         .unwrap_or((false, false, None));
+                    if !synthetic && runtime_mode.is_compat() {
+                        let args = [stream, 0, 0, 0, 0, 0, 0, 0];
+                        if proxy_compat_stdio_import(emu, runtime_mode, "_ferror", &args, errno_ptr)
+                        {
+                            return;
+                        }
+                    }
                     let result = u64::from(synthetic && error);
                     let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
                     let lr = emu.read_reg("lr").unwrap_or(0);
@@ -851,6 +961,7 @@ pub fn install_arm64_process_imports(
             let thread_runtime = shared_state.thread_runtime.clone();
             let import_tracker = import_tracker.clone();
             let trace_bus_for_hook = trace_bus.clone();
+            let runtime_mode = shared_state.runtime_mode;
             emulator.add_code_hook(
                 addr,
                 addr + 4,
@@ -876,6 +987,18 @@ pub fn install_arm64_process_imports(
                             Some((true, stream_state.label.clone()))
                         })
                         .unwrap_or((false, None));
+                    if !synthetic && runtime_mode.is_compat() {
+                        let args = [stream, 0, 0, 0, 0, 0, 0, 0];
+                        if proxy_compat_stdio_import(
+                            emu,
+                            runtime_mode,
+                            "_clearerr",
+                            &args,
+                            errno_ptr,
+                        ) {
+                            return;
+                        }
+                    }
                     let _ = emu.write_memory(errno_ptr, &0u32.to_le_bytes());
                     let lr = emu.read_reg("lr").unwrap_or(0);
                     let _ = emu.write_reg("x0", 0u64);

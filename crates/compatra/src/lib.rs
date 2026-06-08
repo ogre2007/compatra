@@ -5,6 +5,7 @@ mod filesystem;
 mod logging;
 mod mode;
 mod network;
+mod process;
 mod report;
 
 #[cfg(target_os = "macos")]
@@ -14,6 +15,9 @@ use std::sync::OnceLock;
 use cxx::CxxImportKind;
 pub use logging::{take_pending_stop_reason, CompatLogLevel};
 pub use mode::RuntimeMode;
+pub use process::{
+    synthetic_log_stream, synthetic_process_output, SyntheticLogStream, SyntheticProcessOutput,
+};
 pub use report::{
     compat_capability_report_enabled, compat_capability_report_json, emit_compat_capability_report,
     reset_compat_capability_report,
@@ -351,6 +355,10 @@ enum HostImportKind {
     FOpen,
     #[cfg(target_os = "macos")]
     FdOpen,
+    #[cfg(target_os = "macos")]
+    POpen,
+    #[cfg(target_os = "macos")]
+    PClose,
     #[cfg(target_os = "macos")]
     FClose,
     #[cfg(target_os = "macos")]
@@ -898,6 +906,8 @@ impl CompatibilityServices {
                 HostImportKind::Umask => Some(self.umask(args[0])?),
                 HostImportKind::FOpen => Some(self.fopen_path(memory, args[0], args[1])?),
                 HostImportKind::FdOpen => Some(self.fdopen_fd(memory, args[0], args[1])?),
+                HostImportKind::POpen => Some(self.popen_process(memory, args[0], args[1])?),
+                HostImportKind::PClose => Some(self.pclose_process(memory, args[0])?.into()),
                 HostImportKind::FClose => Some(self.fclose_stream(memory, args[0])?.into()),
                 HostImportKind::FRead => Some(
                     self.fread_stream(memory, args[0], args[1], args[2], args[3])?
@@ -1055,6 +1065,20 @@ impl CompatibilityServices {
                     read_cstring(memory, args[0], 4096).unwrap_or_else(|_| "<invalid>".to_string())
                 };
                 log_arg_pairs.push(("Command".to_string(), command));
+            }
+            if matches!(kind, HostImportKind::POpen) {
+                let command = if args[0] == 0 {
+                    "<null>".to_string()
+                } else {
+                    read_cstring(memory, args[0], 4096).unwrap_or_else(|_| "<invalid>".to_string())
+                };
+                let mode = if args[1] == 0 {
+                    "<null>".to_string()
+                } else {
+                    read_cstring(memory, args[1], 64).unwrap_or_else(|_| "<invalid>".to_string())
+                };
+                log_arg_pairs.push(("Command".to_string(), command));
+                log_arg_pairs.push(("Mode".to_string(), mode));
             }
             let log_args = log_arg_pairs
                 .iter()
@@ -2832,6 +2856,8 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "umask" => Some(HostImportKind::Umask),
             "fopen" | "fopen$UNIX2003" => Some(HostImportKind::FOpen),
             "fdopen" | "fdopen$UNIX2003" => Some(HostImportKind::FdOpen),
+            "popen" => Some(HostImportKind::POpen),
+            "pclose" => Some(HostImportKind::PClose),
             "fclose" => Some(HostImportKind::FClose),
             "fread" => Some(HostImportKind::FRead),
             "fwrite" => Some(HostImportKind::FWrite),
@@ -4935,6 +4961,8 @@ mod tests {
             assert!(compat.should_proxy_import("_umask"));
             assert!(compat.should_proxy_import("_fopen"));
             assert!(compat.should_proxy_import("_fdopen"));
+            assert!(compat.should_proxy_import("_popen"));
+            assert!(compat.should_proxy_import("_pclose"));
             assert!(compat.should_proxy_import("_fclose"));
             assert!(compat.should_proxy_import("_fread"));
             assert!(compat.should_proxy_import("_fwrite"));
@@ -5226,6 +5254,94 @@ mod tests {
 
         assert_eq!(result.return_value, 7 << 8);
         assert_eq!(result.errno, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn popen_proxy_returns_host_stdout_readable_by_fgets() {
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+            next_alloc: u64,
+        }
+
+        impl Default for TestMemory {
+            fn default() -> Self {
+                Self {
+                    bytes: std::collections::HashMap::new(),
+                    next_alloc: 0x8000,
+                }
+            }
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+
+            fn allocate_memory(
+                &mut self,
+                size: usize,
+                alignment: usize,
+            ) -> Result<u64, GuestMemoryError> {
+                let align = alignment.max(1) as u64;
+                let addr = (self.next_alloc + align - 1) & !(align - 1);
+                self.next_alloc = addr.saturating_add(size as u64).saturating_add(align);
+                self.write_guest(addr, &vec![0; size]);
+                Ok(addr)
+            }
+
+            fn free_memory(&mut self, addr: u64) -> Result<(), GuestMemoryError> {
+                for offset in 0..64 {
+                    self.bytes.remove(&(addr + offset));
+                }
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"printf 'compatra-popen\\n'\0");
+        memory.write_guest(0x1100, b"r\0");
+
+        let stream = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_popen", &[0x1000, 0x1100, 0, 0, 0, 0, 0, 0])
+            .expect("popen should be proxied")
+            .return_value;
+        assert_ne!(stream, 0);
+
+        let fgets = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_fgets", &[0x2000, 64, stream, 0, 0, 0, 0, 0])
+            .expect("fgets should read proxied popen stream");
+        assert_eq!(fgets.return_value, 0x2000);
+
+        let output = memory
+            .read_memory(0x2000, "compatra-popen\n\0".len())
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output), "compatra-popen\n\0");
+
+        let pclose = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_pclose", &[stream, 0, 0, 0, 0, 0, 0, 0])
+            .expect("pclose should close proxied popen stream");
+        assert_eq!(pclose.return_value, 0);
     }
 
     #[cfg(target_os = "macos")]

@@ -140,6 +140,14 @@ calls:
 cargo run -p compatra-cli --no-default-features --bin compatra -- --compat-log calls --compat-log-filter write,getaddrinfo --compat-log-preview-bytes 96 --compat-report fixtures\macos\bin\arm64_hello
 ```
 
+In compat mode, `_system` and `_popen` proxy to the host shell/libc so guest
+code observes real host command behavior. The analysis runtime also has
+deterministic stdout fixtures for common process-inventory commands such as
+`whoami`, `id`, `uname`, `sw_vers`, `ifconfig`, `ps`, `launchctl list`,
+`system_profiler SPHardwareDataType`, Security keychain commands,
+browser-extension discovery, and `mdfind -name .pem`; those fixtures are
+compatibility aids for analysis runs, not detections.
+
 ## Local compat smoke check
 
 Compatibility mode is pinned by

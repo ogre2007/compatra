@@ -979,6 +979,39 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn popen_process<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        command_ptr: u64,
+        mode_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_popen(memory, command_ptr, mode_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, command_ptr, mode_ptr);
+            None
+        }
+    }
+
+    pub fn pclose_process<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        stream: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_pclose(memory, stream);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, stream);
+            None
+        }
+    }
+
     pub fn fclose_stream<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1302,6 +1335,14 @@ impl CompatibilityServices {
 #[derive(Clone, Copy, Debug)]
 struct HostFileHandle {
     file_ptr: usize,
+    close_kind: HostFileCloseKind,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostFileCloseKind {
+    FClose,
+    PClose,
 }
 
 #[cfg(target_os = "macos")]
@@ -2859,6 +2900,7 @@ fn collect_poll_ready(original: Option<&HashSet<libc::c_int>>) -> HashSet<libc::
 fn allocate_guest_file_handle<M: GuestMemory + ?Sized>(
     memory: &mut M,
     file_ptr: *mut libc::FILE,
+    close_kind: HostFileCloseKind,
 ) -> Option<u64> {
     let guest_handle = memory.allocate_memory(HOST_FILE_HANDLE_SIZE, 8).ok()?;
     memory
@@ -2868,6 +2910,7 @@ fn allocate_guest_file_handle<M: GuestMemory + ?Sized>(
         guest_handle,
         HostFileHandle {
             file_ptr: file_ptr as usize,
+            close_kind,
         },
     );
     Some(guest_handle)
@@ -2888,7 +2931,8 @@ fn proxy_host_fopen<M: GuestMemory + ?Sized>(
     if file.is_null() {
         return Some(host_null_error(host_errno()));
     }
-    let Some(guest_handle) = allocate_guest_file_handle(memory, file) else {
+    let Some(guest_handle) = allocate_guest_file_handle(memory, file, HostFileCloseKind::FClose)
+    else {
         unsafe {
             libc::fclose(file);
         }
@@ -2910,7 +2954,8 @@ fn proxy_host_fdopen<M: GuestMemory + ?Sized>(
     if file.is_null() {
         return Some(host_null_error(host_errno()));
     }
-    let Some(guest_handle) = allocate_guest_file_handle(memory, file) else {
+    let Some(guest_handle) = allocate_guest_file_handle(memory, file, HostFileCloseKind::FClose)
+    else {
         unsafe {
             libc::fclose(file);
         }
@@ -2920,15 +2965,71 @@ fn proxy_host_fdopen<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_host_popen<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    command_ptr: u64,
+    mode_ptr: u64,
+) -> Option<HostCallResult> {
+    let command = read_cstring(memory, command_ptr, HOST_PATH_BUFFER_SIZE).ok()?;
+    let mode = read_cstring(memory, mode_ptr, 64).ok()?;
+    let host_command = CString::new(command).ok()?;
+    let host_mode = CString::new(mode).ok()?;
+    clear_errno();
+    let file = unsafe { libc::popen(host_command.as_ptr(), host_mode.as_ptr()) };
+    if file.is_null() {
+        return Some(host_null_error(host_errno()));
+    }
+    let Some(guest_handle) = allocate_guest_file_handle(memory, file, HostFileCloseKind::PClose)
+    else {
+        unsafe {
+            libc::pclose(file);
+        }
+        return Some(host_null_error(libc::ENOMEM as u32));
+    };
+    Some(host_call_value(guest_handle))
+}
+
+#[cfg(target_os = "macos")]
+fn close_host_file_handle(handle: HostFileHandle) -> isize {
+    match handle.close_kind {
+        HostFileCloseKind::FClose => {
+            (unsafe { libc::fclose(handle.file_ptr as *mut libc::FILE) }) as isize
+        }
+        HostFileCloseKind::PClose => {
+            (unsafe { libc::pclose(handle.file_ptr as *mut libc::FILE) }) as isize
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_pclose<M: GuestMemory + ?Sized>(memory: &mut M, stream: u64) -> Option<HostIoResult> {
+    let handle = match host_file_handles().lock().ok()?.remove(&stream) {
+        Some(handle) => handle,
+        None => return Some(host_io_error(libc::EBADF as u32)),
+    };
+    clear_errno();
+    let ret = match handle.close_kind {
+        HostFileCloseKind::FClose => {
+            (unsafe { libc::fclose(handle.file_ptr as *mut libc::FILE) }) as isize
+        }
+        HostFileCloseKind::PClose => {
+            (unsafe { libc::pclose(handle.file_ptr as *mut libc::FILE) }) as isize
+        }
+    };
+    let _ = memory.free_memory(stream);
+    Some(host_io_result(ret, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_host_fclose<M: GuestMemory + ?Sized>(memory: &mut M, stream: u64) -> Option<HostIoResult> {
     let handle = match host_file_handles().lock().ok()?.remove(&stream) {
         Some(handle) => handle,
         None => return Some(host_io_error(libc::EBADF as u32)),
     };
     clear_errno();
-    let ret = unsafe { libc::fclose(handle.file_ptr as *mut libc::FILE) };
+    let ret = close_host_file_handle(handle);
     let _ = memory.free_memory(stream);
-    Some(host_io_result(ret as isize, Vec::new()))
+    Some(host_io_result(ret, Vec::new()))
 }
 
 #[cfg(target_os = "macos")]

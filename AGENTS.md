@@ -99,6 +99,24 @@ If arm64 code needs analysis behavior, route it through
 capture state or parsing analysis-only env knobs directly in
 `crates/compatra-runtime/src/macos/arch_arm64`.
 
+## Compatibility proxy contract
+
+Compat mode is proxy-first. When a guest operation has a real macOS/libSystem,
+framework, filesystem, process, network, or command-output equivalent on the
+host, route it to the host/system implementation and log the guest arguments,
+host result, errno/status, and useful returned data previews. The compat layer
+is not a defensive sandbox and should not hide real host/sandbox data from the
+emulated malware by default.
+
+Default compat behavior must not replace real host behavior with synthetic
+fixtures. Synthetic stdout, fake files, bait artifacts, fake framework objects,
+or deterministic malware-analysis data belong in analysis mode, behind
+`AnalysisRuntimeHooks`, or behind an explicit opt-in compatibility knob with a
+documented reason. If an exact arm64 hook is added for a symbol that also has a
+host proxy, add or update a test proving the hook does not block the generic
+compat host-proxy path. `_system`, `_popen`, `_pclose`, common stdio calls,
+filesystem calls, and network calls should prefer host proxying in compat.
+
 ## Logging rules
 
 - Default observable output is structured JSONL through the trace/plugin

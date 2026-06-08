@@ -93,15 +93,22 @@ fn arm64_proxy_compat_host_import(
     };
 }
 
-fn arm64_import_has_analysis_runtime_hook(symbol: &str) -> bool {
+fn arm64_import_has_process_stdio_runtime_hook(symbol: &str) -> bool {
     matches!(
         symbol,
         "_clearerr" | "_feof" | "_ferror" | "_fgets" | "_fread"
     )
 }
 
+fn arm64_import_has_analysis_process_runtime_hook(symbol: &str) -> bool {
+    matches!(symbol, "_pclose" | "_popen")
+}
+
 pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> bool {
-    if arm64_import_has_analysis_runtime_hook(symbol) {
+    if arm64_import_has_process_stdio_runtime_hook(symbol) {
+        return runtime_mode.is_analysis() || runtime_mode.is_compat();
+    }
+    if arm64_import_has_analysis_process_runtime_hook(symbol) {
         return runtime_mode.is_analysis();
     }
     if is_apple_import_symbol(symbol) {
@@ -164,9 +171,7 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_notify_is_valid_token"
             | "_open"
             | "_opendir"
-            | "_pclose"
             | "_pipe"
-            | "_popen"
             | "_posix_memalign"
             | "_posix_spawn"
             | "_posix_spawn_file_actions_adddup2"
@@ -460,10 +465,23 @@ mod tests {
     }
 
     #[test]
-    fn analysis_stdio_hooks_do_not_block_compat_host_proxy() {
+    fn process_stdio_hooks_cover_analysis_and_compat_modes() {
         for symbol in ["_fgets", "_fread", "_feof", "_ferror", "_clearerr"] {
             assert!(arm64_import_has_runtime_hook(symbol, RuntimeMode::Analysis));
+            assert!(arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat));
+        }
+    }
+
+    #[test]
+    fn popen_hooks_are_analysis_only_so_compat_can_host_proxy() {
+        for symbol in ["_popen", "_pclose"] {
+            assert!(arm64_import_has_runtime_hook(symbol, RuntimeMode::Analysis));
             assert!(!arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat));
+            #[cfg(target_os = "macos")]
+            assert!(!arm64_import_can_resolve_to_guest_library(
+                symbol,
+                RuntimeMode::Compat
+            ));
         }
     }
 

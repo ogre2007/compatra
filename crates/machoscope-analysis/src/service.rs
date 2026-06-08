@@ -49,18 +49,19 @@ impl AnalysisServices {
     }
 
     pub fn synthetic_log_stream(&self, path: &str, argv: &[String]) -> Option<SyntheticLogStream> {
-        let messages = synthetic_log_stream_messages(path, argv);
-        if messages.is_empty() {
-            return None;
-        }
+        let stream = compatra::synthetic_log_stream(path, argv)?;
         Some(SyntheticLogStream {
-            output: synthetic_log_stream_output(&messages),
-            messages,
+            messages: stream.messages,
+            output: stream.output,
         })
     }
 
     pub fn synthetic_popen_output(&self, command: &str) -> Option<SyntheticPopenOutput> {
-        synthetic_popen_output(command)
+        let output = compatra::synthetic_process_output(command)?;
+        Some(SyntheticPopenOutput {
+            label: output.label,
+            output: output.output,
+        })
     }
 
     pub fn write_posix_spawn_argv_capture(
@@ -137,100 +138,6 @@ impl AnalysisServices {
             analysis_summary,
         }
     }
-}
-
-fn extract_log_stream_event_messages(predicate: &str) -> Vec<String> {
-    let mut messages = Vec::new();
-    let mut rest = predicate;
-    while let Some(idx) = rest.find("eventMessage contains") {
-        rest = &rest[idx + "eventMessage contains".len()..];
-        let Some(start) = rest.find('"') else {
-            break;
-        };
-        let after_start = &rest[start + 1..];
-        let Some(end) = after_start.find('"') else {
-            break;
-        };
-        messages.push(after_start[..end].to_string());
-        rest = &after_start[end + 1..];
-    }
-    messages
-}
-
-fn synthetic_log_stream_messages(path: &str, argv: &[String]) -> Vec<String> {
-    if path != "log" || !argv.iter().any(|arg| arg == "stream") {
-        return Vec::new();
-    }
-    let mut messages = argv
-        .iter()
-        .flat_map(|arg| extract_log_stream_event_messages(arg))
-        .collect::<Vec<_>>();
-    messages.sort();
-    messages.dedup();
-    messages
-}
-
-fn synthetic_log_stream_output(messages: &[String]) -> Vec<u8> {
-    let mut output =
-        "Timestamp                       Thread     Type        Activity             PID    TTL  \n"
-            .as_bytes()
-            .to_vec();
-    for message in messages {
-        output.extend_from_slice(
-            format!(
-                "2026-05-08 20:00:00.000000+0300 0x000000   Info        0x0                  0      0    {}\n",
-                message
-            )
-            .as_bytes(),
-        );
-    }
-    output
-}
-
-fn synthetic_popen_output(command: &str) -> Option<SyntheticPopenOutput> {
-    let command = command.trim();
-    let (label, output): (&str, &str) = match command {
-        "uname -s 2>/dev/null" => ("uname-kernel", "Darwin\n"),
-        "uname -m 2>/dev/null" => ("uname-machine", "arm64\n"),
-        "uname -r 2>/dev/null" => ("uname-release", "23.6.0\n"),
-        "stat -f %SB / 2>/dev/null | head -1" => {
-            ("root-birthtime", "Jan  1 00:00:00 2026\n")
-        }
-        "sysctl -n kern.boottime 2>/dev/null | grep -oE '[0-9]+' | head -1" => {
-            ("boot-time", "1735689600\n")
-        }
-        "date +%Z 2>/dev/null" => ("timezone", "UTC\n"),
-        "sysctl -n machdep.cpu.brand_string 2>/dev/null" => {
-            ("cpu-brand", "Apple M2\n")
-        }
-        "ifconfig en0 2>/dev/null | awk '/ether/{print $2}'" => {
-            ("en0-mac", "02:42:AC:10:00:02\n")
-        }
-        "ifconfig en0 2>/dev/null | awk '/inet /{print $2}'" => ("en0-ipv4", "10.0.2.15\n"),
-        "ps -eo pid,sess,command 2>/dev/null" => (
-            "process-list",
-            "  PID  SESS COMMAND\n\
-               1     1 /sbin/launchd\n\
-             503   503 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n\
-             742   742 /bin/zsh\n",
-        ),
-        _ if command.contains("find ")
-            && command.contains("Extensions")
-            && command.contains("2>/dev/null") =>
-        {
-            (
-                "browser-extensions",
-                "/Users/analyst/Library/Application Support/Google/Chrome/Default/Extensions/nkbihfbeogaeaoehlefnkodbefgpgknn\n\
-                 /Users/analyst/Library/Application Support/BraveSoftware/Brave-Browser/Default/Extensions/bfnaelmomeimhlpmgjnjophhpkkoljpa\n",
-            )
-        }
-        _ => return None,
-    };
-
-    Some(SyntheticPopenOutput {
-        label: label.to_string(),
-        output: output.as_bytes().to_vec(),
-    })
 }
 
 #[cfg(test)]
