@@ -812,6 +812,7 @@ fn compile_arm64_startup_glue_fixture() -> PathBuf {
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -830,8 +831,10 @@ typedef int (*mlock_fn)(const void *, size_t);
 typedef int (*munlock_fn)(const void *, size_t);
 typedef int (*madvise_fn)(void *, size_t, int);
 typedef int (*pthread_sigmask_fn)(int, const sigset_t *, sigset_t *);
+typedef int (*pthread_threadid_np_fn)(pthread_t, uint64_t *);
 typedef int (*issetugid_fn)(void);
 typedef int (*execl_fn)(const char *, const char *, ...);
+typedef int (*system_fn)(const char *);
 typedef size_t (*next_prime_fn)(size_t);
 typedef int (*cxa_guard_acquire_fn)(uint64_t *);
 typedef void (*cxa_guard_void_fn)(uint64_t *);
@@ -897,8 +900,10 @@ static int exercise_startup_glue(
     munlock_fn munlock_impl,
     madvise_fn madvise_impl,
     pthread_sigmask_fn pthread_sigmask_impl,
+    pthread_threadid_np_fn pthread_threadid_np_impl,
     issetugid_fn issetugid_impl,
     execl_fn execl_impl,
+    system_fn system_impl,
     next_prime_fn next_prime_impl,
     cxa_guard_acquire_fn cxa_guard_acquire_impl,
     cxa_guard_void_fn cxa_guard_release_impl,
@@ -952,11 +957,16 @@ static int exercise_startup_glue(
     int mask_ret = pthread_sigmask_impl(SIG_SETMASK, 0, &oldmask);
     unsigned int oldmask_sum = byte_sum((const unsigned char *)&oldmask, sizeof(oldmask));
 
+    uint64_t thread_id = 0;
+    int threadid_ret = pthread_threadid_np_impl(0, &thread_id);
+
     int ugid = issetugid_impl();
 
     errno = 0;
     int exec_ret = execl_impl("/compatra/compat/no-such-helper", "no-such-helper", (char *)0);
     int exec_errno = errno;
+
+    int system_ret = system_impl("exit 0");
 
     size_t prime = next_prime_impl(1000);
     uint64_t guard = 0;
@@ -1176,9 +1186,12 @@ static int exercise_startup_glue(
         && madvise_ret == 0
         && mask_ret == 0
         && oldmask_sum == 0
+        && threadid_ret == 0
+        && thread_id != 0
         && ugid == 0
         && exec_ret == -1
         && exec_errno != 0
+        && system_ret == 0
         && prime == 1009
         && guard_first == 1
         && guard_second == 0
@@ -1190,7 +1203,7 @@ static int exercise_startup_glue(
         && vec_ok;
 
     printf(
-        "compat startup glue %s mlock=%d munlock=%d madvise=%d mask=%d oldmask_size=%lu oldmask_sum=%u issetugid=%d execl=%d execl_errno=%d next_prime=%lu guard_first=%d guard_second=%d guard=0x%llx guard_abort_first=%d guard_abort_second=%d guard_abort=0x%llx str_len=%lu str_accessor_proxy=%d str_size=%lu str_length=%lu str_empty=%d str_text=%.*s str_find=%lu str_compare=%d cstr_ok=%d data_ok=%d str_lifecycle_proxy=%d str_lifecycle_ok=%d str_mutator_proxy=%d str_capacity=%lu reserve_capacity=%lu reserve_ge_40=%d resize_ok=%d shrink_ok=%d clear_ok=%d str_ok=%d vec_proxy=%d vec_size=%lu vec_capacity=%lu vec_data_ok=%d vec_access_proxy=%d vec_access_ok=%d vec_pushed_size=%lu vec_popped_size=%lu vec_lifecycle_proxy=%d vec_lifecycle_ok=%d vec_clear_ok=%d vec_ok=%d ok=%d\n",
+        "compat startup glue %s mlock=%d munlock=%d madvise=%d mask=%d oldmask_size=%lu oldmask_sum=%u threadid=%d thread_id=%llu issetugid=%d execl=%d execl_errno=%d system=%d next_prime=%lu guard_first=%d guard_second=%d guard=0x%llx guard_abort_first=%d guard_abort_second=%d guard_abort=0x%llx str_len=%lu str_accessor_proxy=%d str_size=%lu str_length=%lu str_empty=%d str_text=%.*s str_find=%lu str_compare=%d cstr_ok=%d data_ok=%d str_lifecycle_proxy=%d str_lifecycle_ok=%d str_mutator_proxy=%d str_capacity=%lu reserve_capacity=%lu reserve_ge_40=%d resize_ok=%d shrink_ok=%d clear_ok=%d str_ok=%d vec_proxy=%d vec_size=%lu vec_capacity=%lu vec_data_ok=%d vec_access_proxy=%d vec_access_ok=%d vec_pushed_size=%lu vec_popped_size=%lu vec_lifecycle_proxy=%d vec_lifecycle_ok=%d vec_clear_ok=%d vec_ok=%d ok=%d\n",
         label,
         mlock_ret,
         munlock_ret,
@@ -1198,9 +1211,12 @@ static int exercise_startup_glue(
         mask_ret,
         (unsigned long)sizeof(oldmask),
         oldmask_sum,
+        threadid_ret,
+        (unsigned long long)thread_id,
         ugid,
         exec_ret,
         exec_errno,
+        system_ret,
         (unsigned long)prime,
         guard_first,
         guard_second,
@@ -1254,8 +1270,10 @@ int main(void) {
         munlock,
         madvise,
         pthread_sigmask,
+        pthread_threadid_np,
         issetugid,
         execl,
+        system,
         compat_libcpp_next_prime,
         compat_cxa_guard_acquire,
         compat_cxa_guard_release,
@@ -1306,8 +1324,10 @@ int main(void) {
     munlock_fn dyn_munlock = (munlock_fn)dlsym(self, "munlock");
     madvise_fn dyn_madvise = (madvise_fn)dlsym(self, "madvise");
     pthread_sigmask_fn dyn_pthread_sigmask = (pthread_sigmask_fn)dlsym(self, "pthread_sigmask");
+    pthread_threadid_np_fn dyn_pthread_threadid_np = (pthread_threadid_np_fn)dlsym(self, "pthread_threadid_np");
     issetugid_fn dyn_issetugid = (issetugid_fn)dlsym(self, "issetugid");
     execl_fn dyn_execl = (execl_fn)dlsym(self, "execl");
+    system_fn dyn_system = (system_fn)dlsym(self, "system");
     next_prime_fn dyn_next_prime = (next_prime_fn)dlsym(next_prime_handle, "_ZNSt3__112__next_primeEm");
     cxa_guard_acquire_fn dyn_cxa_guard_acquire = (cxa_guard_acquire_fn)dlsym(self, "__cxa_guard_acquire");
     cxa_guard_void_fn dyn_cxa_guard_release = (cxa_guard_void_fn)dlsym(self, "__cxa_guard_release");
@@ -1350,13 +1370,15 @@ int main(void) {
     vector_void_fn dyn_vector_dtor = (vector_void_fn)dlsym(string_handle, "_ZNSt3__16vectorIcNS_9allocatorIcEEED1Ev");
 
     printf(
-        "compat startup glue dlsym ptrs mlock=%p munlock=%p madvise=%p pthread_sigmask=%p issetugid=%p execl=%p next_prime=%p cxa_guard_acquire=%p cxa_guard_release=%p cxa_guard_abort=%p string_init=%p string_append=%p string_push=%p string_find=%p string_compare=%p string_size=%p string_length=%p string_empty=%p string_cstr=%p string_data=%p string_capacity=%p string_clear=%p string_reserve=%p string_resize=%p string_resize_fill=%p string_ctor=%p string_assign=%p string_dtor=%p vector_size=%p vector_capacity=%p vector_empty=%p vector_data=%p vector_clear=%p vector_reserve=%p vector_resize_fill=%p vector_begin=%p vector_end=%p vector_index=%p vector_front=%p vector_back=%p vector_push=%p vector_pop=%p vector_ctor=%p vector_copy=%p vector_assign=%p vector_dtor=%p\n",
+        "compat startup glue dlsym ptrs mlock=%p munlock=%p madvise=%p pthread_sigmask=%p pthread_threadid_np=%p issetugid=%p execl=%p system=%p next_prime=%p cxa_guard_acquire=%p cxa_guard_release=%p cxa_guard_abort=%p string_init=%p string_append=%p string_push=%p string_find=%p string_compare=%p string_size=%p string_length=%p string_empty=%p string_cstr=%p string_data=%p string_capacity=%p string_clear=%p string_reserve=%p string_resize=%p string_resize_fill=%p string_ctor=%p string_assign=%p string_dtor=%p vector_size=%p vector_capacity=%p vector_empty=%p vector_data=%p vector_clear=%p vector_reserve=%p vector_resize_fill=%p vector_begin=%p vector_end=%p vector_index=%p vector_front=%p vector_back=%p vector_push=%p vector_pop=%p vector_ctor=%p vector_copy=%p vector_assign=%p vector_dtor=%p\n",
         (void *)dyn_mlock,
         (void *)dyn_munlock,
         (void *)dyn_madvise,
         (void *)dyn_pthread_sigmask,
+        (void *)dyn_pthread_threadid_np,
         (void *)dyn_issetugid,
         (void *)dyn_execl,
+        (void *)dyn_system,
         (void *)dyn_next_prime,
         (void *)dyn_cxa_guard_acquire,
         (void *)dyn_cxa_guard_release,
@@ -1399,7 +1421,7 @@ int main(void) {
         (void *)dyn_vector_dtor
     );
 
-    if (!dyn_mlock || !dyn_munlock || !dyn_madvise || !dyn_pthread_sigmask || !dyn_issetugid || !dyn_execl || !dyn_next_prime || !dyn_cxa_guard_acquire || !dyn_cxa_guard_release || !dyn_cxa_guard_abort || !dyn_string_init || !dyn_string_append_cstr_len || !dyn_string_push_back || !dyn_string_find_char || !dyn_string_compare || !dyn_string_size || !dyn_string_length || !dyn_string_empty || !dyn_string_c_str || !dyn_string_data || !dyn_string_capacity || !dyn_string_clear || !dyn_string_reserve || !dyn_string_resize || !dyn_string_resize_fill || !dyn_string_default_ctor || !dyn_string_assign_string || !dyn_string_dtor || !dyn_vector_size || !dyn_vector_capacity || !dyn_vector_empty || !dyn_vector_data || !dyn_vector_clear || !dyn_vector_reserve || !dyn_vector_resize_fill || !dyn_vector_begin || !dyn_vector_end || !dyn_vector_index || !dyn_vector_front || !dyn_vector_back || !dyn_vector_push_back || !dyn_vector_pop_back || !dyn_vector_default_ctor || !dyn_vector_copy || !dyn_vector_assign || !dyn_vector_dtor) {
+    if (!dyn_mlock || !dyn_munlock || !dyn_madvise || !dyn_pthread_sigmask || !dyn_pthread_threadid_np || !dyn_issetugid || !dyn_execl || !dyn_system || !dyn_next_prime || !dyn_cxa_guard_acquire || !dyn_cxa_guard_release || !dyn_cxa_guard_abort || !dyn_string_init || !dyn_string_append_cstr_len || !dyn_string_push_back || !dyn_string_find_char || !dyn_string_compare || !dyn_string_size || !dyn_string_length || !dyn_string_empty || !dyn_string_c_str || !dyn_string_data || !dyn_string_capacity || !dyn_string_clear || !dyn_string_reserve || !dyn_string_resize || !dyn_string_resize_fill || !dyn_string_default_ctor || !dyn_string_assign_string || !dyn_string_dtor || !dyn_vector_size || !dyn_vector_capacity || !dyn_vector_empty || !dyn_vector_data || !dyn_vector_clear || !dyn_vector_reserve || !dyn_vector_resize_fill || !dyn_vector_begin || !dyn_vector_end || !dyn_vector_index || !dyn_vector_front || !dyn_vector_back || !dyn_vector_push_back || !dyn_vector_pop_back || !dyn_vector_default_ctor || !dyn_vector_copy || !dyn_vector_assign || !dyn_vector_dtor) {
         return 2;
     }
     failures += exercise_startup_glue(
@@ -1408,8 +1430,10 @@ int main(void) {
         dyn_munlock,
         dyn_madvise,
         dyn_pthread_sigmask,
+        dyn_pthread_threadid_np,
         dyn_issetugid,
         dyn_execl,
+        dyn_system,
         dyn_next_prime,
         dyn_cxa_guard_acquire,
         dyn_cxa_guard_release,
@@ -5653,7 +5677,7 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
         .arg("--compat-log")
         .arg("verbose")
         .arg("--compat-log-filter")
-        .arg("mlock,munlock,madvise,pthread_sigmask,issetugid,issetguid,execl,next_prime,cxa_guard_acquire,cxa_guard_release,cxa_guard_abort")
+        .arg("mlock,munlock,madvise,pthread_sigmask,pthread_threadid_np,issetugid,issetguid,execl,system,next_prime,cxa_guard_acquire,cxa_guard_release,cxa_guard_abort")
         .arg(&fixture)
         .env("COMPATRA_PLUGIN_TRACE", "1")
         .env("COMPATRA_TRACE_FORMAT", "jsonl")
@@ -5677,7 +5701,7 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
         .join(" | ");
 
     eprintln!(
-        "compat proof(startup glue): command={} --mode compat --compat-log verbose --compat-log-filter mlock,munlock,madvise,pthread_sigmask,issetugid,issetguid,execl,next_prime,cxa_guard_acquire,cxa_guard_release,cxa_guard_abort {}",
+        "compat proof(startup glue): command={} --mode compat --compat-log verbose --compat-log-filter mlock,munlock,madvise,pthread_sigmask,pthread_threadid_np,issetugid,issetguid,execl,system,next_prime,cxa_guard_acquire,cxa_guard_release,cxa_guard_abort {}",
         compatra.display(),
         fixture.display()
     );
@@ -5697,7 +5721,9 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
     assert!(
         stdout.contains("compat startup glue static mlock=0 munlock=0 madvise=0 mask=0")
             && stdout.contains("oldmask_sum=0")
+            && stdout.contains("threadid=0 thread_id=1")
             && stdout.contains("issetugid=0 execl=-1")
+            && stdout.contains("system=0")
             && stdout.contains("next_prime=1009")
             && stdout.contains("guard_first=1 guard_second=0 guard=0x1")
             && stdout.contains("guard_abort_first=1 guard_abort_second=1")
@@ -5711,8 +5737,10 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             && stdout.contains(" munlock=0x")
             && stdout.contains(" madvise=0x")
             && stdout.contains(" pthread_sigmask=0x")
+            && stdout.contains(" pthread_threadid_np=0x")
             && stdout.contains(" issetugid=0x")
             && stdout.contains(" execl=0x")
+            && stdout.contains(" system=0x")
             && stdout.contains(" next_prime=0x")
             && stdout.contains(" cxa_guard_acquire=0x")
             && stdout.contains(" cxa_guard_release=0x")
@@ -5758,7 +5786,9 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
     assert!(
         stdout.contains("compat startup glue dlsym mlock=0 munlock=0 madvise=0 mask=0")
             && stdout.contains("oldmask_sum=0")
+            && stdout.contains("threadid=0 thread_id=1")
             && stdout.contains("issetugid=0 execl=-1")
+            && stdout.contains("system=0")
             && stdout.contains("next_prime=1009")
             && stdout.contains("guard_first=1 guard_second=0 guard=0x1")
             && stdout.contains("guard_abort_first=1 guard_abort_second=1")
@@ -5774,8 +5804,11 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
         "\"Call\":\"munlock\"",
         "\"Call\":\"madvise\"",
         "\"Call\":\"pthread_sigmask\"",
+        "\"Call\":\"pthread_threadid_np\"",
         "issetugid",
         "\"Call\":\"execl\"",
+        "\"Call\":\"system\"",
+        "\"Command\":\"exit 0\"",
         "\"Call\":\"next_prime\"",
         "\"Symbol\":\"__next_prime\"",
         "__cxa_guard_acquire",

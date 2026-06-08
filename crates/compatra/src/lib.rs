@@ -438,6 +438,8 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     PthreadThreadingNp,
     #[cfg(target_os = "macos")]
+    PthreadThreadIdNp,
+    #[cfg(target_os = "macos")]
     PthreadSigmask,
     #[cfg(target_os = "macos")]
     NSGetExecutablePath,
@@ -453,6 +455,8 @@ enum HostImportKind {
     Execve,
     #[cfg(target_os = "macos")]
     Execvp,
+    #[cfg(target_os = "macos")]
+    System,
     #[cfg(target_os = "macos")]
     GetProgName,
     #[cfg(target_os = "macos")]
@@ -951,6 +955,9 @@ impl CompatibilityServices {
                     Some(self.getentropy(memory, args[0], args[1] as usize)?.into())
                 }
                 HostImportKind::PthreadThreadingNp => Some(proxy_host_pthread_threading_np()),
+                HostImportKind::PthreadThreadIdNp => {
+                    Some(proxy_guest_pthread_threadid_np(memory, args[0], args[1])?)
+                }
                 HostImportKind::PthreadSigmask => Some(proxy_guest_pthread_sigmask(
                     memory, args[0], args[1], args[2],
                 )?),
@@ -973,6 +980,7 @@ impl CompatibilityServices {
                 HostImportKind::Execvp => Some(proxy_guest_execv(
                     memory, "execvp", args[0], args[1], 0, true,
                 )?),
+                HostImportKind::System => Some(proxy_guest_system(memory, args[0])?),
                 HostImportKind::GetProgName => Some(host_call_value(
                     memory
                         .guest_program_name_ptr()
@@ -1039,6 +1047,14 @@ impl CompatibilityServices {
                 for (name, value) in sockaddr_log_fields(memory, args[1], args[2]) {
                     log_arg_pairs.push((name.to_string(), value));
                 }
+            }
+            if matches!(kind, HostImportKind::System) {
+                let command = if args[0] == 0 {
+                    "<null>".to_string()
+                } else {
+                    read_cstring(memory, args[0], 4096).unwrap_or_else(|_| "<invalid>".to_string())
+                };
+                log_arg_pairs.push(("Command".to_string(), command));
             }
             let log_args = log_arg_pairs
                 .iter()
@@ -1772,6 +1788,20 @@ fn proxy_host_pthread_threading_np() -> HostCallResult {
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_guest_pthread_threadid_np<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    thread: u64,
+    thread_id_ptr: u64,
+) -> Option<HostCallResult> {
+    if thread_id_ptr == 0 {
+        return Some(host_call_error(libc::EINVAL as u32));
+    }
+    let thread_id = if thread == 0 { 1 } else { thread };
+    write_guest_u64(memory, thread_id_ptr, thread_id).ok()?;
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_cxx_import<M: GuestMemory + ?Sized>(
     kind: CxxImportKind,
     memory: &mut M,
@@ -2270,6 +2300,49 @@ fn emit_exec_model_log(
     fields.push(("return_hex", Some(format!("0x{:X}", result.return_value))));
     fields.push(("errno", result.errno.map(|errno| errno.to_string())));
     emit_verbose_compat_payload("process", call, &log_args, &mut fields, None);
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_system<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    command_ptr: u64,
+) -> Option<HostCallResult> {
+    if command_ptr == 0 {
+        return Some(host_call_value(1));
+    }
+    let command = match read_cstring(memory, command_ptr, 4096) {
+        Ok(command) => command,
+        Err(_) => return Some(host_call_error(libc::EFAULT as u32)),
+    };
+    let mut fields = vec![
+        ("Command", Some(command.clone())),
+        ("Shell", Some("/bin/sh".to_string())),
+    ];
+    let result = match Command::new("/bin/sh").arg("-c").arg(&command).status() {
+        Ok(status) => {
+            let wait_status = status
+                .code()
+                .map(|code| ((code as u64) & 0xff) << 8)
+                .or_else(|| status.signal().map(|signal| signal as u64))
+                .unwrap_or(0);
+            fields.push(("ExitStatus", Some(wait_status.to_string())));
+            fields.push(("Model", Some("shell-wait".to_string())));
+            host_call_value(wait_status)
+        }
+        Err(error) => {
+            let errno = io_error_errno(&error);
+            fields.push(("Model", Some("spawn-error".to_string())));
+            fields.push(("Reason", Some(error.to_string())));
+            host_call_error(errno)
+        }
+    };
+    emit_exec_model_log(
+        "system",
+        vec![("command", hex_arg(command_ptr))],
+        fields,
+        &result,
+    );
+    Some(result)
 }
 
 #[cfg(target_os = "macos")]
@@ -2801,6 +2874,7 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "seekdir" => Some(HostImportKind::Seekdir),
             "getentropy" => Some(HostImportKind::GetEntropy),
             "pthread_threading_np" => Some(HostImportKind::PthreadThreadingNp),
+            "pthread_threadid_np" => Some(HostImportKind::PthreadThreadIdNp),
             "pthread_sigmask" => Some(HostImportKind::PthreadSigmask),
             "_NSGetExecutablePath" | "NSGetExecutablePath" => {
                 Some(HostImportKind::NSGetExecutablePath)
@@ -2811,6 +2885,7 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "execv" => Some(HostImportKind::Execv),
             "execve" => Some(HostImportKind::Execve),
             "execvp" => Some(HostImportKind::Execvp),
+            "system" => Some(HostImportKind::System),
             "getprogname" => Some(HostImportKind::GetProgName),
             "setprogname" => Some(HostImportKind::SetProgName),
             "_dyld_image_count" | "dyld_image_count" => Some(HostImportKind::DyldImageCount),
@@ -4954,6 +5029,7 @@ mod tests {
             assert!(compat.should_proxy_import("_seekdir"));
             assert!(compat.should_proxy_import("_getentropy"));
             assert!(compat.should_proxy_import("_pthread_threading_np"));
+            assert!(compat.should_proxy_import("_pthread_threadid_np"));
             assert!(compat.should_proxy_import("_pthread_sigmask"));
             assert!(compat.should_proxy_import("__NSGetExecutablePath"));
             assert!(compat.should_proxy_import("_NSGetExecutablePath"));
@@ -4964,6 +5040,7 @@ mod tests {
             assert!(compat.should_proxy_import("_execv"));
             assert!(compat.should_proxy_import("_execve"));
             assert!(compat.should_proxy_import("_execvp"));
+            assert!(compat.should_proxy_import("_system"));
             assert!(compat.should_proxy_import("_getprogname"));
             assert!(compat.should_proxy_import("_setprogname"));
             assert!(compat.should_proxy_import("__dyld_image_count"));
@@ -5104,6 +5181,113 @@ mod tests {
         .expect("execl argv should fall back to register arguments");
 
         assert_eq!(argv, vec!["arg0", "arg1", "arg2", "arg3"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_proxy_runs_shell_command_and_returns_wait_status() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"exit 7\0");
+
+        let result = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_system", &[0x1000, 0, 0, 0, 0, 0, 0, 0])
+            .expect("system should be proxied");
+
+        assert_eq!(result.return_value, 7 << 8);
+        assert_eq!(result.errno, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pthread_threadid_np_writes_guest_thread_id() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let mut memory = TestMemory::default();
+        let current = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "_pthread_threadid_np",
+                &[0, 0x2000, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("pthread_threadid_np should be proxied");
+        assert_eq!(current.return_value, 0);
+        assert_eq!(
+            read_u64_at(&memory.read_memory(0x2000, 8).unwrap(), 0),
+            Some(1)
+        );
+
+        let explicit = CompatibilityServices
+            .proxy_arm64_import(
+                &mut memory,
+                "_pthread_threadid_np",
+                &[42, 0x3000, 0, 0, 0, 0, 0, 0],
+            )
+            .expect("explicit pthread_threadid_np should be proxied");
+        assert_eq!(explicit.return_value, 0);
+        assert_eq!(
+            read_u64_at(&memory.read_memory(0x3000, 8).unwrap(), 0),
+            Some(42)
+        );
     }
 
     #[cfg(target_os = "macos")]

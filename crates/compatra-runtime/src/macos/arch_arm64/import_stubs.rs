@@ -193,6 +193,7 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_pthread_self"
             | "_pthread_setname_np"
             | "_pthread_setspecific"
+            | "_pthread_threadid_np"
             | "_read"
             | "_readdir_r"
             | "_realloc"
@@ -295,6 +296,10 @@ mod tests {
             "_pthread_once",
             RuntimeMode::Compat
         ));
+        assert!(arm64_import_has_runtime_hook(
+            "_pthread_threadid_np",
+            RuntimeMode::Compat
+        ));
         assert!(arm64_import_has_runtime_hook("__Znwm", RuntimeMode::Compat));
         assert!(!arm64_import_has_runtime_hook(
             "_future_unhandled_import",
@@ -312,6 +317,17 @@ mod tests {
             "_open",
             RuntimeMode::Compat
         ));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!arm64_import_can_resolve_to_guest_library(
+                "_mkdir",
+                RuntimeMode::Compat
+            ));
+            assert!(!arm64_import_can_resolve_to_guest_library(
+                "_system",
+                RuntimeMode::Compat
+            ));
+        }
         assert!(!arm64_import_can_resolve_to_guest_library(
             "_CFStringCreateWithBytes",
             RuntimeMode::Compat

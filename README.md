@@ -1,6 +1,6 @@
 # Compatra
 
-`Compatra` is a Rust compatibility runner for macOS `arm64` Mach-O userland
+`Compatra` is a compatibility runner for macOS `arm64` Mach-O userland
 binaries on Intel macOS hosts. The workspace also includes `Machoscope`, an
 analysis-capable runner for malware-analysis workflows over the same runtime.
 
@@ -89,7 +89,7 @@ Useful knobs:
 - `COMPATRA_INDIRECT_BRANCH_MODE=sanitize`: enable indirect-branch sanitizers for debugging signed or tagged branch targets
 - `COMPATRA_PROFILE=default`: default; 60s timeout, 50M instruction budget (suitable for most samples and CI)
 - `COMPATRA_PROFILE=short`: legacy 15s / 10M-instruction budget (for tight smoke runs)
-- `COMPATRA_PROFILE=long`: 120s / 200M-instruction budget (recommended for RustDoor and other Rust binaries with large startup graphs)
+- `COMPATRA_PROFILE=long`: 120s / 200M-instruction budget (recommended for RustDoor and other binaries with large startup graphs)
 - `COMPATRA_PROFILE=extended`: 300s / 1B-instruction budget (deep analysis runs)
 - `COMPATRA_TIMEOUT_USECS` / `COMPATRA_MAX_INSTRUCTIONS`: explicit overrides; always win over the active profile
 - `COMPATRA_BYPASS_USAGE_CHECK`: sample-analysis helper for forcing selected arm64 call sites to return fixed values; supports `0xADDR=VAL0,VAL1` and optional LR filters such as `0xADDR@0xLR=VAL`

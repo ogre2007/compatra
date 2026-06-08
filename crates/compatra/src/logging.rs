@@ -338,6 +338,7 @@ fn summary_log_call(call: &str) -> bool {
             | "shutdown"
             | "getaddrinfo"
             | "getnameinfo"
+            | "system"
             | "stat"
             | "lstat"
             | "fstat"

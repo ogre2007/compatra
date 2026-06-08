@@ -480,6 +480,62 @@ pub fn install_arm64_pthread_imports(
         )?;
     }
 
+    if let Some(&addr) = stub_map.get("_pthread_threadid_np") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut compatra_runtime::UnicornEmulator, _address: u64, _size: u32| {
+                let requested_thread = emu.read_reg("x0").unwrap_or(0);
+                let thread_id_ptr = emu.read_reg("x1").unwrap_or(0);
+                let current_thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let thread_id = if requested_thread == 0 {
+                    current_thread_id
+                } else {
+                    requested_thread
+                };
+                let result = if thread_id_ptr == 0 {
+                    libc::EINVAL as u64
+                } else if emu
+                    .write_memory(thread_id_ptr, &thread_id.to_le_bytes())
+                    .is_ok()
+                {
+                    0
+                } else {
+                    libc::EFAULT as u64
+                };
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_threadid_np(thread=0x{:X}, out=0x{:X}) -> {} tid={}",
+                        requested_thread, thread_id_ptr, result, thread_id
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, current_thread_id),
+                    "pthread-threadid-np",
+                    "pthread_threadid_np",
+                )
+                .arg("RequestedThread", format!("0x{:X}", requested_thread))
+                .arg("ThreadIdPtr", format!("0x{:X}", thread_id_ptr))
+                .arg("ThreadId", thread_id.to_string())
+                .arg("Result", result.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
     if let Some(&addr) = stub_map.get("_pthread_setname_np") {
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
