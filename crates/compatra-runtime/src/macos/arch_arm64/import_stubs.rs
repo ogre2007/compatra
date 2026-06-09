@@ -332,6 +332,12 @@ mod tests {
                 "_system",
                 RuntimeMode::Compat
             ));
+            for symbol in ["_getpwuid", "_getpwnam", "_getlogin_r", "_getgroups"] {
+                assert!(!arm64_import_can_resolve_to_guest_library(
+                    symbol,
+                    RuntimeMode::Compat
+                ));
+            }
         }
         assert!(!arm64_import_can_resolve_to_guest_library(
             "_CFStringCreateWithBytes",

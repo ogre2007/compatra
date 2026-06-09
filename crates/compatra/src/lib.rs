@@ -2,6 +2,7 @@
 
 mod cxx;
 mod filesystem;
+mod identity;
 mod logging;
 mod mode;
 mod network;
@@ -313,6 +314,16 @@ enum HostImportKind {
     GetGid,
     #[cfg(target_os = "macos")]
     GetEgid,
+    #[cfg(target_os = "macos")]
+    GetLogin,
+    #[cfg(target_os = "macos")]
+    GetLoginR,
+    #[cfg(target_os = "macos")]
+    GetPwUid,
+    #[cfg(target_os = "macos")]
+    GetPwNam,
+    #[cfg(target_os = "macos")]
+    GetGroups,
     #[cfg(target_os = "macos")]
     SysConf,
     #[cfg(target_os = "macos")]
@@ -871,6 +882,13 @@ impl CompatibilityServices {
                 HostImportKind::GetEuid => Some(self.geteuid()?),
                 HostImportKind::GetGid => Some(self.getgid()?),
                 HostImportKind::GetEgid => Some(self.getegid()?),
+                HostImportKind::GetLogin => Some(self.getlogin_name(memory)?),
+                HostImportKind::GetLoginR => Some(self.getlogin_r_name(memory, args[0], args[1])?),
+                HostImportKind::GetPwUid => Some(self.getpwuid_entry(memory, args[0])?),
+                HostImportKind::GetPwNam => Some(self.getpwnam_entry(memory, args[0])?),
+                HostImportKind::GetGroups => {
+                    Some(self.getgroups_list(memory, args[0], args[1])?.into())
+                }
                 HostImportKind::SysConf => Some(self.sysconf(args[0])?),
                 HostImportKind::GetPageSize => Some(self.getpagesize()?),
                 HostImportKind::GetHostName => {
@@ -1079,6 +1097,14 @@ impl CompatibilityServices {
                 };
                 log_arg_pairs.push(("Command".to_string(), command));
                 log_arg_pairs.push(("Mode".to_string(), mode));
+            }
+            if matches!(kind, HostImportKind::GetPwNam) {
+                let name = if args[0] == 0 {
+                    "<null>".to_string()
+                } else {
+                    read_cstring(memory, args[0], 1024).unwrap_or_else(|_| "<invalid>".to_string())
+                };
+                log_arg_pairs.push(("Name".to_string(), name));
             }
             let log_args = log_arg_pairs
                 .iter()
@@ -2835,6 +2861,11 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "geteuid" => Some(HostImportKind::GetEuid),
             "getgid" => Some(HostImportKind::GetGid),
             "getegid" => Some(HostImportKind::GetEgid),
+            "getlogin" => Some(HostImportKind::GetLogin),
+            "getlogin_r" => Some(HostImportKind::GetLoginR),
+            "getpwuid" => Some(HostImportKind::GetPwUid),
+            "getpwnam" => Some(HostImportKind::GetPwNam),
+            "getgroups" => Some(HostImportKind::GetGroups),
             "sysconf" => Some(HostImportKind::SysConf),
             "getpagesize" => Some(HostImportKind::GetPageSize),
             "gethostname" => Some(HostImportKind::GetHostName),
@@ -4941,6 +4972,11 @@ mod tests {
             assert!(compat.should_proxy_import("_geteuid"));
             assert!(compat.should_proxy_import("_getgid"));
             assert!(compat.should_proxy_import("_getegid"));
+            assert!(compat.should_proxy_import("_getlogin"));
+            assert!(compat.should_proxy_import("_getlogin_r"));
+            assert!(compat.should_proxy_import("_getpwuid"));
+            assert!(compat.should_proxy_import("_getpwnam"));
+            assert!(compat.should_proxy_import("_getgroups"));
             assert!(compat.should_proxy_import("_sysconf"));
             assert!(compat.should_proxy_import("_gethostname"));
             assert!(compat.should_proxy_import("_uname"));

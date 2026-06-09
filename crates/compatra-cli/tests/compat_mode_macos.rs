@@ -132,6 +132,84 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_identity_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_identity.c");
+    let binary = out_dir.join("arm64_identity");
+    fs::write(
+        &source,
+        r#"#include <errno.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+int main(void) {
+    uid_t uid = getuid();
+    struct passwd *pw = getpwuid(uid);
+    int pw_ok = pw && pw->pw_name && pw->pw_dir && pw->pw_shell;
+    struct passwd *by_name = pw_ok ? getpwnam(pw->pw_name) : 0;
+    int pwnam_ok = by_name && by_name->pw_uid == uid;
+
+    char login[256];
+    memset(login, 0, sizeof(login));
+    int login_ret = getlogin_r(login, sizeof(login));
+
+    int group_count = getgroups(0, 0);
+    gid_t groups[32];
+    memset(groups, 0, sizeof(groups));
+    int group_limit = group_count > 32 ? 32 : group_count;
+    int group_read = group_limit > 0 ? getgroups(group_limit, groups) : group_count;
+
+    int ok = pw_ok && pwnam_ok && login_ret == 0 && login[0] != 0 && group_count >= 0 && group_read >= 0;
+    printf(
+        "compat identity uid=%u pw=%d name=%s dir=%s shell=%s pwnam=%d login_ret=%d login=%s groups=%d read=%d ok=%d\n",
+        (unsigned)uid,
+        pw_ok,
+        pw_ok ? pw->pw_name : "<null>",
+        pw_ok ? pw->pw_dir : "<null>",
+        pw_ok ? pw->pw_shell : "<null>",
+        pwnam_ok,
+        login_ret,
+        login,
+        group_count,
+        group_read,
+        ok
+    );
+    return ok ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 identity fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 identity fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 identity fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_printf_varargs_fixture() -> PathBuf {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -5129,6 +5207,89 @@ fn compat_mode_runs_fresh_arm64_write_program() {
         !stderr.contains("\"Call\":\"dlopen\"") && !stderr.contains("\"Call\":\"dlsym\""),
         "compat log filter leaked unrequested dynamic loader calls; stderr:\n{stderr}"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_proxies_host_user_identity_imports() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode identity test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_identity_fixture();
+    let compatra = compatra_binary();
+    let output = Command::new(&compatra)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("verbose")
+        .arg("--compat-log-filter")
+        .arg("getuid,getpwuid,getpwnam,getlogin_r,getgroups")
+        .arg(&fixture)
+        .env("COMPATRA_PLUGIN_TRACE", "1")
+        .env("COMPATRA_TRACE_FORMAT", "jsonl")
+        .env("COMPATRA_PROFILE", "short")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch compatra binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("compatra stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(identity): command={} --mode compat --compat-log verbose --compat-log-filter getuid,getpwuid,getpwnam,getlogin_r,getgroups {}",
+        compatra.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(identity): status={status}");
+    eprintln!("compat proof(identity): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!(
+            "compat proof(identity): stderr excerpt:\n{}",
+            stderr_log_excerpt(&stderr, 12)
+        );
+    }
+
+    assert!(
+        status.success(),
+        "compatra exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("compat identity") && stdout.contains(" ok=1"),
+        "identity fixture did not observe host-backed passwd/login/group data; stdout:\n{stdout}"
+    );
+    for fragment in [
+        "\"Call\":\"getuid\"",
+        "\"Call\":\"getpwuid\"",
+        "\"Call\":\"getpwnam\"",
+        "\"Call\":\"getlogin_r\"",
+        "\"Call\":\"getgroups\"",
+        "\"Model\":\"host-userdb\"",
+        "\"Dir\":\"",
+        "\"Shell\":\"",
+    ] {
+        assert!(
+            stderr.contains(fragment),
+            "compat identity log did not contain fragment {fragment:?}; stderr:\n{stderr}"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
