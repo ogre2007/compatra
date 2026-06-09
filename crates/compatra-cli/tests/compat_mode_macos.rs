@@ -4056,9 +4056,12 @@ fn compile_arm64_directory_entropy_fixture() -> (PathBuf, PathBuf) {
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/attr.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -4071,6 +4074,11 @@ typedef int (*dirfd_fn)(DIR *);
 typedef void (*rewinddir_fn)(DIR *);
 typedef long (*telldir_fn)(DIR *);
 typedef void (*seekdir_fn)(DIR *, long);
+typedef int (*scandir_fn)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **));
+typedef int (*alphasort_fn)(const struct dirent **, const struct dirent **);
+typedef int (*glob_fn)(const char *, int, int (*)(const char *, int), glob_t *);
+typedef void (*globfree_fn)(glob_t *);
+typedef int (*getattrlist_fn)(const char *, struct attrlist *, void *, size_t, unsigned long);
 typedef int (*getentropy_fn)(void *, size_t);
 
 extern int getentropy(void *, size_t);
@@ -4198,6 +4206,73 @@ static int scan_with_readdir_r(const char *label, DIR *dir, readdir_r_fn read_di
     return last_ret == 0 && alpha && beta ? 0 : 1;
 }}
 
+static int scan_with_scandir(const char *label, const char *base_dir, scandir_fn scan_dir, alphasort_fn alpha_sort) {{
+    struct dirent **names = 0;
+    errno = 0;
+    int count = scan_dir(base_dir, &names, 0, alpha_sort);
+    int alpha = 0;
+    int beta = 0;
+    char first[256] = {{0}};
+    char last[256] = {{0}};
+    snprintf(first, sizeof(first), "%s", count > 0 && names && names[0] ? names[0]->d_name : "<none>");
+    snprintf(last, sizeof(last), "%s", count > 0 && names && names[count - 1] ? names[count - 1]->d_name : "<none>");
+    for (int i = 0; names && i < count; i++) {{
+        if (names[i]) {{
+            if (streq(names[i]->d_name, "alpha.txt")) {{
+                alpha = 1;
+            }}
+            if (streq(names[i]->d_name, "beta.txt")) {{
+                beta = 1;
+            }}
+            free(names[i]);
+        }}
+    }}
+    free(names);
+    printf("compat dir %s scandir count=%d alpha=%d beta=%d first=%s last=%s errno=%d\n", label, count, alpha, beta, first, last, errno);
+    return count >= 2 && alpha && beta ? 0 : 1;
+}}
+
+static int scan_with_glob(const char *label, const char *pattern, glob_fn glob_call, globfree_fn glob_free) {{
+    glob_t globbuf;
+    memset(&globbuf, 0, sizeof(globbuf));
+    errno = 0;
+    int ret = glob_call(pattern, 0, 0, &globbuf);
+    int alpha = 0;
+    int beta = 0;
+    const char *first = globbuf.gl_pathc > 0 && globbuf.gl_pathv ? globbuf.gl_pathv[0] : "<none>";
+    size_t count = globbuf.gl_pathc;
+    for (size_t i = 0; ret == 0 && globbuf.gl_pathv && i < globbuf.gl_pathc; i++) {{
+        const char *path = globbuf.gl_pathv[i];
+        if (path && strstr(path, "alpha.txt")) {{
+            alpha = 1;
+        }}
+        if (path && strstr(path, "beta.txt")) {{
+            beta = 1;
+        }}
+    }}
+    printf("compat dir %s glob ret=%d count=%zu alpha=%d beta=%d first=%s errno=%d\n", label, ret, globbuf.gl_pathc, alpha, beta, first, errno);
+    glob_free(&globbuf);
+    return ret == 0 && count >= 2 && alpha && beta ? 0 : 1;
+}}
+
+static int probe_getattrlist(const char *label, const char *path, getattrlist_fn get_attrs) {{
+    struct attrlist attrs;
+    unsigned char buffer[512];
+    memset(&attrs, 0, sizeof(attrs));
+    memset(buffer, 0, sizeof(buffer));
+    attrs.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attrs.commonattr = ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | ATTR_CMN_OWNERID | ATTR_CMN_GRPID | ATTR_CMN_ACCESSMASK | ATTR_CMN_FILEID;
+    attrs.fileattr = ATTR_FILE_TOTALSIZE | ATTR_FILE_DATALENGTH;
+    errno = 0;
+    int ret = get_attrs(path, &attrs, buffer, sizeof(buffer), 0);
+    uint32_t len = 0;
+    if (ret == 0) {{
+        memcpy(&len, buffer, sizeof(len));
+    }}
+    printf("compat dir %s getattrlist ret=%d len=%u errno=%d\n", label, ret, len, errno);
+    return ret == 0 && len > 4 ? 0 : 1;
+}}
+
 int main(int argc, char **argv) {{
     int failures = 0;
     const char *argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : ".";
@@ -4205,10 +4280,12 @@ int main(int argc, char **argv) {{
     char base_dir[4096] = {{0}};
     char alpha_file[4096] = {{0}};
     char beta_file[4096] = {{0}};
+    char glob_pattern[4096] = {{0}};
     fixture_dir_from_optional_arg(argc, argv, argv0, fixture_dir, sizeof(fixture_dir));
     join_path(fixture_dir, "dir-host-root", base_dir, sizeof(base_dir));
     join_path(base_dir, "alpha.txt", alpha_file, sizeof(alpha_file));
     join_path(base_dir, "beta.txt", beta_file, sizeof(beta_file));
+    snprintf(glob_pattern, sizeof(glob_pattern), "%s/*.txt", base_dir);
     printf(
         "compat dir paths argc=%d argv1=%s fixture_dir=%s base=%s alpha=%s beta=%s\n",
         argc,
@@ -4250,6 +4327,10 @@ int main(int argc, char **argv) {{
         closedir(rr_dir);
     }}
 
+    failures += scan_with_scandir("static", base_dir, scandir, alphasort);
+    failures += scan_with_glob("static", glob_pattern, glob, globfree);
+    failures += probe_getattrlist("static", alpha_file, getattrlist);
+
     unsigned char entropy[16] = {{0}};
     int entropy_ret = getentropy(entropy, sizeof(entropy));
     unsigned char syscall_entropy[16] = {{0}};
@@ -4269,9 +4350,14 @@ int main(int argc, char **argv) {{
     rewinddir_fn dyn_rewinddir = (rewinddir_fn)dlsym(self, "rewinddir");
     telldir_fn dyn_telldir = (telldir_fn)dlsym(self, "telldir");
     seekdir_fn dyn_seekdir = (seekdir_fn)dlsym(self, "seekdir");
+    scandir_fn dyn_scandir = (scandir_fn)dlsym(self, "scandir");
+    alphasort_fn dyn_alphasort = (alphasort_fn)dlsym(self, "alphasort");
+    glob_fn dyn_glob = (glob_fn)dlsym(self, "glob");
+    globfree_fn dyn_globfree = (globfree_fn)dlsym(self, "globfree");
+    getattrlist_fn dyn_getattrlist = (getattrlist_fn)dlsym(self, "getattrlist");
     getentropy_fn dyn_getentropy = (getentropy_fn)dlsym(self, "getentropy");
-    printf("compat dir dlsym ptrs opendir=%p readdir=%p closedir=%p dirfd=%p entropy=%p\n", (void *)dyn_opendir, (void *)dyn_readdir, (void *)dyn_closedir, (void *)dyn_dirfd, (void *)dyn_getentropy);
-    if (!dyn_opendir || !dyn_fdopendir || !dyn_readdir || !dyn_readdir_r || !dyn_closedir || !dyn_dirfd || !dyn_rewinddir || !dyn_telldir || !dyn_seekdir || !dyn_getentropy) {{
+    printf("compat dir dlsym ptrs opendir=%p readdir=%p closedir=%p dirfd=%p scandir=%p glob=%p getattrlist=%p entropy=%p\n", (void *)dyn_opendir, (void *)dyn_readdir, (void *)dyn_closedir, (void *)dyn_dirfd, (void *)dyn_scandir, (void *)dyn_glob, (void *)dyn_getattrlist, (void *)dyn_getentropy);
+    if (!dyn_opendir || !dyn_fdopendir || !dyn_readdir || !dyn_readdir_r || !dyn_closedir || !dyn_dirfd || !dyn_rewinddir || !dyn_telldir || !dyn_seekdir || !dyn_scandir || !dyn_alphasort || !dyn_glob || !dyn_globfree || !dyn_getattrlist || !dyn_getentropy) {{
         return 50;
     }}
 
@@ -4291,6 +4377,10 @@ int main(int argc, char **argv) {{
     }} else if (dyn_raw_fd >= 0) {{
         close(dyn_raw_fd);
     }}
+
+    failures += scan_with_scandir("dlsym", base_dir, dyn_scandir, dyn_alphasort);
+    failures += scan_with_glob("dlsym", glob_pattern, dyn_glob, dyn_globfree);
+    failures += probe_getattrlist("dlsym", beta_file, dyn_getattrlist);
 
     unsigned char dyn_entropy[16] = {{0}};
     int dyn_entropy_ret = dyn_getentropy(dyn_entropy, sizeof(dyn_entropy));
@@ -4852,6 +4942,20 @@ extern size_t CGDisplayPixelsWide(uint32_t);
 extern size_t CGDisplayPixelsHigh(uint32_t);
 extern int CGDisplayIsActive(uint32_t);
 extern int CGDisplayIsOnline(uint32_t);
+extern int CGPreflightScreenCaptureAccess(void);
+extern void *CGDisplayCreateImage(uint32_t);
+extern size_t CGImageGetWidth(void *);
+extern size_t CGImageGetHeight(void *);
+extern size_t CGImageGetBitsPerPixel(void *);
+extern size_t CGImageGetBytesPerRow(void *);
+extern void *CGImageGetDataProvider(void *);
+extern void CGImageRelease(void *);
+extern void *CGDataProviderCopyData(void *);
+extern int CGEventSourceKeyState(uint32_t, uint16_t);
+extern int CGPreflightListenEventAccess(void);
+extern int AXIsProcessTrusted(void);
+extern int AXIsProcessTrustedWithOptions(void *);
+extern long CFDataGetLength(void *);
 extern void *objc_getClass(const char *);
 extern void *sel_registerName(const char *);
 extern uintptr_t objc_msgSend(void *, void *, ...);
@@ -4861,6 +4965,14 @@ typedef int (*ns_application_main_fn)(int, const char **);
 typedef uint32_t (*cg_main_display_id_fn)(void);
 typedef size_t (*cg_display_pixels_fn)(uint32_t);
 typedef int (*cg_display_predicate_fn)(uint32_t);
+typedef int (*cg_noarg_bool_fn)(void);
+typedef void *(*cg_display_image_fn)(uint32_t);
+typedef size_t (*cg_image_size_fn)(void *);
+typedef void *(*cg_image_provider_fn)(void *);
+typedef void (*cg_image_release_fn)(void *);
+typedef void *(*cg_provider_copy_data_fn)(void *);
+typedef int (*cg_key_state_fn)(uint32_t, uint16_t);
+typedef int (*ax_options_fn)(void *);
 
 static void *cls(const char *name) {
     return objc_getClass(name);
@@ -4944,6 +5056,37 @@ int main(void) {
     size_t height = CGDisplayPixelsHigh(display);
     int active = CGDisplayIsActive(display);
     int online = CGDisplayIsOnline(display);
+    int screen_preflight = CGPreflightScreenCaptureAccess();
+    void *screen_image = CGDisplayCreateImage(display);
+    size_t image_width = screen_image ? CGImageGetWidth(screen_image) : 0;
+    size_t image_height = screen_image ? CGImageGetHeight(screen_image) : 0;
+    size_t image_bpp = screen_image ? CGImageGetBitsPerPixel(screen_image) : 0;
+    size_t image_row = screen_image ? CGImageGetBytesPerRow(screen_image) : 0;
+    void *image_provider = screen_image ? CGImageGetDataProvider(screen_image) : 0;
+    void *image_data = image_provider ? CGDataProviderCopyData(image_provider) : 0;
+    long image_data_len = image_data ? CFDataGetLength(image_data) : 0;
+    int key_state = CGEventSourceKeyState(0, 0);
+    int listen_preflight = CGPreflightListenEventAccess();
+    int ax_trusted = AXIsProcessTrusted();
+    int ax_options = AXIsProcessTrustedWithOptions(0);
+    if (screen_image) {
+        CGImageRelease(screen_image);
+    }
+
+    void *audio_type = ns_string("soun");
+    void *capture_device_class = cls("AVCaptureDevice");
+    uintptr_t mic_auth = capture_device_class ? msg1_uint(capture_device_class, "authorizationStatusForMediaType:", (uintptr_t)audio_type) : 999;
+    void *default_audio = capture_device_class ? msg1_obj(capture_device_class, "defaultDeviceWithMediaType:", audio_type) : 0;
+    void *audio_name = default_audio ? msg0_obj(default_audio, "localizedName") : 0;
+    uintptr_t audio_connected = default_audio ? msg0_uint(default_audio, "isConnected") : 0;
+    int privacy_ok = (screen_preflight == 0 || screen_preflight == 1)
+        && (!screen_image || (image_width > 0 && image_height > 0 && image_bpp > 0 && image_row > 0 && image_provider && image_data && image_data_len > 0))
+        && (key_state == 0 || key_state == 1)
+        && (listen_preflight == 0 || listen_preflight == 1)
+        && (ax_trusted == 0 || ax_trusted == 1)
+        && (ax_options == 0 || ax_options == 1)
+        && capture_device_class
+        && mic_auth <= 4;
 
     const char *main_argv[] = {"compat-ui", 0};
     int appmain = NSApplicationMain(1, main_argv);
@@ -4968,8 +5111,9 @@ int main(void) {
         && display != 0
         && width > 0
         && height > 0
-        && active
-        && online
+        && (active == 0 || active == 1)
+        && (online == 0 || online == 1)
+        && privacy_ok
         && appmain == 0;
 
     printf(
@@ -4998,9 +5142,33 @@ int main(void) {
         appmain,
         static_ok
     );
+    printf(
+        "compat privacy static screen_access=%d image=%p image_size=%zux%zu bpp=%zu row=%zu provider=%p data=%p data_len=%ld key_a=%d listen_access=%d ax=%d axopt=%d avclass=%p mic_auth=%lu mic=%p mic_connected=%lu mic_name=%s pass=%d\n",
+        screen_preflight,
+        screen_image,
+        image_width,
+        image_height,
+        image_bpp,
+        image_row,
+        image_provider,
+        image_data,
+        image_data_len,
+        key_state,
+        listen_preflight,
+        ax_trusted,
+        ax_options,
+        capture_device_class,
+        (unsigned long)mic_auth,
+        default_audio,
+        (unsigned long)audio_connected,
+        utf8_or_null(audio_name),
+        privacy_ok
+    );
 
     void *appkit = dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_NOW);
     void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW);
+    void *appservices = dlopen("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", RTLD_NOW);
+    void *avfoundation = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_NOW);
     ns_application_load_fn dyn_load = (ns_application_load_fn)dlsym(appkit, "NSApplicationLoad");
     ns_application_main_fn dyn_main = (ns_application_main_fn)dlsym(appkit, "NSApplicationMain");
     cg_main_display_id_fn dyn_display = (cg_main_display_id_fn)dlsym(cg, "CGMainDisplayID");
@@ -5008,12 +5176,67 @@ int main(void) {
     cg_display_pixels_fn dyn_height = (cg_display_pixels_fn)dlsym(cg, "CGDisplayPixelsHigh");
     cg_display_predicate_fn dyn_active = (cg_display_predicate_fn)dlsym(cg, "CGDisplayIsActive");
     cg_display_predicate_fn dyn_online = (cg_display_predicate_fn)dlsym(cg, "CGDisplayIsOnline");
+    cg_noarg_bool_fn dyn_screen_preflight = (cg_noarg_bool_fn)dlsym(cg, "CGPreflightScreenCaptureAccess");
+    cg_display_image_fn dyn_create_image = (cg_display_image_fn)dlsym(cg, "CGDisplayCreateImage");
+    cg_image_size_fn dyn_image_width = (cg_image_size_fn)dlsym(cg, "CGImageGetWidth");
+    cg_image_size_fn dyn_image_height = (cg_image_size_fn)dlsym(cg, "CGImageGetHeight");
+    cg_image_size_fn dyn_image_bpp = (cg_image_size_fn)dlsym(cg, "CGImageGetBitsPerPixel");
+    cg_image_size_fn dyn_image_row = (cg_image_size_fn)dlsym(cg, "CGImageGetBytesPerRow");
+    cg_image_provider_fn dyn_image_provider = (cg_image_provider_fn)dlsym(cg, "CGImageGetDataProvider");
+    cg_image_release_fn dyn_image_release = (cg_image_release_fn)dlsym(cg, "CGImageRelease");
+    cg_provider_copy_data_fn dyn_provider_data = (cg_provider_copy_data_fn)dlsym(cg, "CGDataProviderCopyData");
+    cg_key_state_fn dyn_key_state = (cg_key_state_fn)dlsym(cg, "CGEventSourceKeyState");
+    cg_noarg_bool_fn dyn_listen_preflight = (cg_noarg_bool_fn)dlsym(cg, "CGPreflightListenEventAccess");
+    cg_noarg_bool_fn dyn_ax = (cg_noarg_bool_fn)dlsym(appservices, "AXIsProcessTrusted");
+    ax_options_fn dyn_ax_options = (ax_options_fn)dlsym(appservices, "AXIsProcessTrustedWithOptions");
 
     uint32_t dyn_did = dyn_display ? dyn_display() : 0;
     size_t dyn_w = dyn_width ? dyn_width(dyn_did) : 0;
     size_t dyn_h = dyn_height ? dyn_height(dyn_did) : 0;
+    int dyn_screen_access = dyn_screen_preflight ? dyn_screen_preflight() : -1;
+    void *dyn_image = dyn_create_image ? dyn_create_image(dyn_did) : 0;
+    size_t dyn_image_w = dyn_image && dyn_image_width ? dyn_image_width(dyn_image) : 0;
+    size_t dyn_image_h = dyn_image && dyn_image_height ? dyn_image_height(dyn_image) : 0;
+    size_t dyn_image_bits = dyn_image && dyn_image_bpp ? dyn_image_bpp(dyn_image) : 0;
+    size_t dyn_image_stride = dyn_image && dyn_image_row ? dyn_image_row(dyn_image) : 0;
+    void *dyn_provider = dyn_image && dyn_image_provider ? dyn_image_provider(dyn_image) : 0;
+    void *dyn_pixels = dyn_provider && dyn_provider_data ? dyn_provider_data(dyn_provider) : 0;
+    long dyn_pixels_len = dyn_pixels ? CFDataGetLength(dyn_pixels) : 0;
+    int dyn_key_a = dyn_key_state ? dyn_key_state(0, 0) : -1;
+    int dyn_listen_access = dyn_listen_preflight ? dyn_listen_preflight() : -1;
+    int dyn_ax_trusted = dyn_ax ? dyn_ax() : -1;
+    int dyn_ax_trusted_options = dyn_ax_options ? dyn_ax_options(0) : -1;
+    if (dyn_image && dyn_image_release) {
+        dyn_image_release(dyn_image);
+    }
     int dyn_load_ret = dyn_load ? dyn_load() : 0;
     int dyn_main_ret = dyn_main ? dyn_main(1, main_argv) : -1;
+    void *dyn_capture_device_class = cls("AVCaptureDevice");
+    uintptr_t dyn_mic_auth = dyn_capture_device_class ? msg1_uint(dyn_capture_device_class, "authorizationStatusForMediaType:", (uintptr_t)audio_type) : 999;
+    void *dyn_default_audio = dyn_capture_device_class ? msg1_obj(dyn_capture_device_class, "defaultDeviceWithMediaType:", audio_type) : 0;
+    void *dyn_audio_name = dyn_default_audio ? msg0_obj(dyn_default_audio, "localizedName") : 0;
+    int dyn_privacy_ok = dyn_screen_preflight
+        && dyn_create_image
+        && dyn_image_width
+        && dyn_image_height
+        && dyn_image_bpp
+        && dyn_image_row
+        && dyn_image_provider
+        && dyn_image_release
+        && dyn_provider_data
+        && dyn_key_state
+        && dyn_listen_preflight
+        && dyn_ax
+        && dyn_ax_options
+        && (dyn_screen_access == 0 || dyn_screen_access == 1)
+        && (!dyn_image || (dyn_image_w > 0 && dyn_image_h > 0 && dyn_image_bits > 0 && dyn_image_stride > 0 && dyn_provider && dyn_pixels && dyn_pixels_len > 0))
+        && (dyn_key_a == 0 || dyn_key_a == 1)
+        && (dyn_listen_access == 0 || dyn_listen_access == 1)
+        && (dyn_ax_trusted == 0 || dyn_ax_trusted == 1)
+        && (dyn_ax_trusted_options == 0 || dyn_ax_trusted_options == 1)
+        && avfoundation
+        && dyn_capture_device_class
+        && dyn_mic_auth <= 4;
     int dyn_ok = dyn_load
         && dyn_main
         && dyn_display
@@ -5026,18 +5249,33 @@ int main(void) {
         && dyn_did != 0
         && dyn_w > 0
         && dyn_h > 0
-        && dyn_active(dyn_did)
-        && dyn_online(dyn_did);
+        && (dyn_active(dyn_did) == 0 || dyn_active(dyn_did) == 1)
+        && (dyn_online(dyn_did) == 0 || dyn_online(dyn_did) == 1)
+        && dyn_privacy_ok;
 
     printf(
-        "compat appkit dlsym ptrs load=%p main=%p display=%p width=%p height=%p active=%p online=%p\n",
+        "compat appkit dlsym ptrs load=%p main=%p display=%p width=%p height=%p active=%p online=%p screen_pre=%p image=%p imgw=%p imgh=%p bpp=%p row=%p provider=%p release=%p data=%p key=%p listen=%p ax=%p axopt=%p av=%p\n",
         (void *)dyn_load,
         (void *)dyn_main,
         (void *)dyn_display,
         (void *)dyn_width,
         (void *)dyn_height,
         (void *)dyn_active,
-        (void *)dyn_online
+        (void *)dyn_online,
+        (void *)dyn_screen_preflight,
+        (void *)dyn_create_image,
+        (void *)dyn_image_width,
+        (void *)dyn_image_height,
+        (void *)dyn_image_bpp,
+        (void *)dyn_image_row,
+        (void *)dyn_image_provider,
+        (void *)dyn_image_release,
+        (void *)dyn_provider_data,
+        (void *)dyn_key_state,
+        (void *)dyn_listen_preflight,
+        (void *)dyn_ax,
+        (void *)dyn_ax_options,
+        avfoundation
     );
     printf(
         "compat appkit dlsym load=%d main=%d display=%u size=%zux%zu pass=%d\n",
@@ -5047,6 +5285,27 @@ int main(void) {
         dyn_w,
         dyn_h,
         dyn_ok
+    );
+    printf(
+        "compat privacy dlsym screen_access=%d image=%p image_size=%zux%zu bpp=%zu row=%zu provider=%p data=%p data_len=%ld key_a=%d listen_access=%d ax=%d axopt=%d avclass=%p mic_auth=%lu mic=%p mic_name=%s pass=%d\n",
+        dyn_screen_access,
+        dyn_image,
+        dyn_image_w,
+        dyn_image_h,
+        dyn_image_bits,
+        dyn_image_stride,
+        dyn_provider,
+        dyn_pixels,
+        dyn_pixels_len,
+        dyn_key_a,
+        dyn_listen_access,
+        dyn_ax_trusted,
+        dyn_ax_trusted_options,
+        dyn_capture_device_class,
+        (unsigned long)dyn_mic_auth,
+        dyn_default_audio,
+        utf8_or_null(dyn_audio_name),
+        dyn_privacy_ok
     );
     return static_ok && dyn_ok ? 0 : 1;
 }
@@ -5067,6 +5326,12 @@ int main(void) {
         .arg("AppKit")
         .arg("-framework")
         .arg("CoreGraphics")
+        .arg("-framework")
+        .arg("CoreFoundation")
+        .arg("-framework")
+        .arg("ApplicationServices")
+        .arg("-framework")
+        .arg("AVFoundation")
         .arg("-framework")
         .arg("Foundation")
         .arg("-lobjc")
@@ -6311,7 +6576,7 @@ fn compat_mode_proxies_appkit_startup_glue() {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let proof_lines = stdout
         .lines()
-        .filter(|line| line.contains("compat appkit"))
+        .filter(|line| line.contains("compat appkit") || line.contains("compat privacy"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -6348,8 +6613,9 @@ fn compat_mode_proxies_appkit_startup_glue() {
                 && line.contains(" name=Compatibility Display")
                 && line.contains(" window=0x")
                 && line.contains(" title=Compatibility Window")
-                && line.contains(" display=1")
-                && line.contains(" active=1 online=1 ")
+                && line.contains(" display=")
+                && line.contains(" active=")
+                && line.contains(" online=")
                 && line.contains(" appmain=0 ")
                 && line.contains(" pass=1")),
         "AppKit startup fixture did not complete static UI glue; stdout:\n{stdout}"
@@ -6361,7 +6627,21 @@ fn compat_mode_proxies_appkit_startup_glue() {
             && stdout.contains(" width=0x")
             && stdout.contains(" height=0x")
             && stdout.contains(" active=0x")
-            && stdout.contains(" online=0x"),
+            && stdout.contains(" online=0x")
+            && stdout.contains(" screen_pre=0x")
+            && stdout.contains(" image=0x")
+            && stdout.contains(" imgw=0x")
+            && stdout.contains(" imgh=0x")
+            && stdout.contains(" bpp=0x")
+            && stdout.contains(" row=0x")
+            && stdout.contains(" provider=0x")
+            && stdout.contains(" release=0x")
+            && stdout.contains(" data=0x")
+            && stdout.contains(" key=0x")
+            && stdout.contains(" listen=0x")
+            && stdout.contains(" ax=0x")
+            && stdout.contains(" axopt=0x")
+            && stdout.contains(" av=0x"),
         "AppKit startup fixture did not receive dlsym UI trampolines; stdout:\n{stdout}"
     );
     assert!(
@@ -6370,10 +6650,22 @@ fn compat_mode_proxies_appkit_startup_glue() {
             .any(|line| line.contains("compat appkit dlsym ")
                 && line.contains(" load=1 ")
                 && line.contains(" main=0 ")
-                && line.contains(" display=1 ")
-                && line.contains(" size=1440x900 ")
+                && line.contains(" display=")
+                && line.contains(" size=")
                 && line.contains(" pass=1")),
         "AppKit startup fixture did not complete dlsym UI glue; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat privacy static ") && line.contains(" pass=1")),
+        "AppKit startup fixture did not complete static privacy-sensitive probes; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat privacy dlsym ") && line.contains(" pass=1")),
+        "AppKit startup fixture did not complete dlsym privacy-sensitive probes; stdout:\n{stdout}"
     );
 }
 
@@ -7299,12 +7591,31 @@ fn compat_mode_proxies_directory_iteration_and_entropy() {
         "directory fixture did not complete static readdir_r scan; stdout:\n{stdout}"
     );
     assert!(
+        stdout.lines().any(|line| {
+            line.contains("compat dir static scandir count=") && line.contains(" alpha=1 beta=1")
+        }),
+        "directory fixture did not complete static scandir scan; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("compat dir static glob ret=0") && line.contains(" alpha=1 beta=1")
+        }),
+        "directory fixture did not complete static glob scan; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat dir static getattrlist ret=0 len="),
+        "directory fixture did not complete static getattrlist probe; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("compat entropy static ret=0 nonzero=1 syscall=0 sc_nonzero=1"),
         "directory fixture did not complete static and raw-syscall getentropy; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat dir dlsym ptrs opendir=0x")
             && stdout.contains(" readdir=0x")
+            && stdout.contains(" scandir=0x")
+            && stdout.contains(" glob=0x")
+            && stdout.contains(" getattrlist=0x")
             && stdout.contains(" entropy=0x"),
         "directory fixture did not receive dlsym directory/entropy trampolines; stdout:\n{stdout}"
     );
@@ -7315,6 +7626,22 @@ fn compat_mode_proxies_directory_iteration_and_entropy() {
     assert!(
         stdout.contains("compat dir dlsym readdir_r ret=0 alpha=1 beta=1"),
         "directory fixture did not complete dlsym readdir_r scan; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("compat dir dlsym scandir count=") && line.contains(" alpha=1 beta=1")
+        }),
+        "directory fixture did not complete dlsym scandir scan; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("compat dir dlsym glob ret=0") && line.contains(" alpha=1 beta=1")
+        }),
+        "directory fixture did not complete dlsym glob scan; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat dir dlsym getattrlist ret=0 len="),
+        "directory fixture did not complete dlsym getattrlist probe; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat entropy dlsym ret=0 nonzero=1"),

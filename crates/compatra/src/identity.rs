@@ -6,8 +6,8 @@ use crate::{CompatibilityServices, GuestMemory, HostCallResult, HostIoResult};
 use crate::logging::{emit_verbose_compat_payload, hex_arg};
 #[cfg(target_os = "macos")]
 use crate::{
-    clear_errno, host_call_error, host_call_result, host_call_value, host_errno, host_io_error,
-    host_io_result, read_cstring,
+    clear_errno, host_call_error, host_call_value, host_errno, host_io_error, host_io_result,
+    read_cstring,
 };
 
 #[cfg(target_os = "macos")]

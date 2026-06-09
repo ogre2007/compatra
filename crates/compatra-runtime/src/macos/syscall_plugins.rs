@@ -1506,15 +1506,51 @@ pub fn handle_basic_macos_syscall(
             let attrlist_ptr = invocation.args[1];
             let buffer_ptr = invocation.args[2];
             let buffer_size = invocation.args[3] as usize;
-            if buffer_size >= 4 {
-                write_guest_u32(emu, buffer_ptr, 4);
+            let options = invocation.args[4];
+            if let Some(compat) = CompatibilityServices::for_mode(runtime.runtime_mode) {
+                let result = if invocation.num == SYSCALL_GETATTRLIST {
+                    compat.getattrlist_path(
+                        emu,
+                        subject,
+                        attrlist_ptr,
+                        buffer_ptr,
+                        buffer_size,
+                        options,
+                    )
+                } else {
+                    compat.fgetattrlist_fd(
+                        emu,
+                        subject,
+                        attrlist_ptr,
+                        buffer_ptr,
+                        buffer_size,
+                        options,
+                    )
+                };
+                if let Some(result) = result {
+                    return_value = result.return_value;
+                    event = event
+                        .arg("HostProxy", "true")
+                        .arg("Subject", format!("0x{:X}", subject))
+                        .arg("AttrList", format!("0x{:X}", attrlist_ptr))
+                        .arg("Buffer", format!("0x{:X}", buffer_ptr))
+                        .arg("BufferSize", buffer_size.to_string())
+                        .arg("Options", format!("0x{:X}", options))
+                        .arg("Result", return_value.to_string())
+                        .arg("Errno", result.errno.to_string())
+                        .arg("Transferred", result.transferred.to_string());
+                }
+            } else {
+                if buffer_size >= 4 {
+                    write_guest_u32(emu, buffer_ptr, 4);
+                }
+                event = event
+                    .arg("Subject", format!("0x{:X}", subject))
+                    .arg("AttrList", format!("0x{:X}", attrlist_ptr))
+                    .arg("Buffer", format!("0x{:X}", buffer_ptr))
+                    .arg("BufferSize", buffer_size.to_string())
+                    .arg("Result", "0");
             }
-            event = event
-                .arg("Subject", format!("0x{:X}", subject))
-                .arg("AttrList", format!("0x{:X}", attrlist_ptr))
-                .arg("Buffer", format!("0x{:X}", buffer_ptr))
-                .arg("BufferSize", buffer_size.to_string())
-                .arg("Result", "0");
         }
         SYSCALL_GETDIRENTRIESATTR => {
             let fd = invocation.args[0];

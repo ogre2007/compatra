@@ -744,6 +744,46 @@ impl CompatibilityServices {
         compatra::CompatibilityServices.realpath_path(&mut memory, path_ptr, resolved_ptr)
     }
 
+    pub fn getattrlist_path(
+        &self,
+        emu: &mut dyn Emulator,
+        path_ptr: u64,
+        attrlist_ptr: u64,
+        buffer_ptr: u64,
+        buffer_size: usize,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        compatra::CompatibilityServices.getattrlist_path(
+            &mut memory,
+            path_ptr,
+            attrlist_ptr,
+            buffer_ptr,
+            buffer_size,
+            options,
+        )
+    }
+
+    pub fn fgetattrlist_fd(
+        &self,
+        emu: &mut dyn Emulator,
+        fd: u64,
+        attrlist_ptr: u64,
+        buffer_ptr: u64,
+        buffer_size: usize,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        let mut memory = EmulatorGuestMemory { emulator: emu };
+        compatra::CompatibilityServices.fgetattrlist_fd(
+            &mut memory,
+            fd,
+            attrlist_ptr,
+            buffer_ptr,
+            buffer_size,
+            options,
+        )
+    }
+
     pub fn setenv_var(
         &self,
         emu: &mut dyn Emulator,

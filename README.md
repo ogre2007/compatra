@@ -168,11 +168,14 @@ outputs, including:
 - lifecycle glue diagnostics for `__mod_init_func` constructors, `atexit`
   handlers, and destructor/finalizer stages
 - static imports and `dlsym` imports for file descriptors, positioned I/O,
-  path metadata and mutation, directory iteration, environment, time, resource,
-  and entropy calls
+  path metadata and mutation, directory iteration, `scandir`, `glob`,
+  `getattrlist`, environment, time, resource, and entropy calls
 - static imports and `dlsym` imports for CoreFoundation/Security framework
   glue, including host-backed keychain status/path lookups and
   `SecItemCopyMatching`/`SecKeychainFindGenericPassword` status reporting
+- host-backed privacy-sensitive framework probes for screen capture, keyboard
+  listen/accessibility state, synchronous key-state reads, and AVFoundation
+  microphone device discovery. TCC denial is preserved as real host behavior.
 - raw Darwin syscall traps and imported syscall thunks for process, time,
   resource, sysctl, and file descriptor calls
 

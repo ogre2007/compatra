@@ -52,6 +52,90 @@ const MAX_GUEST_STDIO_BYTES: usize = 16 * 1024 * 1024;
 const HOST_FILE_HANDLE_SIZE: usize = 8;
 #[cfg(target_os = "macos")]
 const HOST_DIRENT_SIZE: usize = mem::size_of::<libc::dirent>();
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_BIT_MAP_COUNT: u16 = 5;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTRLIST_SIZE: usize = 24;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_NAME: u32 = 0x0000_0001;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_DEVID: u32 = 0x0000_0002;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_FSID: u32 = 0x0000_0004;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_OBJTAG: u32 = 0x0000_0010;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_OBJID: u32 = 0x0000_0020;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_OBJPERMANENTID: u32 = 0x0000_0040;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_PAROBJID: u32 = 0x0000_0080;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_SCRIPT: u32 = 0x0000_0100;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_CRTIME: u32 = 0x0000_0200;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_CHGTIME: u32 = 0x0000_0800;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_ACCTIME: u32 = 0x0000_1000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_BKUPTIME: u32 = 0x0000_2000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_FNDRINFO: u32 = 0x0000_4000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_OWNERID: u32 = 0x0000_8000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_GRPID: u32 = 0x0001_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_ACCESSMASK: u32 = 0x0002_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_FLAGS: u32 = 0x0004_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_GEN_COUNT: u32 = 0x0008_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_DOCUMENT_ID: u32 = 0x0010_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_USERACCESS: u32 = 0x0020_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_EXTENDED_SECURITY: u32 = 0x0040_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_UUID: u32 = 0x0100_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_GRPUUID: u32 = 0x0200_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_FILEID: u32 = 0x2000_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_CMN_PARENTID: u32 = 0x4000_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_TOTALSIZE: u32 = 0x0000_0002;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_IOBLOCKSIZE: u32 = 0x0000_0008;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_DEVTYPE: u32 = 0x0000_0020;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_FILETYPE: u32 = 0x0000_0040;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_FORKCOUNT: u32 = 0x0000_0080;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_FORKLIST: u32 = 0x0000_0100;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_DATAALLOCSIZE: u32 = 0x0000_0400;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_RSRCLENGTH: u32 = 0x0000_1000;
+#[cfg(target_os = "macos")]
+const DARWIN_ATTR_FILE_RSRCALLOCSIZE: u32 = 0x0000_2000;
+#[cfg(target_os = "macos")]
+const DARWIN_FSOPT_NOFOLLOW: u64 = 0x0000_0001;
 impl CompatibilityServices {
     pub fn open_path_arg0<M: GuestMemory + ?Sized>(
         &self,
@@ -1120,6 +1204,74 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn getattrlist_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        attrlist_ptr: u64,
+        buffer_ptr: u64,
+        buffer_size: usize,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_getattrlist(
+                memory,
+                path_ptr,
+                attrlist_ptr,
+                buffer_ptr,
+                buffer_size,
+                options,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                &mut *memory,
+                path_ptr,
+                attrlist_ptr,
+                buffer_ptr,
+                buffer_size,
+                options,
+            );
+            None
+        }
+    }
+
+    pub fn fgetattrlist_fd<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        fd: u64,
+        attrlist_ptr: u64,
+        buffer_ptr: u64,
+        buffer_size: usize,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_fgetattrlist(
+                memory,
+                fd,
+                attrlist_ptr,
+                buffer_ptr,
+                buffer_size,
+                options,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                &mut *memory,
+                fd,
+                attrlist_ptr,
+                buffer_ptr,
+                buffer_size,
+                options,
+            );
+            None
+        }
+    }
+
     pub fn fputs_stream<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1327,6 +1479,77 @@ impl CompatibilityServices {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, buf_ptr, count);
+            None
+        }
+    }
+
+    pub fn scandir_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        namelist_ptr: u64,
+        filter_ptr: u64,
+        compar_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_scandir(memory, path_ptr, namelist_ptr, filter_ptr, compar_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, path_ptr, namelist_ptr, filter_ptr, compar_ptr);
+            None
+        }
+    }
+
+    pub fn alphasort_entries<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        left_ptr: u64,
+        right_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_alphasort(memory, left_ptr, right_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, left_ptr, right_ptr);
+            None
+        }
+    }
+
+    pub fn glob_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        pattern_ptr: u64,
+        flags: u64,
+        errfunc_ptr: u64,
+        glob_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_glob(memory, pattern_ptr, flags, errfunc_ptr, glob_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, pattern_ptr, flags, errfunc_ptr, glob_ptr);
+            None
+        }
+    }
+
+    pub fn globfree_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        glob_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_globfree(memory, glob_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, glob_ptr);
             None
         }
     }
@@ -2126,6 +2349,354 @@ fn proxy_host_realpath<M: GuestMemory + ?Sized>(
         return_value: dest,
         errno: None,
     })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct DarwinAttrList {
+    bitmapcount: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let raw = <[u8; 4]>::try_from(bytes.get(offset..offset + 4)?).ok()?;
+    Some(u32::from_le_bytes(raw))
+}
+
+#[cfg(target_os = "macos")]
+fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) -> Option<()> {
+    bytes
+        .get_mut(offset..offset + 4)?
+        .copy_from_slice(&value.to_le_bytes());
+    Some(())
+}
+
+#[cfg(target_os = "macos")]
+fn write_i64_le(bytes: &mut Vec<u8>, value: i64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(target_os = "macos")]
+fn append_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(target_os = "macos")]
+fn append_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(target_os = "macos")]
+fn align_vec_4(bytes: &mut Vec<u8>) {
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn append_zeroes(bytes: &mut Vec<u8>, len: usize) {
+    bytes.extend(std::iter::repeat(0).take(len));
+}
+
+#[cfg(target_os = "macos")]
+fn append_timespec(bytes: &mut Vec<u8>, sec: i64, nsec: i64) {
+    write_i64_le(bytes, sec);
+    write_i64_le(bytes, nsec);
+}
+
+#[cfg(target_os = "macos")]
+fn append_attr_reference(bytes: &mut Vec<u8>, refs: &mut Vec<(usize, Vec<u8>)>, data: Vec<u8>) {
+    align_vec_4(bytes);
+    let ref_offset = bytes.len();
+    append_zeroes(bytes, 8);
+    refs.push((ref_offset, data));
+}
+
+#[cfg(target_os = "macos")]
+fn finish_attr_references(bytes: &mut Vec<u8>, refs: Vec<(usize, Vec<u8>)>) {
+    for (ref_offset, data) in refs {
+        align_vec_4(bytes);
+        let data_offset = bytes.len();
+        bytes.extend_from_slice(&data);
+        let relative = data_offset.saturating_sub(ref_offset) as i32;
+        let _ = write_i32_at(bytes, ref_offset, relative);
+        let _ = write_u32_le(bytes, ref_offset + 4, data.len() as u32);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_darwin_attrlist<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    attrlist_ptr: u64,
+) -> Result<DarwinAttrList, u32> {
+    if attrlist_ptr == 0 {
+        return Err(libc::EFAULT as u32);
+    }
+    let bytes = memory
+        .read_memory(attrlist_ptr, DARWIN_ATTRLIST_SIZE)
+        .map_err(|_| libc::EFAULT as u32)?;
+    let bitmapcount = read_i16_at(&bytes, 0).ok_or(libc::EFAULT as u32)? as u16;
+    Ok(DarwinAttrList {
+        bitmapcount,
+        commonattr: read_u32_le(&bytes, 4).ok_or(libc::EFAULT as u32)?,
+        volattr: read_u32_le(&bytes, 8).ok_or(libc::EFAULT as u32)?,
+        dirattr: read_u32_le(&bytes, 12).ok_or(libc::EFAULT as u32)?,
+        fileattr: read_u32_le(&bytes, 16).ok_or(libc::EFAULT as u32)?,
+        forkattr: read_u32_le(&bytes, 20).ok_or(libc::EFAULT as u32)?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_objtype(metadata: &fs::Metadata) -> u32 {
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        2
+    } else if file_type.is_symlink() {
+        5
+    } else if file_type.is_file() {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_darwin_getattrlist_buffer<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    buffer_ptr: u64,
+    buffer_size: usize,
+    attrs: DarwinAttrList,
+    metadata: &fs::Metadata,
+    name: Option<&str>,
+) -> Result<usize, u32> {
+    if buffer_ptr == 0 {
+        return Err(libc::EFAULT as u32);
+    }
+    if attrs.bitmapcount != DARWIN_ATTR_BIT_MAP_COUNT {
+        return Err(libc::EINVAL as u32);
+    }
+    if attrs.volattr != 0 || attrs.dirattr != 0 || attrs.forkattr != 0 {
+        return Err(libc::ENOTSUP as u32);
+    }
+
+    let mut out = vec![0u8; 4];
+    let mut refs = Vec::new();
+    let common = attrs.commonattr;
+    if common & DARWIN_ATTR_CMN_NAME != 0 {
+        let mut name_bytes = name.unwrap_or("").as_bytes().to_vec();
+        name_bytes.push(0);
+        append_attr_reference(&mut out, &mut refs, name_bytes);
+    }
+    if common & DARWIN_ATTR_CMN_DEVID != 0 {
+        append_u32(&mut out, metadata.dev() as u32);
+    }
+    if common & DARWIN_ATTR_CMN_FSID != 0 {
+        append_u64(&mut out, metadata.dev());
+    }
+    if common & DARWIN_ATTR_CMN_OBJTYPE != 0 {
+        append_u32(&mut out, darwin_objtype(metadata));
+    }
+    if common & DARWIN_ATTR_CMN_OBJTAG != 0 {
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_OBJID != 0 {
+        append_u32(&mut out, metadata.ino() as u32);
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_OBJPERMANENTID != 0 {
+        append_u32(&mut out, metadata.ino() as u32);
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_PAROBJID != 0 {
+        append_u64(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_SCRIPT != 0 {
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_CRTIME != 0 {
+        append_timespec(&mut out, metadata.ctime(), metadata.ctime_nsec());
+    }
+    if common & DARWIN_ATTR_CMN_MODTIME != 0 {
+        append_timespec(&mut out, metadata.mtime(), metadata.mtime_nsec());
+    }
+    if common & DARWIN_ATTR_CMN_CHGTIME != 0 {
+        append_timespec(&mut out, metadata.ctime(), metadata.ctime_nsec());
+    }
+    if common & DARWIN_ATTR_CMN_ACCTIME != 0 {
+        append_timespec(&mut out, metadata.atime(), metadata.atime_nsec());
+    }
+    if common & DARWIN_ATTR_CMN_BKUPTIME != 0 {
+        append_timespec(&mut out, 0, 0);
+    }
+    if common & DARWIN_ATTR_CMN_FNDRINFO != 0 {
+        append_zeroes(&mut out, 32);
+    }
+    if common & DARWIN_ATTR_CMN_OWNERID != 0 {
+        append_u32(&mut out, metadata.uid());
+    }
+    if common & DARWIN_ATTR_CMN_GRPID != 0 {
+        append_u32(&mut out, metadata.gid());
+    }
+    if common & DARWIN_ATTR_CMN_ACCESSMASK != 0 {
+        append_u32(&mut out, metadata.mode() & 0o7777);
+    }
+    if common & DARWIN_ATTR_CMN_FLAGS != 0 {
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_GEN_COUNT != 0 {
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_DOCUMENT_ID != 0 {
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_USERACCESS != 0 {
+        append_u32(&mut out, 0);
+    }
+    if common & DARWIN_ATTR_CMN_EXTENDED_SECURITY != 0 {
+        append_attr_reference(&mut out, &mut refs, Vec::new());
+    }
+    if common & DARWIN_ATTR_CMN_UUID != 0 {
+        append_zeroes(&mut out, 16);
+    }
+    if common & DARWIN_ATTR_CMN_GRPUUID != 0 {
+        append_zeroes(&mut out, 16);
+    }
+    if common & DARWIN_ATTR_CMN_FILEID != 0 {
+        append_u64(&mut out, metadata.ino());
+    }
+    if common & DARWIN_ATTR_CMN_PARENTID != 0 {
+        append_u64(&mut out, 0);
+    }
+
+    let file = attrs.fileattr;
+    if file & DARWIN_ATTR_FILE_LINKCOUNT != 0 {
+        append_u32(&mut out, metadata.nlink() as u32);
+    }
+    if file & DARWIN_ATTR_FILE_TOTALSIZE != 0 {
+        append_u64(&mut out, metadata.size());
+    }
+    if file & DARWIN_ATTR_FILE_ALLOCSIZE != 0 {
+        append_u64(&mut out, metadata.blocks().saturating_mul(512));
+    }
+    if file & DARWIN_ATTR_FILE_IOBLOCKSIZE != 0 {
+        append_u32(&mut out, metadata.blksize() as u32);
+    }
+    if file & DARWIN_ATTR_FILE_DEVTYPE != 0 {
+        append_u32(&mut out, metadata.rdev() as u32);
+    }
+    if file & DARWIN_ATTR_FILE_FILETYPE != 0 {
+        append_u32(&mut out, metadata.mode() & libc::S_IFMT as u32);
+    }
+    if file & DARWIN_ATTR_FILE_FORKCOUNT != 0 {
+        append_u32(&mut out, 1);
+    }
+    if file & DARWIN_ATTR_FILE_FORKLIST != 0 {
+        append_attr_reference(&mut out, &mut refs, Vec::new());
+    }
+    if file & DARWIN_ATTR_FILE_DATALENGTH != 0 {
+        append_u64(&mut out, metadata.size());
+    }
+    if file & DARWIN_ATTR_FILE_DATAALLOCSIZE != 0 {
+        append_u64(&mut out, metadata.blocks().saturating_mul(512));
+    }
+    if file & DARWIN_ATTR_FILE_RSRCLENGTH != 0 {
+        append_u64(&mut out, 0);
+    }
+    if file & DARWIN_ATTR_FILE_RSRCALLOCSIZE != 0 {
+        append_u64(&mut out, 0);
+    }
+
+    finish_attr_references(&mut out, refs);
+    let total_len = out.len() as u32;
+    let _ = write_u32_le(&mut out, 0, total_len);
+    if out.len() > buffer_size {
+        return Err(libc::ERANGE as u32);
+    }
+    memory
+        .write_memory(buffer_ptr, &out)
+        .map_err(|_| libc::EFAULT as u32)?;
+    Ok(out.len())
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_getattrlist<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    attrlist_ptr: u64,
+    buffer_ptr: u64,
+    buffer_size: usize,
+    options: u64,
+) -> Option<HostIoResult> {
+    let attrs = match read_darwin_attrlist(memory, attrlist_ptr) {
+        Ok(attrs) => attrs,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let (path_string, _) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let metadata = if options & DARWIN_FSOPT_NOFOLLOW == 0 {
+        fs::metadata(&path_string)
+    } else {
+        fs::symlink_metadata(&path_string)
+    };
+    let metadata = match metadata {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(host_io_error(io_error_errno(&error))),
+    };
+    let name = std::path::Path::new(&path_string)
+        .file_name()
+        .and_then(|name| name.to_str());
+    match write_darwin_getattrlist_buffer(memory, buffer_ptr, buffer_size, attrs, &metadata, name) {
+        Ok(bytes) => Some(HostIoResult {
+            return_value: 0,
+            errno: 0,
+            transferred: bytes,
+            preview: Vec::new(),
+        }),
+        Err(errno) => Some(host_io_error(errno)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fgetattrlist<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    fd: u64,
+    attrlist_ptr: u64,
+    buffer_ptr: u64,
+    buffer_size: usize,
+    _options: u64,
+) -> Option<HostIoResult> {
+    let attrs = match read_darwin_attrlist(memory, attrlist_ptr) {
+        Ok(attrs) => attrs,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    clear_errno();
+    let ret = unsafe { libc::fstat(fd as libc::c_int, stat.as_mut_ptr()) };
+    if ret != 0 {
+        return Some(host_io_result(ret as isize, Vec::new()));
+    }
+    let metadata = match fs::metadata(format!("/dev/fd/{fd}")) {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(host_io_error(io_error_errno(&error))),
+    };
+    let result =
+        write_darwin_getattrlist_buffer(memory, buffer_ptr, buffer_size, attrs, &metadata, None);
+    match result {
+        Ok(bytes) => Some(HostIoResult {
+            return_value: 0,
+            errno: 0,
+            transferred: bytes,
+            preview: Vec::new(),
+        }),
+        Err(errno) => Some(host_io_error(errno)),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3472,6 +4043,390 @@ fn proxy_host_seekdir(dirp: u64, loc: u64) -> Option<HostCallResult> {
     unsafe {
         libc::seekdir(handle.dir_ptr as *mut libc::DIR, loc as libc::c_long);
     }
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn dirent_name_offset() -> usize {
+    let entry = MaybeUninit::<libc::dirent>::uninit();
+    let base = entry.as_ptr() as usize;
+    unsafe { ptr::addr_of!((*entry.as_ptr()).d_name) as usize - base }
+}
+
+#[cfg(target_os = "macos")]
+fn dirent_name_from_bytes(bytes: &[u8]) -> String {
+    let offset = dirent_name_offset().min(bytes.len());
+    let name_bytes = &bytes[offset..];
+    let nul = name_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name_bytes.len());
+    String::from_utf8_lossy(&name_bytes[..nul]).into_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn dirent_name_from_guest<M: GuestMemory + ?Sized>(memory: &mut M, dirent_ptr: u64) -> String {
+    if dirent_ptr == 0 {
+        return String::new();
+    }
+    memory
+        .read_memory(dirent_ptr, HOST_DIRENT_SIZE)
+        .map(|bytes| dirent_name_from_bytes(&bytes))
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn free_guest_allocations<M: GuestMemory + ?Sized>(memory: &mut M, ptrs: &[u64]) {
+    for ptr in ptrs {
+        if *ptr != 0 {
+            let _ = memory.free_memory(*ptr);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_scandir<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    namelist_ptr: u64,
+    filter_ptr: u64,
+    compar_ptr: u64,
+) -> Option<HostCallResult> {
+    if namelist_ptr == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    let (_, host_path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_call_error(errno)),
+    };
+    clear_errno();
+    let dir = unsafe { libc::opendir(host_path.as_ptr()) };
+    if dir.is_null() {
+        return Some(host_call_result(-1));
+    }
+
+    let mut entries = Vec::<Vec<u8>>::new();
+    loop {
+        clear_errno();
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            let errno = host_errno();
+            unsafe {
+                libc::closedir(dir);
+            }
+            if errno != 0 {
+                return Some(host_call_error(errno));
+            }
+            break;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(entry.cast::<u8>(), HOST_DIRENT_SIZE) };
+        entries.push(bytes.to_vec());
+    }
+
+    if compar_ptr != 0 {
+        entries.sort_by(|left, right| {
+            dirent_name_from_bytes(left)
+                .as_str()
+                .cmp(dirent_name_from_bytes(right).as_str())
+        });
+    }
+    let _ = filter_ptr;
+
+    let mut allocated = Vec::new();
+    let mut guest_entry_ptrs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let addr = match memory.allocate_memory(HOST_DIRENT_SIZE, 8) {
+            Ok(addr) => addr,
+            Err(_) => {
+                free_guest_allocations(memory, &allocated);
+                return Some(host_call_error(libc::ENOMEM as u32));
+            }
+        };
+        if memory.write_memory(addr, &entry).is_err() {
+            free_guest_allocations(memory, &allocated);
+            let _ = memory.free_memory(addr);
+            return Some(host_call_error(libc::EFAULT as u32));
+        }
+        allocated.push(addr);
+        guest_entry_ptrs.push(addr);
+    }
+
+    let array_size = guest_entry_ptrs
+        .len()
+        .saturating_add(1)
+        .saturating_mul(mem::size_of::<u64>());
+    let array_ptr = match memory.allocate_memory(array_size, 8) {
+        Ok(addr) => addr,
+        Err(_) => {
+            free_guest_allocations(memory, &allocated);
+            return Some(host_call_error(libc::ENOMEM as u32));
+        }
+    };
+    allocated.push(array_ptr);
+    for (idx, ptr) in guest_entry_ptrs.iter().copied().enumerate() {
+        if write_guest_u64(memory, array_ptr + (idx * 8) as u64, ptr).is_err() {
+            free_guest_allocations(memory, &allocated);
+            return Some(host_call_error(libc::EFAULT as u32));
+        }
+    }
+    if write_guest_u64(memory, array_ptr + (guest_entry_ptrs.len() * 8) as u64, 0).is_err()
+        || write_guest_u64(memory, namelist_ptr, array_ptr).is_err()
+    {
+        free_guest_allocations(memory, &allocated);
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+
+    Some(host_call_value(guest_entry_ptrs.len() as u64))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_alphasort<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    left_ptr: u64,
+    right_ptr: u64,
+) -> Option<HostCallResult> {
+    let left_dirent = memory
+        .read_memory(left_ptr, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .unwrap_or(0);
+    let right_dirent = memory
+        .read_memory(right_ptr, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .unwrap_or(0);
+    let left = dirent_name_from_guest(memory, left_dirent);
+    let right = dirent_name_from_guest(memory, right_dirent);
+    let ret = match left.as_str().cmp(right.as_str()) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Some(host_call_value(signed_return_value(ret as isize)))
+}
+
+#[cfg(target_os = "macos")]
+fn glob_has_magic(pattern: &str) -> bool {
+    pattern
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'*' | b'?' | b'['))
+}
+
+#[cfg(target_os = "macos")]
+fn glob_component_match(pattern: &[u8], text: &[u8]) -> bool {
+    fn inner(pattern: &[u8], text: &[u8]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        match pattern[0] {
+            b'*' => inner(&pattern[1..], text) || (!text.is_empty() && inner(pattern, &text[1..])),
+            b'?' => !text.is_empty() && inner(&pattern[1..], &text[1..]),
+            byte => !text.is_empty() && byte == text[0] && inner(&pattern[1..], &text[1..]),
+        }
+    }
+    inner(pattern, text)
+}
+
+#[cfg(target_os = "macos")]
+fn host_glob_matches(pattern: &str, flags: u64) -> Result<Vec<String>, u32> {
+    if !glob_has_magic(pattern) {
+        if fs::metadata(pattern).is_ok() || flags & libc::GLOB_NOCHECK as u64 != 0 {
+            return Ok(vec![pattern.to_string()]);
+        }
+        return Err(libc::GLOB_NOMATCH as u32);
+    }
+
+    let path = std::path::Path::new(pattern);
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_pattern = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(pattern);
+    let mut matches = Vec::new();
+    let entries = fs::read_dir(parent).map_err(|error| io_error_errno(&error))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if glob_component_match(file_pattern.as_bytes(), name_str.as_bytes()) {
+            let mut rendered =
+                if parent.as_os_str().is_empty() || parent == std::path::Path::new(".") {
+                    name_str.to_string()
+                } else {
+                    parent.join(name_str).display().to_string()
+                };
+            if flags & libc::GLOB_MARK as u64 != 0 && entry.path().is_dir() {
+                rendered.push('/');
+            }
+            matches.push(rendered);
+        }
+    }
+    matches.sort();
+    if matches.is_empty() {
+        if flags & libc::GLOB_NOCHECK as u64 != 0 {
+            Ok(vec![pattern.to_string()])
+        } else {
+            Err(libc::GLOB_NOMATCH as u32)
+        }
+    } else {
+        Ok(matches)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn plausible_guest_ptr<M: GuestMemory + ?Sized>(memory: &mut M, ptr: u64) -> bool {
+    ptr != 0 && memory.allocation_size(ptr).is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn write_guest_glob_fields<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    glob_ptr: u64,
+    pathc: u64,
+    pathv: u64,
+    offs: u64,
+) -> Result<(), u32> {
+    if glob_ptr == 0 {
+        return Err(libc::EFAULT as u32);
+    }
+    write_guest_u64(memory, glob_ptr, pathc).map_err(|_| libc::EFAULT as u32)?;
+    write_guest_u64(memory, glob_ptr + 8, pathv).map_err(|_| libc::EFAULT as u32)?;
+    write_guest_u64(memory, glob_ptr + 16, offs).map_err(|_| libc::EFAULT as u32)?;
+    let _ = write_guest_i32(memory, glob_ptr + 24, 0);
+    let _ = write_guest_u64(memory, glob_ptr + 32, pathv);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_guest_glob_pathv<M: GuestMemory + ?Sized>(memory: &mut M, glob_ptr: u64) -> Option<u64> {
+    let first = memory
+        .read_memory(glob_ptr + 8, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .unwrap_or(0);
+    if plausible_guest_ptr(memory, first) {
+        return Some(first);
+    }
+    memory
+        .read_memory(glob_ptr + 32, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .filter(|ptr| plausible_guest_ptr(memory, *ptr))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_glob<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    pattern_ptr: u64,
+    flags: u64,
+    errfunc_ptr: u64,
+    glob_ptr: u64,
+) -> Option<HostCallResult> {
+    if glob_ptr == 0 {
+        return Some(host_call_value(libc::GLOB_NOSPACE as u64));
+    }
+    let pattern = match read_cstring(memory, pattern_ptr, HOST_PATH_BUFFER_SIZE) {
+        Ok(pattern) => pattern,
+        Err(_) => return Some(host_call_value(libc::GLOB_NOSPACE as u64)),
+    };
+    let _ = errfunc_ptr;
+    let matches = match host_glob_matches(&pattern, flags) {
+        Ok(matches) => matches,
+        Err(errno) => return Some(host_call_value(errno as u64)),
+    };
+    let offs = memory
+        .read_memory(glob_ptr + 16, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .filter(|_| flags & libc::GLOB_DOOFFS as u64 != 0)
+        .unwrap_or(0) as usize;
+
+    let mut allocated = Vec::new();
+    let mut string_ptrs = Vec::with_capacity(matches.len());
+    for hit in matches {
+        let mut bytes = hit.into_bytes();
+        bytes.push(0);
+        let Some(ptr) = allocate_guest_bytes(memory, &bytes) else {
+            free_guest_allocations(memory, &allocated);
+            return Some(host_call_value(libc::GLOB_NOSPACE as u64));
+        };
+        allocated.push(ptr);
+        string_ptrs.push(ptr);
+    }
+
+    let pointer_count = offs.saturating_add(string_ptrs.len()).saturating_add(1);
+    let pathv_ptr = match memory.allocate_memory(pointer_count.saturating_mul(8), 8) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            free_guest_allocations(memory, &allocated);
+            return Some(host_call_value(libc::GLOB_NOSPACE as u64));
+        }
+    };
+    allocated.push(pathv_ptr);
+    for idx in 0..offs {
+        if write_guest_u64(memory, pathv_ptr + (idx * 8) as u64, 0).is_err() {
+            free_guest_allocations(memory, &allocated);
+            return Some(host_call_value(libc::GLOB_NOSPACE as u64));
+        }
+    }
+    for (idx, ptr) in string_ptrs.iter().copied().enumerate() {
+        let slot = offs.saturating_add(idx);
+        if write_guest_u64(memory, pathv_ptr + (slot * 8) as u64, ptr).is_err() {
+            free_guest_allocations(memory, &allocated);
+            return Some(host_call_value(libc::GLOB_NOSPACE as u64));
+        }
+    }
+    if write_guest_u64(memory, pathv_ptr + ((pointer_count - 1) * 8) as u64, 0).is_err()
+        || write_guest_glob_fields(
+            memory,
+            glob_ptr,
+            string_ptrs.len() as u64,
+            pathv_ptr,
+            offs as u64,
+        )
+        .is_err()
+    {
+        free_guest_allocations(memory, &allocated);
+        return Some(host_call_value(libc::GLOB_NOSPACE as u64));
+    }
+
+    Some(host_call_value(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_globfree<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    glob_ptr: u64,
+) -> Option<HostCallResult> {
+    if glob_ptr == 0 {
+        return Some(host_call_value(0));
+    }
+    let pathc = memory
+        .read_memory(glob_ptr, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .unwrap_or(0) as usize;
+    let offs = memory
+        .read_memory(glob_ptr + 16, 8)
+        .ok()
+        .and_then(|bytes| read_u64_at(&bytes, 0))
+        .unwrap_or(0) as usize;
+    if let Some(pathv) = read_guest_glob_pathv(memory, glob_ptr) {
+        for idx in 0..pathc {
+            let slot = offs.saturating_add(idx);
+            if let Some(ptr) = memory
+                .read_memory(pathv + (slot * 8) as u64, 8)
+                .ok()
+                .and_then(|bytes| read_u64_at(&bytes, 0))
+            {
+                let _ = memory.free_memory(ptr);
+            }
+        }
+        let _ = memory.free_memory(pathv);
+    }
+    let _ = write_guest_glob_fields(memory, glob_ptr, 0, 0, 0);
     Some(host_call_value(0))
 }
 

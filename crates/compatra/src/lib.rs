@@ -273,6 +273,10 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     Realpath,
     #[cfg(target_os = "macos")]
+    GetAttrList,
+    #[cfg(target_os = "macos")]
+    FGetAttrList,
+    #[cfg(target_os = "macos")]
     GetAddrInfo,
     #[cfg(target_os = "macos")]
     FreeAddrInfo,
@@ -452,6 +456,14 @@ enum HostImportKind {
     Telldir,
     #[cfg(target_os = "macos")]
     Seekdir,
+    #[cfg(target_os = "macos")]
+    ScanDir,
+    #[cfg(target_os = "macos")]
+    AlphaSort,
+    #[cfg(target_os = "macos")]
+    Glob,
+    #[cfg(target_os = "macos")]
+    GlobFree,
     #[cfg(target_os = "macos")]
     GetEntropy,
     #[cfg(target_os = "macos")]
@@ -839,6 +851,28 @@ impl CompatibilityServices {
                     Some(self.symlink_path(memory, args[0], args[1])?.into())
                 }
                 HostImportKind::Realpath => Some(self.realpath_path(memory, args[0], args[1])?),
+                HostImportKind::GetAttrList => Some(
+                    self.getattrlist_path(
+                        memory,
+                        args[0],
+                        args[1],
+                        args[2],
+                        args[3] as usize,
+                        args[4],
+                    )?
+                    .into(),
+                ),
+                HostImportKind::FGetAttrList => Some(
+                    self.fgetattrlist_fd(
+                        memory,
+                        args[0],
+                        args[1],
+                        args[2],
+                        args[3] as usize,
+                        args[4],
+                    )?
+                    .into(),
+                ),
                 HostImportKind::GetAddrInfo => {
                     Some(self.getaddrinfo(memory, args[0], args[1], args[2], args[3])?)
                 }
@@ -979,6 +1013,16 @@ impl CompatibilityServices {
                 HostImportKind::RewindDir => Some(self.rewinddir_handle(args[0])?),
                 HostImportKind::Telldir => Some(self.telldir_handle(args[0])?),
                 HostImportKind::Seekdir => Some(self.seekdir_handle(args[0], args[1])?),
+                HostImportKind::ScanDir => {
+                    Some(self.scandir_path(memory, args[0], args[1], args[2], args[3])?)
+                }
+                HostImportKind::AlphaSort => {
+                    Some(self.alphasort_entries(memory, args[0], args[1])?)
+                }
+                HostImportKind::Glob => {
+                    Some(self.glob_path(memory, args[0], args[1], args[2], args[3])?)
+                }
+                HostImportKind::GlobFree => Some(self.globfree_path(memory, args[0])?),
                 HostImportKind::GetEntropy => {
                     Some(self.getentropy(memory, args[0], args[1] as usize)?.into())
                 }
@@ -2840,6 +2884,8 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "readlinkat" => Some(HostImportKind::ReadlinkAt),
             "symlink" => Some(HostImportKind::Symlink),
             "realpath" => Some(HostImportKind::Realpath),
+            "getattrlist" => Some(HostImportKind::GetAttrList),
+            "fgetattrlist" => Some(HostImportKind::FGetAttrList),
             "getaddrinfo" => Some(HostImportKind::GetAddrInfo),
             "freeaddrinfo" => Some(HostImportKind::FreeAddrInfo),
             "gai_strerror" => Some(HostImportKind::GaiStrError),
@@ -2929,6 +2975,10 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "rewinddir" => Some(HostImportKind::RewindDir),
             "telldir" => Some(HostImportKind::Telldir),
             "seekdir" => Some(HostImportKind::Seekdir),
+            "scandir" | "scandir$INODE64" => Some(HostImportKind::ScanDir),
+            "alphasort" | "alphasort$INODE64" => Some(HostImportKind::AlphaSort),
+            "glob" => Some(HostImportKind::Glob),
+            "globfree" => Some(HostImportKind::GlobFree),
             "getentropy" => Some(HostImportKind::GetEntropy),
             "pthread_threading_np" => Some(HostImportKind::PthreadThreadingNp),
             "pthread_threadid_np" => Some(HostImportKind::PthreadThreadIdNp),
@@ -4963,6 +5013,8 @@ mod tests {
             assert!(compat.should_proxy_import("_readlinkat"));
             assert!(compat.should_proxy_import("_symlink"));
             assert!(compat.should_proxy_import("_realpath"));
+            assert!(compat.should_proxy_import("_getattrlist"));
+            assert!(compat.should_proxy_import("_fgetattrlist"));
             assert!(compat.should_proxy_import("_getenv"));
             assert!(compat.should_proxy_import("_setenv"));
             assert!(compat.should_proxy_import("_unsetenv"));
@@ -5091,6 +5143,10 @@ mod tests {
             assert!(compat.should_proxy_import("_rewinddir"));
             assert!(compat.should_proxy_import("_telldir"));
             assert!(compat.should_proxy_import("_seekdir"));
+            assert!(compat.should_proxy_import("_scandir"));
+            assert!(compat.should_proxy_import("_alphasort"));
+            assert!(compat.should_proxy_import("_glob"));
+            assert!(compat.should_proxy_import("_globfree"));
             assert!(compat.should_proxy_import("_getentropy"));
             assert!(compat.should_proxy_import("_pthread_threading_np"));
             assert!(compat.should_proxy_import("_pthread_threadid_np"));

@@ -393,11 +393,17 @@ fn compat_call_family(raw_call: &str, normalized: &str) -> &'static str {
             | "readlinkat"
             | "symlink"
             | "realpath"
+            | "getattrlist"
+            | "fgetattrlist"
             | "opendir"
             | "closedir"
             | "fdopendir"
             | "readdir"
             | "readdir_r"
+            | "scandir"
+            | "alphasort"
+            | "glob"
+            | "globfree"
     ) {
         return "filesystem";
     }

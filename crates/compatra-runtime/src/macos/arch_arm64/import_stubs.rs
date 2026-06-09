@@ -242,6 +242,21 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_CGDisplayPixelsHigh"
             | "_CGDisplayIsActive"
             | "_CGDisplayIsOnline"
+            | "_CGPreflightScreenCaptureAccess"
+            | "_CGRequestScreenCaptureAccess"
+            | "_CGDisplayCreateImage"
+            | "_CGImageGetWidth"
+            | "_CGImageGetHeight"
+            | "_CGImageGetBitsPerPixel"
+            | "_CGImageGetBytesPerRow"
+            | "_CGImageGetDataProvider"
+            | "_CGImageRelease"
+            | "_CGDataProviderCopyData"
+            | "_CGEventSourceKeyState"
+            | "_CGPreflightListenEventAccess"
+            | "_CGRequestListenEventAccess"
+            | "_AXIsProcessTrusted"
+            | "_AXIsProcessTrustedWithOptions"
             | "_NSApplicationLoad"
             | "_NSApplicationMain"
             | "_SecCertificateCopyData"
@@ -448,6 +463,21 @@ mod tests {
             "_CGDisplayPixelsHigh",
             "_CGDisplayIsActive",
             "_CGDisplayIsOnline",
+            "_CGPreflightScreenCaptureAccess",
+            "_CGRequestScreenCaptureAccess",
+            "_CGDisplayCreateImage",
+            "_CGImageGetWidth",
+            "_CGImageGetHeight",
+            "_CGImageGetBitsPerPixel",
+            "_CGImageGetBytesPerRow",
+            "_CGImageGetDataProvider",
+            "_CGImageRelease",
+            "_CGDataProviderCopyData",
+            "_CGEventSourceKeyState",
+            "_CGPreflightListenEventAccess",
+            "_CGRequestListenEventAccess",
+            "_AXIsProcessTrusted",
+            "_AXIsProcessTrustedWithOptions",
         ] {
             assert!(
                 arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),

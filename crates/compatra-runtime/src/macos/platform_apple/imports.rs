@@ -115,6 +115,21 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "CGDisplayPixelsHigh"
             | "CGDisplayIsActive"
             | "CGDisplayIsOnline"
+            | "CGPreflightScreenCaptureAccess"
+            | "CGRequestScreenCaptureAccess"
+            | "CGDisplayCreateImage"
+            | "CGImageGetWidth"
+            | "CGImageGetHeight"
+            | "CGImageGetBitsPerPixel"
+            | "CGImageGetBytesPerRow"
+            | "CGImageGetDataProvider"
+            | "CGImageRelease"
+            | "CGDataProviderCopyData"
+            | "CGEventSourceKeyState"
+            | "CGPreflightListenEventAccess"
+            | "CGRequestListenEventAccess"
+            | "AXIsProcessTrusted"
+            | "AXIsProcessTrustedWithOptions"
             | "SecRandomCopyBytes"
             | "SecCopyErrorMessageString"
             | "SecCertificateCreateWithData"
@@ -277,6 +292,21 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_CGDisplayPixelsHigh",
     "_CGDisplayIsActive",
     "_CGDisplayIsOnline",
+    "_CGPreflightScreenCaptureAccess",
+    "_CGRequestScreenCaptureAccess",
+    "_CGDisplayCreateImage",
+    "_CGImageGetWidth",
+    "_CGImageGetHeight",
+    "_CGImageGetBitsPerPixel",
+    "_CGImageGetBytesPerRow",
+    "_CGImageGetDataProvider",
+    "_CGImageRelease",
+    "_CGDataProviderCopyData",
+    "_CGEventSourceKeyState",
+    "_CGPreflightListenEventAccess",
+    "_CGRequestListenEventAccess",
+    "_AXIsProcessTrusted",
+    "_AXIsProcessTrustedWithOptions",
     "_SecRandomCopyBytes",
     "_SecCopyErrorMessageString",
     "_SecItemCopyMatching",
@@ -286,6 +316,282 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_SecKeychainFindGenericPassword",
     "_SecKeychainItemFreeContent",
 ];
+
+#[cfg(target_os = "macos")]
+fn host_cg_main_display_id() -> u32 {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+    }
+    unsafe { CGMainDisplayID() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_main_display_id() -> u32 {
+    1
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_display_pixels_wide(display: u32) -> usize {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayPixelsWide(display: u32) -> usize;
+    }
+    unsafe { CGDisplayPixelsWide(display) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_display_pixels_wide(_display: u32) -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_display_pixels_high(display: u32) -> usize {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayPixelsHigh(display: u32) -> usize;
+    }
+    unsafe { CGDisplayPixelsHigh(display) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_display_pixels_high(_display: u32) -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_display_is_active(display: u32) -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayIsActive(display: u32) -> u8;
+    }
+    unsafe { CGDisplayIsActive(display) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_display_is_active(_display: u32) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_display_is_online(display: u32) -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayIsOnline(display: u32) -> u8;
+    }
+    unsafe { CGDisplayIsOnline(display) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_display_is_online(_display: u32) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_preflight_screen_capture_access() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> u8;
+    }
+    unsafe { CGPreflightScreenCaptureAccess() != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_preflight_screen_capture_access() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_request_screen_capture_access() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGRequestScreenCaptureAccess() -> u8;
+    }
+    unsafe { CGRequestScreenCaptureAccess() != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_request_screen_capture_access() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_display_create_image(display: u32) -> Option<u64> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDisplayCreateImage(display: u32) -> *const std::ffi::c_void;
+    }
+    let image = unsafe { CGDisplayCreateImage(display) };
+    (!image.is_null()).then_some(image as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_display_create_image(_display: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_image_size(image: u64, dimension: &str) -> usize {
+    if image == 0 {
+        return 0;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGImageGetWidth(image: *const std::ffi::c_void) -> usize;
+        fn CGImageGetHeight(image: *const std::ffi::c_void) -> usize;
+    }
+    unsafe {
+        match dimension {
+            "height" => CGImageGetHeight(image as *const std::ffi::c_void),
+            _ => CGImageGetWidth(image as *const std::ffi::c_void),
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_image_size(_image: u64, _dimension: &str) -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_image_bits_per_pixel(image: u64) -> usize {
+    if image == 0 {
+        return 0;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGImageGetBitsPerPixel(image: *const std::ffi::c_void) -> usize;
+    }
+    unsafe { CGImageGetBitsPerPixel(image as *const std::ffi::c_void) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_image_bits_per_pixel(_image: u64) -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_image_bytes_per_row(image: u64) -> usize {
+    if image == 0 {
+        return 0;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGImageGetBytesPerRow(image: *const std::ffi::c_void) -> usize;
+    }
+    unsafe { CGImageGetBytesPerRow(image as *const std::ffi::c_void) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_image_bytes_per_row(_image: u64) -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_image_get_data_provider(image: u64) -> Option<u64> {
+    if image == 0 {
+        return None;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGImageGetDataProvider(image: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    }
+    let provider = unsafe { CGImageGetDataProvider(image as *const std::ffi::c_void) };
+    (!provider.is_null()).then_some(provider as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_image_get_data_provider(_image: u64) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_data_provider_copy_data(provider: u64) -> Option<u64> {
+    if provider == 0 {
+        return None;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDataProviderCopyData(provider: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    }
+    let data = unsafe { CGDataProviderCopyData(provider as *const std::ffi::c_void) };
+    (!data.is_null()).then_some(data as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_data_provider_copy_data(_provider: u64) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_event_source_key_state(state_id: u32, key: u16) -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceKeyState(state_id: u32, key: u16) -> u8;
+    }
+    unsafe { CGEventSourceKeyState(state_id, key) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_event_source_key_state(_state_id: u32, _key: u16) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_preflight_listen_event_access() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightListenEventAccess() -> u8;
+    }
+    unsafe { CGPreflightListenEventAccess() != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_preflight_listen_event_access() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_cg_request_listen_event_access() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGRequestListenEventAccess() -> u8;
+    }
+    unsafe { CGRequestListenEventAccess() != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cg_request_listen_event_access() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_ax_is_process_trusted() -> bool {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+    }
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_ax_is_process_trusted() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_ax_is_process_trusted_with_options(options: u64) -> bool {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> u8;
+    }
+    unsafe { AXIsProcessTrustedWithOptions(options as *const std::ffi::c_void) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_ax_is_process_trusted_with_options(_options: u64) -> bool {
+    false
+}
 
 #[cfg(target_os = "macos")]
 fn host_sec_random_bytes(len: usize) -> Option<Vec<u8>> {
@@ -1226,20 +1532,58 @@ fn host_objc_class_lookup(symbol: &str, name: &str) -> Option<u64> {
         fn objc_lookUpClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
         fn objc_getMetaClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
     }
+    let class_name = name.to_string();
     let name = std::ffi::CString::new(name).ok()?;
-    let class = unsafe {
+    let mut class = unsafe {
         match symbol {
             "objc_lookUpClass" => objc_lookUpClass(name.as_ptr()),
             "objc_getMetaClass" => objc_getMetaClass(name.as_ptr()),
             _ => objc_getClass(name.as_ptr()),
         }
     };
+    if class.is_null() {
+        host_load_framework_for_objc_class(&class_name);
+        class = unsafe {
+            match symbol {
+                "objc_lookUpClass" => objc_lookUpClass(name.as_ptr()),
+                "objc_getMetaClass" => objc_getMetaClass(name.as_ptr()),
+                _ => objc_getClass(name.as_ptr()),
+            }
+        };
+    }
     (!class.is_null()).then_some(class as u64)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn host_objc_class_lookup(_symbol: &str, _name: &str) -> Option<u64> {
     None
+}
+
+#[cfg(target_os = "macos")]
+fn host_load_framework_for_objc_class(name: &str) {
+    let path = if name.starts_with("AVCapture")
+        || name.starts_with("AVAudio")
+        || name.starts_with("AVAsset")
+        || name.starts_with("AVMedia")
+    {
+        Some("/System/Library/Frameworks/AVFoundation.framework/AVFoundation")
+    } else if name.starts_with("SCScreen")
+        || name.starts_with("SCShareableContent")
+        || name.starts_with("SCStream")
+    {
+        Some("/System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit")
+    } else {
+        None
+    };
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(path) = std::ffi::CString::new(path) else {
+        return;
+    };
+    unsafe {
+        let _ = libc::dlopen(path.as_ptr(), libc::RTLD_NOW);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1527,6 +1871,15 @@ fn objc_selector_returns_raw_value(selector: &str) -> bool {
             | "isEqualToString:"
             | "containsObject:"
             | "isProxy"
+            | "authorizationStatusForMediaType:"
+            | "isConnected"
+            | "hasMediaType:"
+            | "supportsAVCaptureSessionPreset:"
+            | "canAddInput:"
+            | "canAddOutput:"
+            | "prepareToRecord"
+            | "record"
+            | "isRecording"
     )
 }
 
@@ -5612,19 +5965,22 @@ fn dispatch_apple_import(
             Some(0)
         }
         "CGMainDisplayID" => {
-            record_arm64_import(tracker, "_CGMainDisplayID() -> 1".to_string());
+            let display = host_cg_main_display_id();
+            record_arm64_import(tracker, format!("_CGMainDisplayID() -> {}", display));
             emit_arm64_event(
                 trace,
-                process_event(metadata, "coregraphics", "CGMainDisplayID").arg("Result", "1"),
+                process_event(metadata, "coregraphics", "CGMainDisplayID")
+                    .arg("Result", display.to_string())
+                    .arg("HostProxy", "true"),
             );
-            Some(1)
+            Some(display as u64)
         }
         "CGDisplayPixelsWide" | "CGDisplayPixelsHigh" => {
-            let display = emu.read_reg("x0").unwrap_or(0);
+            let display = emu.read_reg("x0").unwrap_or(0) as u32;
             let result = if normalized_apple_symbol(symbol) == "CGDisplayPixelsWide" {
-                1440
+                host_cg_display_pixels_wide(display)
             } else {
-                900
+                host_cg_display_pixels_high(display)
             };
             record_arm64_import(
                 tracker,
@@ -5640,28 +5996,333 @@ fn dispatch_apple_import(
                 process_event(metadata, "coregraphics", normalized_apple_symbol(symbol))
                     .arg("Display", display.to_string())
                     .arg("Result", result.to_string())
-                    .arg("Model", "synthetic-display"),
+                    .arg("HostProxy", "true"),
             );
-            Some(result)
+            Some(result as u64)
         }
         "CGDisplayIsActive" | "CGDisplayIsOnline" => {
-            let display = emu.read_reg("x0").unwrap_or(0);
+            let display = emu.read_reg("x0").unwrap_or(0) as u32;
+            let result = if normalized_apple_symbol(symbol) == "CGDisplayIsActive" {
+                host_cg_display_is_active(display)
+            } else {
+                host_cg_display_is_online(display)
+            };
             record_arm64_import(
                 tracker,
                 format!(
-                    "_{}(display={}) -> 1",
+                    "_{}(display={}) -> {}",
                     normalized_apple_symbol(symbol),
-                    display
+                    display,
+                    result as u64
                 ),
             );
             emit_arm64_event(
                 trace,
                 process_event(metadata, "coregraphics", normalized_apple_symbol(symbol))
                     .arg("Display", display.to_string())
-                    .arg("Result", "1")
-                    .arg("Model", "synthetic-display"),
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", "true"),
             );
-            Some(1)
+            Some(result as u64)
+        }
+        "CGPreflightScreenCaptureAccess" | "CGRequestScreenCaptureAccess" => {
+            let request = normalized_apple_symbol(symbol) == "CGRequestScreenCaptureAccess";
+            let result = if request {
+                host_cg_request_screen_capture_access()
+            } else {
+                host_cg_preflight_screen_capture_access()
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_{}() -> {}",
+                    normalized_apple_symbol(symbol),
+                    result as u64
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "privacy", normalized_apple_symbol(symbol))
+                    .arg("Capability", "screen-capture")
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(result as u64)
+        }
+        "CGDisplayCreateImage" => {
+            let display = emu.read_reg("x0").unwrap_or(0) as u32;
+            let host_image = host_cg_display_create_image(display);
+            let image_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                host_image
+                    .map(|host_image| runtime.register_host_opaque("CGImage", host_image))
+                    .unwrap_or(0)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CGDisplayCreateImage(display={}) -> 0x{:X}",
+                    display, image_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "screen-capture", "CGDisplayCreateImage")
+                    .arg("Display", display.to_string())
+                    .arg("Result", format!("0x{:X}", image_ref))
+                    .arg("HostProxy", host_image.is_some().to_string()),
+            );
+            Some(image_ref)
+        }
+        "CGImageGetWidth" | "CGImageGetHeight" => {
+            let image_ref = emu.read_reg("x0").unwrap_or(0);
+            let host_image = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(image_ref).unwrap_or(0)
+            };
+            let result = host_cg_image_size(
+                host_image,
+                if normalized_apple_symbol(symbol) == "CGImageGetHeight" {
+                    "height"
+                } else {
+                    "width"
+                },
+            );
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_{}(image=0x{:X}, host=0x{:X}) -> {}",
+                    normalized_apple_symbol(symbol),
+                    image_ref,
+                    host_image,
+                    result
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "screen-capture", normalized_apple_symbol(symbol))
+                    .arg("Image", format!("0x{:X}", image_ref))
+                    .arg("HostImage", format!("0x{:X}", host_image))
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", (host_image != 0).to_string()),
+            );
+            Some(result as u64)
+        }
+        "CGImageGetBitsPerPixel" | "CGImageGetBytesPerRow" => {
+            let image_ref = emu.read_reg("x0").unwrap_or(0);
+            let host_image = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(image_ref).unwrap_or(0)
+            };
+            let result = if normalized_apple_symbol(symbol) == "CGImageGetBitsPerPixel" {
+                host_cg_image_bits_per_pixel(host_image)
+            } else {
+                host_cg_image_bytes_per_row(host_image)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_{}(image=0x{:X}, host=0x{:X}) -> {}",
+                    normalized_apple_symbol(symbol),
+                    image_ref,
+                    host_image,
+                    result
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "screen-capture", normalized_apple_symbol(symbol))
+                    .arg("Image", format!("0x{:X}", image_ref))
+                    .arg("HostImage", format!("0x{:X}", host_image))
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", (host_image != 0).to_string()),
+            );
+            Some(result as u64)
+        }
+        "CGImageGetDataProvider" => {
+            let image_ref = emu.read_reg("x0").unwrap_or(0);
+            let host_image = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(image_ref).unwrap_or(0)
+            };
+            let host_provider = host_cg_image_get_data_provider(host_image);
+            let provider_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                host_provider
+                    .map(|host_provider| {
+                        runtime.register_host_opaque("CGDataProvider", host_provider)
+                    })
+                    .unwrap_or(0)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CGImageGetDataProvider(image=0x{:X}, host=0x{:X}) -> 0x{:X}",
+                    image_ref, host_image, provider_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "screen-capture", "CGImageGetDataProvider")
+                    .arg("Image", format!("0x{:X}", image_ref))
+                    .arg("HostImage", format!("0x{:X}", host_image))
+                    .arg("Result", format!("0x{:X}", provider_ref))
+                    .arg("HostProxy", host_provider.is_some().to_string()),
+            );
+            Some(provider_ref)
+        }
+        "CGDataProviderCopyData" => {
+            let provider_ref = emu.read_reg("x0").unwrap_or(0);
+            let host_provider = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(provider_ref).unwrap_or(0)
+            };
+            let host_data = host_cg_data_provider_copy_data(host_provider);
+            let data_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                host_data
+                    .map(|host_data| {
+                        register_host_cf_value_with_ownership(
+                            &mut runtime,
+                            host_data,
+                            "CGImageData",
+                            true,
+                        )
+                    })
+                    .unwrap_or(0)
+            };
+            let data_len = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.object_len(data_ref).unwrap_or(0)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CGDataProviderCopyData(provider=0x{:X}, host=0x{:X}) -> 0x{:X} len={}",
+                    provider_ref, host_provider, data_ref, data_len
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "screen-capture", "CGDataProviderCopyData")
+                    .arg("Provider", format!("0x{:X}", provider_ref))
+                    .arg("HostProvider", format!("0x{:X}", host_provider))
+                    .arg("Result", format!("0x{:X}", data_ref))
+                    .arg("Bytes", data_len.to_string())
+                    .arg("HostProxy", host_data.is_some().to_string()),
+            );
+            Some(data_ref)
+        }
+        "CGImageRelease" => {
+            let image_ref = emu.read_reg("x0").unwrap_or(0);
+            let host_image = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(image_ref).unwrap_or(0)
+            };
+            if host_image != 0 {
+                host_cf_release(host_image);
+            }
+            if let Ok(mut runtime) = apple_runtime.lock() {
+                runtime.release(image_ref);
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CGImageRelease(image=0x{:X}, host=0x{:X})",
+                    image_ref, host_image
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "screen-capture", "CGImageRelease")
+                    .arg("Image", format!("0x{:X}", image_ref))
+                    .arg("HostImage", format!("0x{:X}", host_image))
+                    .arg("HostProxy", (host_image != 0).to_string()),
+            );
+            Some(0)
+        }
+        "CGEventSourceKeyState" => {
+            let state_id = emu.read_reg("x0").unwrap_or(0) as u32;
+            let key = emu.read_reg("x1").unwrap_or(0) as u16;
+            let pressed = host_cg_event_source_key_state(state_id, key);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CGEventSourceKeyState(state={}, key={}) -> {}",
+                    state_id, key, pressed as u64
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "keyboard", "CGEventSourceKeyState")
+                    .arg("State", state_id.to_string())
+                    .arg("Key", key.to_string())
+                    .arg("Pressed", pressed.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(pressed as u64)
+        }
+        "CGPreflightListenEventAccess" | "CGRequestListenEventAccess" => {
+            let request = normalized_apple_symbol(symbol) == "CGRequestListenEventAccess";
+            let result = if request {
+                host_cg_request_listen_event_access()
+            } else {
+                host_cg_preflight_listen_event_access()
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_{}() -> {}",
+                    normalized_apple_symbol(symbol),
+                    result as u64
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "privacy", normalized_apple_symbol(symbol))
+                    .arg("Capability", "keyboard-listen")
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(result as u64)
+        }
+        "AXIsProcessTrusted" => {
+            let result = host_ax_is_process_trusted();
+            record_arm64_import(
+                tracker,
+                format!("_AXIsProcessTrusted() -> {}", result as u64),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "accessibility", "AXIsProcessTrusted")
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(result as u64)
+        }
+        "AXIsProcessTrustedWithOptions" => {
+            let options_ref = emu.read_reg("x0").unwrap_or(0);
+            let host_options = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(options_ref).unwrap_or(0)
+            };
+            let result = host_ax_is_process_trusted_with_options(host_options);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_AXIsProcessTrustedWithOptions(options=0x{:X}, host=0x{:X}) -> {}",
+                    options_ref, host_options, result as u64
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "accessibility", "AXIsProcessTrustedWithOptions")
+                    .arg("Options", format!("0x{:X}", options_ref))
+                    .arg("HostOptions", format!("0x{:X}", host_options))
+                    .arg("Result", result.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(result as u64)
         }
         "CFRelease" => {
             let object_ref = emu.read_reg("x0").unwrap_or(0);
@@ -7060,6 +7721,12 @@ mod tests {
             "boolValue",
             "isEqualToString:",
             "respondsToSelector:",
+            "authorizationStatusForMediaType:",
+            "isConnected",
+            "hasMediaType:",
+            "prepareToRecord",
+            "record",
+            "isRecording",
         ] {
             assert!(objc_selector_returns_raw_value(selector));
         }
@@ -7151,6 +7818,21 @@ mod tests {
             "_CGDisplayPixelsHigh",
             "_CGDisplayIsActive",
             "_CGDisplayIsOnline",
+            "_CGPreflightScreenCaptureAccess",
+            "_CGRequestScreenCaptureAccess",
+            "_CGDisplayCreateImage",
+            "_CGImageGetWidth",
+            "_CGImageGetHeight",
+            "_CGImageGetBitsPerPixel",
+            "_CGImageGetBytesPerRow",
+            "_CGImageGetDataProvider",
+            "_CGImageRelease",
+            "_CGDataProviderCopyData",
+            "_CGEventSourceKeyState",
+            "_CGPreflightListenEventAccess",
+            "_CGRequestListenEventAccess",
+            "_AXIsProcessTrusted",
+            "_AXIsProcessTrustedWithOptions",
         ] {
             assert!(
                 is_apple_import_symbol(symbol),
