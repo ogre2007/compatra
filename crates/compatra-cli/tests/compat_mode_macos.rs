@@ -4360,6 +4360,12 @@ typedef CFTypeID (*cf_get_type_id_fn)(CFTypeRef);
 typedef CFTypeID (*cf_type_id_fn)(void);
 typedef int (*sec_random_fn)(void *, size_t, uint8_t *);
 typedef CFStringRef (*sec_error_fn)(OSStatus, void *);
+typedef OSStatus (*sec_item_copy_matching_fn)(CFDictionaryRef, CFTypeRef *);
+typedef OSStatus (*sec_keychain_copy_default_fn)(SecKeychainRef *);
+typedef OSStatus (*sec_keychain_open_fn)(const char *, SecKeychainRef *);
+typedef OSStatus (*sec_keychain_get_path_fn)(SecKeychainRef, UInt32 *, char *);
+typedef OSStatus (*sec_keychain_find_generic_password_fn)(CFTypeRef, UInt32, const char *, UInt32, const char *, UInt32 *, void **, SecKeychainItemRef *);
+typedef OSStatus (*sec_keychain_item_free_content_fn)(SecKeychainAttributeList *, void *);
 
 static int any_nonzero(const unsigned char *buf, unsigned long len) {
     for (unsigned long i = 0; i < len; i++) {
@@ -4408,6 +4414,51 @@ int main(void) {
         static_ok
     );
 
+    SecKeychainRef default_keychain = 0;
+    OSStatus default_ret = SecKeychainCopyDefault(&default_keychain);
+    char keychain_path[1024] = {0};
+    UInt32 keychain_path_len = sizeof(keychain_path);
+    OSStatus path_ret = default_ret == 0 ? SecKeychainGetPath(default_keychain, &keychain_path_len, keychain_path) : -1;
+    SecKeychainRef opened_keychain = 0;
+    OSStatus open_ret = path_ret == 0 ? SecKeychainOpen(keychain_path, &opened_keychain) : -1;
+    const char missing_service[] = "compatra-ci-missing-service-static";
+    const char missing_account[] = "compatra-ci-missing-account-static";
+    UInt32 password_len = 0;
+    void *password_data = 0;
+    SecKeychainItemRef item_ref = 0;
+    OSStatus find_ret = SecKeychainFindGenericPassword(
+        default_keychain,
+        (UInt32)strlen(missing_service),
+        missing_service,
+        (UInt32)strlen(missing_account),
+        missing_account,
+        &password_len,
+        &password_data,
+        &item_ref
+    );
+    OSStatus free_ret = password_data ? SecKeychainItemFreeContent(0, password_data) : 0;
+    OSStatus null_item_ret = SecItemCopyMatching(0, 0);
+    int default_keychain_ok = default_ret != 0 || (default_keychain && path_ret == 0 && keychain_path_len > 0 && keychain_path[0] != 0);
+    int find_ok = find_ret != 0 || password_data || item_ref;
+    int static_security_ok = default_keychain_ok && find_ok && null_item_ret != 0;
+    printf(
+        "compat security static default=%d keychain=%p path_ret=%d path_len=%u path=%s open=%d opened=%p find=%d pw_len=%u pw=%p item=%p free=%d null_item=%d pass=%d\n",
+        default_ret,
+        (void *)default_keychain,
+        path_ret,
+        keychain_path_len,
+        keychain_path,
+        open_ret,
+        (void *)opened_keychain,
+        find_ret,
+        password_len,
+        password_data,
+        (void *)item_ref,
+        free_ret,
+        null_item_ret,
+        static_security_ok
+    );
+
     void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
     void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
     cf_create_cstr_fn dyn_create = (cf_create_cstr_fn)dlsym(cf, "CFStringCreateWithCString");
@@ -4421,8 +4472,14 @@ int main(void) {
     cf_type_id_fn dyn_data_type = (cf_type_id_fn)dlsym(cf, "CFDataGetTypeID");
     sec_random_fn dyn_random = (sec_random_fn)dlsym(sec, "SecRandomCopyBytes");
     sec_error_fn dyn_error = (sec_error_fn)dlsym(sec, "SecCopyErrorMessageString");
+    sec_item_copy_matching_fn dyn_item_copy = (sec_item_copy_matching_fn)dlsym(sec, "SecItemCopyMatching");
+    sec_keychain_copy_default_fn dyn_keychain_default = (sec_keychain_copy_default_fn)dlsym(sec, "SecKeychainCopyDefault");
+    sec_keychain_open_fn dyn_keychain_open = (sec_keychain_open_fn)dlsym(sec, "SecKeychainOpen");
+    sec_keychain_get_path_fn dyn_keychain_path = (sec_keychain_get_path_fn)dlsym(sec, "SecKeychainGetPath");
+    sec_keychain_find_generic_password_fn dyn_keychain_find = (sec_keychain_find_generic_password_fn)dlsym(sec, "SecKeychainFindGenericPassword");
+    sec_keychain_item_free_content_fn dyn_keychain_free = (sec_keychain_item_free_content_fn)dlsym(sec, "SecKeychainItemFreeContent");
     printf(
-        "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p random=%p error=%p\n",
+        "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p random=%p error=%p item_copy=%p kc_default=%p kc_open=%p kc_path=%p kc_find=%p kc_free=%p\n",
         (void *)dyn_create,
         (void *)dyn_get,
         (void *)dyn_len,
@@ -4433,7 +4490,13 @@ int main(void) {
         (void *)dyn_string_type,
         (void *)dyn_data_type,
         (void *)dyn_random,
-        (void *)dyn_error
+        (void *)dyn_error,
+        (void *)dyn_item_copy,
+        (void *)dyn_keychain_default,
+        (void *)dyn_keychain_open,
+        (void *)dyn_keychain_path,
+        (void *)dyn_keychain_find,
+        (void *)dyn_keychain_free
     );
 
     char dyn_buf[64] = {0};
@@ -4472,7 +4535,53 @@ int main(void) {
         derr_buf,
         dyn_ok
     );
-    return static_ok && dyn_ok ? 0 : 1;
+
+    SecKeychainRef dyn_default_keychain = 0;
+    OSStatus dyn_default_ret = dyn_keychain_default ? dyn_keychain_default(&dyn_default_keychain) : -1;
+    char dyn_keychain_path_buf[1024] = {0};
+    UInt32 dyn_keychain_path_len = sizeof(dyn_keychain_path_buf);
+    OSStatus dyn_path_ret = dyn_default_ret == 0 && dyn_keychain_path ? dyn_keychain_path(dyn_default_keychain, &dyn_keychain_path_len, dyn_keychain_path_buf) : -1;
+    SecKeychainRef dyn_opened_keychain = 0;
+    OSStatus dyn_open_ret = dyn_path_ret == 0 && dyn_keychain_open ? dyn_keychain_open(dyn_keychain_path_buf, &dyn_opened_keychain) : -1;
+    const char dyn_missing_service[] = "compatra-ci-missing-service-dynamic";
+    const char dyn_missing_account[] = "compatra-ci-missing-account-dynamic";
+    UInt32 dyn_password_len = 0;
+    void *dyn_password_data = 0;
+    SecKeychainItemRef dyn_item_ref = 0;
+    OSStatus dyn_find_ret = dyn_keychain_find ? dyn_keychain_find(
+        dyn_default_keychain,
+        (UInt32)strlen(dyn_missing_service),
+        dyn_missing_service,
+        (UInt32)strlen(dyn_missing_account),
+        dyn_missing_account,
+        &dyn_password_len,
+        &dyn_password_data,
+        &dyn_item_ref
+    ) : -1;
+    OSStatus dyn_free_ret = dyn_password_data && dyn_keychain_free ? dyn_keychain_free(0, dyn_password_data) : 0;
+    OSStatus dyn_null_item_ret = dyn_item_copy ? dyn_item_copy(0, 0) : 0;
+    int dyn_default_keychain_ok = dyn_default_ret != 0 || (dyn_default_keychain && dyn_path_ret == 0 && dyn_keychain_path_len > 0 && dyn_keychain_path_buf[0] != 0);
+    int dyn_find_ok = dyn_find_ret != 0 || dyn_password_data || dyn_item_ref;
+    int dyn_security_ok = dyn_item_copy && dyn_keychain_default && dyn_keychain_open && dyn_keychain_path && dyn_keychain_find && dyn_keychain_free && dyn_default_keychain_ok && dyn_find_ok && dyn_null_item_ret != 0;
+    printf(
+        "compat security dlsym default=%d keychain=%p path_ret=%d path_len=%u path=%s open=%d opened=%p find=%d pw_len=%u pw=%p item=%p free=%d null_item=%d pass=%d\n",
+        dyn_default_ret,
+        (void *)dyn_default_keychain,
+        dyn_path_ret,
+        dyn_keychain_path_len,
+        dyn_keychain_path_buf,
+        dyn_open_ret,
+        (void *)dyn_opened_keychain,
+        dyn_find_ret,
+        dyn_password_len,
+        dyn_password_data,
+        (void *)dyn_item_ref,
+        dyn_free_ret,
+        dyn_null_item_ret,
+        dyn_security_ok
+    );
+
+    return static_ok && dyn_ok && static_security_ok && dyn_security_ok ? 0 : 1;
 }
 "#,
     )
@@ -6056,7 +6165,13 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
             && stdout.contains(" string_type=0x")
             && stdout.contains(" data_type=0x")
             && stdout.contains(" random=0x")
-            && stdout.contains(" error=0x"),
+            && stdout.contains(" error=0x")
+            && stdout.contains(" item_copy=0x")
+            && stdout.contains(" kc_default=0x")
+            && stdout.contains(" kc_open=0x")
+            && stdout.contains(" kc_path=0x")
+            && stdout.contains(" kc_find=0x")
+            && stdout.contains(" kc_free=0x"),
         "Apple framework fixture did not receive dlsym Apple trampolines; stdout:\n{stdout}"
     );
     assert!(
@@ -6064,6 +6179,18 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
             "compat apple dlsym cf ok=1 len=6 text=dyn-cf data_len=7 data_text=dyndata type_ok=1"
         ) && line.contains(" pass=1")),
         "Apple framework fixture did not complete dlsym CoreFoundation/Security calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security static") && line.contains(" pass=1")),
+        "Apple framework fixture did not complete static Security/keychain calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security dlsym") && line.contains(" pass=1")),
+        "Apple framework fixture did not complete dlsym Security/keychain calls; stdout:\n{stdout}"
     );
 }
 

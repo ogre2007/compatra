@@ -170,6 +170,9 @@ outputs, including:
 - static imports and `dlsym` imports for file descriptors, positioned I/O,
   path metadata and mutation, directory iteration, environment, time, resource,
   and entropy calls
+- static imports and `dlsym` imports for CoreFoundation/Security framework
+  glue, including host-backed keychain status/path lookups and
+  `SecItemCopyMatching`/`SecKeychainFindGenericPassword` status reporting
 - raw Darwin syscall traps and imported syscall thunks for process, time,
   resource, sysctl, and file descriptor calls
 

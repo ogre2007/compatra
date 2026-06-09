@@ -120,6 +120,12 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "SecCertificateCreateWithData"
             | "SecCertificateCopyData"
             | "SecPolicyCreateSSL"
+            | "SecItemCopyMatching"
+            | "SecKeychainCopyDefault"
+            | "SecKeychainOpen"
+            | "SecKeychainGetPath"
+            | "SecKeychainFindGenericPassword"
+            | "SecKeychainItemFreeContent"
             | "SecTrustCreateWithCertificates"
             | "SecTrustEvaluateWithError"
             | "SecTrustGetCertificateCount"
@@ -163,6 +169,15 @@ fn read_guest_u64(emu: &mut dyn Emulator, addr: u64) -> Option<u64> {
     Some(u64::from_le_bytes(array))
 }
 
+fn read_guest_u32(emu: &mut dyn Emulator, addr: u64) -> Option<u32> {
+    if addr == 0 {
+        return None;
+    }
+    let bytes = emu.read_memory(addr, 4).ok()?;
+    let array = <[u8; 4]>::try_from(bytes.as_slice()).ok()?;
+    Some(u32::from_le_bytes(array))
+}
+
 fn write_guest_cstring(emu: &mut dyn Emulator, addr: u64, capacity: usize, bytes: &[u8]) -> bool {
     if addr == 0 || capacity == 0 {
         return false;
@@ -176,6 +191,10 @@ fn write_guest_cstring(emu: &mut dyn Emulator, addr: u64, capacity: usize, bytes
 
 fn write_guest_bool(emu: &mut dyn Emulator, addr: u64, value: bool) -> bool {
     addr != 0 && emu.write_memory(addr, &[value as u8]).is_ok()
+}
+
+fn write_guest_u32(emu: &mut dyn Emulator, addr: u64, value: u32) -> bool {
+    addr != 0 && emu.write_memory(addr, &value.to_le_bytes()).is_ok()
 }
 
 fn cf_string_len(data: &[u8]) -> u64 {
@@ -260,6 +279,12 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_CGDisplayIsOnline",
     "_SecRandomCopyBytes",
     "_SecCopyErrorMessageString",
+    "_SecItemCopyMatching",
+    "_SecKeychainCopyDefault",
+    "_SecKeychainOpen",
+    "_SecKeychainGetPath",
+    "_SecKeychainFindGenericPassword",
+    "_SecKeychainItemFreeContent",
 ];
 
 #[cfg(target_os = "macos")]
@@ -334,6 +359,190 @@ fn host_sec_error_message(status: i32) -> Option<Vec<u8>> {
 }
 
 #[cfg(target_os = "macos")]
+fn host_sec_item_copy_matching(query: u64) -> (i32, u64) {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecItemCopyMatching(
+            query: *const std::ffi::c_void,
+            result: *mut *const std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut result = std::ptr::null();
+    let status = unsafe {
+        SecItemCopyMatching(
+            query as *const std::ffi::c_void,
+            &mut result as *mut *const std::ffi::c_void,
+        )
+    };
+    (status, result as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_item_copy_matching(_query: u64) -> (i32, u64) {
+    (-50, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_keychain_copy_default() -> (i32, u64) {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainCopyDefault(keychain: *mut *mut std::ffi::c_void) -> i32;
+    }
+
+    let mut keychain = std::ptr::null_mut();
+    let status = unsafe { SecKeychainCopyDefault(&mut keychain) };
+    (status, keychain as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_keychain_copy_default() -> (i32, u64) {
+    (-25307, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_keychain_open(path: &[u8]) -> (i32, u64) {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainOpen(
+            path_name: *const std::ffi::c_char,
+            keychain: *mut *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let Ok(path) = std::ffi::CString::new(path) else {
+        return (-50, 0);
+    };
+    let mut keychain = std::ptr::null_mut();
+    let status = unsafe { SecKeychainOpen(path.as_ptr(), &mut keychain) };
+    (status, keychain as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_keychain_open(_path: &[u8]) -> (i32, u64) {
+    (-25294, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_keychain_get_path(keychain: u64) -> (i32, Vec<u8>) {
+    if keychain == 0 {
+        return (-50, Vec::new());
+    }
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainGetPath(
+            keychain: *mut std::ffi::c_void,
+            io_path_length: *mut u32,
+            path_name: *mut std::ffi::c_char,
+        ) -> i32;
+    }
+
+    let mut len = 4096u32;
+    let mut buf = vec![0i8; len as usize];
+    let status = unsafe {
+        SecKeychainGetPath(
+            keychain as *mut std::ffi::c_void,
+            &mut len,
+            buf.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return (status, Vec::new());
+    }
+    let capped_len = (len as usize).min(buf.len());
+    let nul = buf[..capped_len]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(capped_len);
+    (
+        status,
+        buf[..nul]
+            .iter()
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_keychain_get_path(_keychain: u64) -> (i32, Vec<u8>) {
+    (-50, Vec::new())
+}
+
+struct HostGenericPasswordResult {
+    status: i32,
+    password: Vec<u8>,
+    item: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_keychain_find_generic_password(
+    keychain: u64,
+    service: &[u8],
+    account: &[u8],
+) -> HostGenericPasswordResult {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainFindGenericPassword(
+            keychain_or_array: *mut std::ffi::c_void,
+            service_name_length: u32,
+            service_name: *const std::ffi::c_char,
+            account_name_length: u32,
+            account_name: *const std::ffi::c_char,
+            password_length: *mut u32,
+            password_data: *mut *mut std::ffi::c_void,
+            item_ref: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn SecKeychainItemFreeContent(
+            attr_list: *const std::ffi::c_void,
+            data: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut password_len = 0u32;
+    let mut password_data = std::ptr::null_mut();
+    let mut item_ref = std::ptr::null_mut();
+    let status = unsafe {
+        SecKeychainFindGenericPassword(
+            keychain as *mut std::ffi::c_void,
+            service.len().min(u32::MAX as usize) as u32,
+            service.as_ptr() as *const std::ffi::c_char,
+            account.len().min(u32::MAX as usize) as u32,
+            account.as_ptr() as *const std::ffi::c_char,
+            &mut password_len,
+            &mut password_data,
+            &mut item_ref,
+        )
+    };
+    let password = if status == 0 && !password_data.is_null() && password_len <= 1024 * 1024 {
+        unsafe { std::slice::from_raw_parts(password_data as *const u8, password_len as usize) }
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    if !password_data.is_null() {
+        let _ = unsafe { SecKeychainItemFreeContent(std::ptr::null(), password_data) };
+    }
+    HostGenericPasswordResult {
+        status,
+        password,
+        item: item_ref as u64,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_keychain_find_generic_password(
+    _keychain: u64,
+    _service: &[u8],
+    _account: &[u8],
+) -> HostGenericPasswordResult {
+    HostGenericPasswordResult {
+        status: -25300,
+        password: Vec::new(),
+        item: 0,
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn host_cf_release(cf: u64) {
     if cf == 0 {
         return;
@@ -344,6 +553,9 @@ fn host_cf_release(cf: u64) {
     }
     unsafe { CFRelease(cf as *const std::ffi::c_void) };
 }
+
+#[cfg(not(target_os = "macos"))]
+fn host_cf_release(_cf: u64) {}
 
 #[cfg(target_os = "macos")]
 fn host_cf_retain(cf: u64) -> u64 {
@@ -3811,15 +4023,15 @@ fn dispatch_apple_import(
             let keys = read_guest_u64_array(emu, keys_ptr, count, 4096);
             let values = read_guest_u64_array(emu, values_ptr, count, 4096);
             let entries = keys.into_iter().zip(values).collect::<Vec<_>>();
-            let dict_ref = {
+            let (dict_ref, host_proxy) = {
                 let mut runtime = apple_runtime.lock().ok()?;
-                runtime.alloc_dictionary(entries)
+                make_foundation_dictionary_result(&mut runtime, entries)
             };
             record_arm64_import(
                 tracker,
                 format!(
-                    "_CFDictionaryCreate(keys=0x{:X}, values=0x{:X}, count={}) -> 0x{:X}",
-                    keys_ptr, values_ptr, count, dict_ref
+                    "_CFDictionaryCreate(keys=0x{:X}, values=0x{:X}, count={}, host={}) -> 0x{:X}",
+                    keys_ptr, values_ptr, count, host_proxy, dict_ref
                 ),
             );
             Some(dict_ref)
@@ -3989,7 +4201,7 @@ fn dispatch_apple_import(
         "SecRandomCopyBytes" => {
             let count = emu.read_reg("x1").unwrap_or(0) as usize;
             let out_ptr = emu.read_reg("x2").unwrap_or(0);
-            let result = if out_ptr == 0 {
+            let result: i32 = if out_ptr == 0 {
                 -1
             } else if let Some(bytes) = host_sec_random_bytes(count) {
                 if emu.write_memory(out_ptr, &bytes).is_ok() {
@@ -4088,6 +4300,241 @@ fn dispatch_apple_import(
                 ),
             );
             Some(policy_ref)
+        }
+        "SecItemCopyMatching" => {
+            let query_ref = emu.read_reg("x0").unwrap_or(0);
+            let result_out = emu.read_reg("x1").unwrap_or(0);
+            let host_query = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(query_ref).unwrap_or(0)
+            };
+            let (status, host_result) = if host_query != 0 {
+                host_sec_item_copy_matching(host_query)
+            } else {
+                (-50, 0)
+            };
+            let result_ref = if status == 0 && host_result != 0 {
+                let mut runtime = apple_runtime.lock().ok()?;
+                register_host_cf_value_with_ownership(
+                    &mut runtime,
+                    host_result,
+                    "SecItemResult",
+                    true,
+                )
+            } else {
+                if host_result != 0 {
+                    host_cf_release(host_result);
+                }
+                0
+            };
+            if result_out != 0 {
+                let _ = emu.write_memory(result_out, &result_ref.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecItemCopyMatching(query=0x{:X}, host=0x{:X}, out=0x{:X}) -> {} result=0x{:X}",
+                    query_ref, host_query, result_out, status, result_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "secitem", "SecItemCopyMatching")
+                    .arg("Query", format!("0x{:X}", query_ref))
+                    .arg("HostQuery", format!("0x{:X}", host_query))
+                    .arg("ResultOut", format!("0x{:X}", result_out))
+                    .arg("Result", status.to_string())
+                    .arg("Item", format!("0x{:X}", result_ref))
+                    .arg("HostProxy", (host_query != 0).to_string()),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecKeychainCopyDefault" => {
+            let keychain_out = emu.read_reg("x0").unwrap_or(0);
+            let (status, host_keychain) = host_sec_keychain_copy_default();
+            let keychain_ref = if status == 0 && host_keychain != 0 {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.register_host_opaque("SecKeychain", host_keychain)
+            } else {
+                0
+            };
+            if keychain_out != 0 {
+                let _ = emu.write_memory(keychain_out, &keychain_ref.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainCopyDefault(out=0x{:X}) -> {} keychain=0x{:X}",
+                    keychain_out, status, keychain_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "seckeychain", "SecKeychainCopyDefault")
+                    .arg("Out", format!("0x{:X}", keychain_out))
+                    .arg("Result", status.to_string())
+                    .arg("Keychain", format!("0x{:X}", keychain_ref))
+                    .arg("HostProxy", "true"),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecKeychainOpen" => {
+            let path_ptr = emu.read_reg("x0").unwrap_or(0);
+            let keychain_out = emu.read_reg("x1").unwrap_or(0);
+            let path = read_cstring(emu, path_ptr, 4096)
+                .unwrap_or_default()
+                .into_bytes();
+            let (status, host_keychain) = host_sec_keychain_open(&path);
+            let keychain_ref = if status == 0 && host_keychain != 0 {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.register_host_opaque("SecKeychain", host_keychain)
+            } else {
+                0
+            };
+            if keychain_out != 0 {
+                let _ = emu.write_memory(keychain_out, &keychain_ref.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainOpen(path=0x{:X}, out=0x{:X}) -> {} keychain=0x{:X}",
+                    path_ptr, keychain_out, status, keychain_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "seckeychain", "SecKeychainOpen")
+                    .arg("Path", format!("0x{:X}", path_ptr))
+                    .arg("Out", format!("0x{:X}", keychain_out))
+                    .arg("Result", status.to_string())
+                    .arg("Keychain", format!("0x{:X}", keychain_ref))
+                    .arg("Preview", lossy_data_preview(&path, 256))
+                    .arg("HostProxy", "true"),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecKeychainGetPath" => {
+            let keychain_ref = emu.read_reg("x0").unwrap_or(0);
+            let length_ptr = emu.read_reg("x1").unwrap_or(0);
+            let path_ptr = emu.read_reg("x2").unwrap_or(0);
+            let host_keychain = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(keychain_ref).unwrap_or(0)
+            };
+            let (mut status, path) = host_sec_keychain_get_path(host_keychain);
+            let capacity = read_guest_u32(emu, length_ptr).unwrap_or(0) as usize;
+            if status == 0 {
+                let _ = write_guest_u32(emu, length_ptr, path.len() as u32);
+                if !write_guest_cstring(emu, path_ptr, capacity, &path) {
+                    status = -50;
+                }
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainGetPath(keychain=0x{:X}, host=0x{:X}, len=0x{:X}, path=0x{:X}) -> {}",
+                    keychain_ref, host_keychain, length_ptr, path_ptr, status
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "seckeychain", "SecKeychainGetPath")
+                    .arg("Keychain", format!("0x{:X}", keychain_ref))
+                    .arg("HostKeychain", format!("0x{:X}", host_keychain))
+                    .arg("LengthOut", format!("0x{:X}", length_ptr))
+                    .arg("PathOut", format!("0x{:X}", path_ptr))
+                    .arg("Capacity", capacity.to_string())
+                    .arg("Result", status.to_string())
+                    .arg("Preview", lossy_data_preview(&path, 256))
+                    .arg("HostProxy", (host_keychain != 0).to_string()),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecKeychainFindGenericPassword" => {
+            let keychain_ref = emu.read_reg("x0").unwrap_or(0);
+            let service_len = emu.read_reg("x1").unwrap_or(0) as usize;
+            let service_ptr = emu.read_reg("x2").unwrap_or(0);
+            let account_len = emu.read_reg("x3").unwrap_or(0) as usize;
+            let account_ptr = emu.read_reg("x4").unwrap_or(0);
+            let password_len_out = emu.read_reg("x5").unwrap_or(0);
+            let password_data_out = emu.read_reg("x6").unwrap_or(0);
+            let item_out = emu.read_reg("x7").unwrap_or(0);
+            let service = read_guest_bytes(emu, service_ptr, service_len, 64 * 1024);
+            let account = read_guest_bytes(emu, account_ptr, account_len, 64 * 1024);
+            let host_keychain = if keychain_ref == 0 {
+                0
+            } else {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(keychain_ref).unwrap_or(0)
+            };
+            let result = host_sec_keychain_find_generic_password(host_keychain, &service, &account);
+            let password_ptr = if result.status == 0 && !result.password.is_empty() {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.export_bytes(emu, &result.password).unwrap_or(0)
+            } else {
+                0
+            };
+            let item_ref = if result.status == 0 && result.item != 0 {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.register_host_opaque("SecKeychainItem", result.item)
+            } else {
+                0
+            };
+            let _ = write_guest_u32(emu, password_len_out, result.password.len() as u32);
+            if password_data_out != 0 {
+                let _ = emu.write_memory(password_data_out, &password_ptr.to_le_bytes());
+            }
+            if item_out != 0 {
+                let _ = emu.write_memory(item_out, &item_ref.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainFindGenericPassword(keychain=0x{:X}, service_len={}, account_len={}) -> {} password_len={} item=0x{:X}",
+                    keychain_ref,
+                    service_len,
+                    account_len,
+                    result.status,
+                    result.password.len(),
+                    item_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "seckeychain", "SecKeychainFindGenericPassword")
+                    .arg("Keychain", format!("0x{:X}", keychain_ref))
+                    .arg("HostKeychain", format!("0x{:X}", host_keychain))
+                    .arg("Service", lossy_data_preview(&service, 128))
+                    .arg("Account", lossy_data_preview(&account, 128))
+                    .arg("PasswordLen", result.password.len().to_string())
+                    .arg("PasswordOut", format!("0x{:X}", password_data_out))
+                    .arg("PasswordGuestPtr", format!("0x{:X}", password_ptr))
+                    .arg("Item", format!("0x{:X}", item_ref))
+                    .arg("Result", result.status.to_string())
+                    .arg("HostProxy", "true"),
+            );
+            Some(result.status as i64 as u64)
+        }
+        "SecKeychainItemFreeContent" => {
+            let attr_list = emu.read_reg("x0").unwrap_or(0);
+            let data = emu.read_reg("x1").unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainItemFreeContent(attrs=0x{:X}, data=0x{:X}) -> 0",
+                    attr_list, data
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "seckeychain", "SecKeychainItemFreeContent")
+                    .arg("Attributes", format!("0x{:X}", attr_list))
+                    .arg("Data", format!("0x{:X}", data))
+                    .arg("Result", "0")
+                    .arg("HostProxy", "false")
+                    .arg("Model", "guest-copy-cleanup"),
+            );
+            Some(0)
         }
         "SecTrustCreateWithCertificates" => {
             let certificates = emu.read_reg("x0").unwrap_or(0);
@@ -5913,18 +6360,18 @@ pub fn install_apple_imports(
             let keys = read_guest_u64_array(emu, keys_ptr, count, 4096);
             let values = read_guest_u64_array(emu, values_ptr, count, 4096);
             let entries = keys.into_iter().zip(values).collect::<Vec<_>>();
-            let dict_ref = {
+            let (dict_ref, host_proxy) = {
                 let mut runtime = match apple_runtime.lock() {
                     Ok(runtime) => runtime,
                     Err(_) => return 0,
                 };
-                runtime.alloc_dictionary(entries)
+                make_foundation_dictionary_result(&mut runtime, entries)
             };
             record_arm64_import(
                 &tracker,
                 format!(
-                    "_CFDictionaryCreate(keys=0x{:X}, values=0x{:X}, count={}) -> 0x{:X}",
-                    keys_ptr, values_ptr, count, dict_ref
+                    "_CFDictionaryCreate(keys=0x{:X}, values=0x{:X}, count={}, host={}) -> 0x{:X}",
+                    keys_ptr, values_ptr, count, host_proxy, dict_ref
                 ),
             );
             emit_arm64_event(
@@ -5933,7 +6380,8 @@ pub fn install_apple_imports(
                     .arg("Keys", format!("0x{:X}", keys_ptr))
                     .arg("Values", format!("0x{:X}", values_ptr))
                     .arg("Count", count.to_string())
-                    .arg("Result", format!("0x{:X}", dict_ref)),
+                    .arg("Result", format!("0x{:X}", dict_ref))
+                    .arg("HostProxy", host_proxy.to_string()),
             );
             dict_ref
         })?;
@@ -6507,6 +6955,27 @@ mod tests {
             assert!(
                 is_apple_import_symbol(symbol),
                 "{symbol} should be Apple-dispatched"
+            );
+        }
+    }
+
+    #[test]
+    fn security_keychain_imports_use_direct_dispatch_hooks() {
+        for symbol in [
+            "_SecItemCopyMatching",
+            "_SecKeychainCopyDefault",
+            "_SecKeychainOpen",
+            "_SecKeychainGetPath",
+            "_SecKeychainFindGenericPassword",
+            "_SecKeychainItemFreeContent",
+        ] {
+            assert!(
+                is_apple_import_symbol(symbol),
+                "{symbol} should be Apple-dispatched"
+            );
+            assert!(
+                APPLE_DIRECT_DISPATCH_IMPORTS.contains(&symbol),
+                "{symbol} must be installed by install_apple_imports for static imports"
             );
         }
     }

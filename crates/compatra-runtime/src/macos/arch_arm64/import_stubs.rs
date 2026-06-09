@@ -246,6 +246,12 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_NSApplicationMain"
             | "_SecCertificateCopyData"
             | "_SecCertificateCreateWithData"
+            | "_SecItemCopyMatching"
+            | "_SecKeychainCopyDefault"
+            | "_SecKeychainFindGenericPassword"
+            | "_SecKeychainGetPath"
+            | "_SecKeychainItemFreeContent"
+            | "_SecKeychainOpen"
             | "_SecPolicyCreateSSL"
             | "_SecTrustCreateWithCertificates"
             | "_SecTrustEvaluateWithError"
@@ -412,6 +418,12 @@ mod tests {
         for symbol in [
             "_SecCertificateCreateWithData",
             "_SecCertificateCopyData",
+            "_SecItemCopyMatching",
+            "_SecKeychainCopyDefault",
+            "_SecKeychainOpen",
+            "_SecKeychainGetPath",
+            "_SecKeychainFindGenericPassword",
+            "_SecKeychainItemFreeContent",
             "_SecPolicyCreateSSL",
             "_SecTrustCreateWithCertificates",
             "_SecTrustEvaluateWithError",
