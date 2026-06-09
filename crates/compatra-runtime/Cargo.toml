@@ -1,6 +1,6 @@
 [package]
 name = "compatra-runtime"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Compatra macOS arm64 emulation runtime"
 license = "GPL-2.0"

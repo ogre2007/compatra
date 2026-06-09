@@ -1,6 +1,6 @@
 [package]
 name = "compatra-threading"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Guest threading scheduler state for Compatra"
 license = "GPL-2.0"

@@ -136,6 +136,12 @@ const DARWIN_ATTR_FILE_RSRCLENGTH: u32 = 0x0000_1000;
 const DARWIN_ATTR_FILE_RSRCALLOCSIZE: u32 = 0x0000_2000;
 #[cfg(target_os = "macos")]
 const DARWIN_FSOPT_NOFOLLOW: u64 = 0x0000_0001;
+#[cfg(target_os = "macos")]
+const DARWIN_GLOB_PATHC_OFFSET: u64 = 0;
+#[cfg(target_os = "macos")]
+const DARWIN_GLOB_OFFS_OFFSET: u64 = 16;
+#[cfg(target_os = "macos")]
+const DARWIN_GLOB_PATHV_OFFSET: u64 = 32;
 impl CompatibilityServices {
     pub fn open_path_arg0<M: GuestMemory + ?Sized>(
         &self,
@@ -4291,26 +4297,19 @@ fn write_guest_glob_fields<M: GuestMemory + ?Sized>(
     if glob_ptr == 0 {
         return Err(libc::EFAULT as u32);
     }
-    write_guest_u64(memory, glob_ptr, pathc).map_err(|_| libc::EFAULT as u32)?;
-    write_guest_u64(memory, glob_ptr + 8, pathv).map_err(|_| libc::EFAULT as u32)?;
-    write_guest_u64(memory, glob_ptr + 16, offs).map_err(|_| libc::EFAULT as u32)?;
-    let _ = write_guest_i32(memory, glob_ptr + 24, 0);
-    let _ = write_guest_u64(memory, glob_ptr + 32, pathv);
+    write_guest_u64(memory, glob_ptr + DARWIN_GLOB_PATHC_OFFSET, pathc)
+        .map_err(|_| libc::EFAULT as u32)?;
+    write_guest_u64(memory, glob_ptr + DARWIN_GLOB_OFFS_OFFSET, offs)
+        .map_err(|_| libc::EFAULT as u32)?;
+    write_guest_u64(memory, glob_ptr + DARWIN_GLOB_PATHV_OFFSET, pathv)
+        .map_err(|_| libc::EFAULT as u32)?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn read_guest_glob_pathv<M: GuestMemory + ?Sized>(memory: &mut M, glob_ptr: u64) -> Option<u64> {
-    let first = memory
-        .read_memory(glob_ptr + 8, 8)
-        .ok()
-        .and_then(|bytes| read_u64_at(&bytes, 0))
-        .unwrap_or(0);
-    if plausible_guest_ptr(memory, first) {
-        return Some(first);
-    }
     memory
-        .read_memory(glob_ptr + 32, 8)
+        .read_memory(glob_ptr + DARWIN_GLOB_PATHV_OFFSET, 8)
         .ok()
         .and_then(|bytes| read_u64_at(&bytes, 0))
         .filter(|ptr| plausible_guest_ptr(memory, *ptr))
@@ -4337,7 +4336,7 @@ fn proxy_host_glob<M: GuestMemory + ?Sized>(
         Err(errno) => return Some(host_call_value(errno as u64)),
     };
     let offs = memory
-        .read_memory(glob_ptr + 16, 8)
+        .read_memory(glob_ptr + DARWIN_GLOB_OFFS_OFFSET, 8)
         .ok()
         .and_then(|bytes| read_u64_at(&bytes, 0))
         .filter(|_| flags & libc::GLOB_DOOFFS as u64 != 0)
@@ -4404,12 +4403,12 @@ fn proxy_guest_globfree<M: GuestMemory + ?Sized>(
         return Some(host_call_value(0));
     }
     let pathc = memory
-        .read_memory(glob_ptr, 8)
+        .read_memory(glob_ptr + DARWIN_GLOB_PATHC_OFFSET, 8)
         .ok()
         .and_then(|bytes| read_u64_at(&bytes, 0))
         .unwrap_or(0) as usize;
     let offs = memory
-        .read_memory(glob_ptr + 16, 8)
+        .read_memory(glob_ptr + DARWIN_GLOB_OFFS_OFFSET, 8)
         .ok()
         .and_then(|bytes| read_u64_at(&bytes, 0))
         .unwrap_or(0) as usize;

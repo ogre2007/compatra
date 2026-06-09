@@ -1,6 +1,6 @@
 [package]
 name = "compatra-cli"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Compatra compatibility-only CLI for macOS arm64 userland"
 license = "GPL-2.0"

@@ -4078,7 +4078,7 @@ typedef int (*scandir_fn)(const char *, struct dirent ***, int (*)(const struct 
 typedef int (*alphasort_fn)(const struct dirent **, const struct dirent **);
 typedef int (*glob_fn)(const char *, int, int (*)(const char *, int), glob_t *);
 typedef void (*globfree_fn)(glob_t *);
-typedef int (*getattrlist_fn)(const char *, struct attrlist *, void *, size_t, unsigned long);
+typedef int (*getattrlist_fn)(const char *, void *, void *, size_t, unsigned int);
 typedef int (*getentropy_fn)(void *, size_t);
 
 extern int getentropy(void *, size_t);

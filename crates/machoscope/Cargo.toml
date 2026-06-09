@@ -1,6 +1,6 @@
 [package]
 name = "machoscope"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Machoscope macOS-focused Mach-O malware analysis runner"
 license = "GPL-2.0"
