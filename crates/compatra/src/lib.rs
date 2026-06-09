@@ -435,6 +435,8 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     Strrchr,
     #[cfg(target_os = "macos")]
+    Strstr,
+    #[cfg(target_os = "macos")]
     Strdup,
     #[cfg(target_os = "macos")]
     Cxx(CxxImportKind),
@@ -1000,6 +1002,7 @@ impl CompatibilityServices {
                 HostImportKind::Strcat => Some(self.strcat(memory, args[0], args[1])?),
                 HostImportKind::Strchr => Some(self.strchr(memory, args[0], args[1])?),
                 HostImportKind::Strrchr => Some(self.strrchr(memory, args[0], args[1])?),
+                HostImportKind::Strstr => Some(self.strstr(memory, args[0], args[1])?),
                 HostImportKind::Strdup => Some(self.strdup(memory, args[0])?),
                 HostImportKind::Cxx(kind) => proxy_cxx_import(kind, memory, args),
                 HostImportKind::OpenDir => Some(self.opendir_path(memory, args[0])?),
@@ -1822,6 +1825,23 @@ impl CompatibilityServices {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (&mut *memory, str_ptr, needle);
+            None
+        }
+    }
+
+    pub fn strstr<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        haystack_ptr: u64,
+        needle_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_strstr(memory, haystack_ptr, needle_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, haystack_ptr, needle_ptr);
             None
         }
     }
@@ -2965,6 +2985,7 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "strcat" | "__strcat_chk" => Some(HostImportKind::Strcat),
             "strchr" => Some(HostImportKind::Strchr),
             "strrchr" => Some(HostImportKind::Strrchr),
+            "strstr" => Some(HostImportKind::Strstr),
             "strdup" => Some(HostImportKind::Strdup),
             "opendir" => Some(HostImportKind::OpenDir),
             "fdopendir" => Some(HostImportKind::FdOpenDir),
@@ -4902,6 +4923,26 @@ fn proxy_guest_strchr<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_guest_strstr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    haystack_ptr: u64,
+    needle_ptr: u64,
+) -> Option<HostCallResult> {
+    let haystack = read_cstring_bytes(memory, haystack_ptr, MAX_GUEST_STRING_BYTES).ok()?;
+    let needle = read_cstring_bytes(memory, needle_ptr, MAX_GUEST_STRING_BYTES).ok()?;
+    if needle.is_empty() {
+        return Some(host_call_value(haystack_ptr));
+    }
+
+    let found = haystack
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+        .map(|idx| haystack_ptr.saturating_add(idx as u64))
+        .unwrap_or(0);
+    Some(host_call_value(found))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_guest_strdup<M: GuestMemory + ?Sized>(
     memory: &mut M,
     str_ptr: u64,
@@ -5081,6 +5122,7 @@ mod tests {
             assert!(compat.should_proxy_import("_strcat"));
             assert!(compat.should_proxy_import("_strchr"));
             assert!(compat.should_proxy_import("_strrchr"));
+            assert!(compat.should_proxy_import("_strstr"));
             assert!(compat.should_proxy_import("_strdup"));
             assert!(compat.should_proxy_import("__ZNSt3__112__next_primeEm"));
             assert!(compat.should_proxy_import("_ZNSt3__112__next_primeEm"));

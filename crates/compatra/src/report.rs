@@ -434,6 +434,7 @@ fn compat_call_family(raw_call: &str, normalized: &str) -> &'static str {
             | "strcat"
             | "strchr"
             | "strrchr"
+            | "strstr"
             | "strdup"
     ) {
         return "memory-string";
