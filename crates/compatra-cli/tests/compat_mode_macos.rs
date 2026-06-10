@@ -1770,11 +1770,14 @@ fn compile_arm64_network_fixture() -> PathBuf {
         r#"#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -1782,6 +1785,9 @@ fn compile_arm64_network_fixture() -> PathBuf {
 typedef int (*getaddrinfo_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
 typedef void (*freeaddrinfo_fn)(struct addrinfo *);
 typedef int (*getnameinfo_fn)(const struct sockaddr *, socklen_t, char *, socklen_t, char *, socklen_t, int);
+typedef int (*getifaddrs_fn)(struct ifaddrs **);
+typedef void (*freeifaddrs_fn)(struct ifaddrs *);
+typedef unsigned int (*if_nametoindex_fn)(const char *);
 typedef in_addr_t (*inet_addr_fn)(const char *);
 typedef int (*inet_aton_fn)(const char *, struct in_addr *);
 typedef const char *(*inet_ntop_fn)(int, const void *, char *, socklen_t);
@@ -1942,17 +1948,54 @@ static int probe_nameinfo(
     return 0;
 }
 
+static int probe_ifaddrs(
+    const char *label,
+    getifaddrs_fn get_ifs,
+    freeifaddrs_fn free_ifs,
+    if_nametoindex_fn name_to_index
+) {
+    struct ifaddrs *ifs = 0;
+    errno = 0;
+    int ret = get_ifs(&ifs);
+    int saved_errno = errno;
+    int count = 0;
+    int saw_lo = 0;
+    char first[64] = {0};
+    for (struct ifaddrs *cur = ifs; cur && count < 128; cur = cur->ifa_next) {
+        if (count == 0 && cur->ifa_name) {
+            snprintf(first, sizeof(first), "%s", cur->ifa_name);
+        }
+        if (cur->ifa_name && strcmp(cur->ifa_name, "lo0") == 0) {
+            saw_lo = 1;
+        }
+        count++;
+    }
+    unsigned int lo_index = name_to_index("lo0");
+    printf("compat ifaddrs %s ret=%d count=%d first=%s saw_lo=%d lo_index=%u errno=%d\n", label, ret, count, first, saw_lo, lo_index, saved_errno);
+    if (ifs) {
+        free_ifs(ifs);
+    }
+    if (ret != 0 || count <= 0 || !saw_lo || lo_index == 0) {
+        return 15;
+    }
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += probe_gai("static", getaddrinfo, freeaddrinfo);
     failures += probe_msg("static", sendmsg, recvmsg);
     failures += probe_inet_legacy("static", inet_addr, inet_aton, inet_ntop, htonl, htons, ntohl, ntohs);
     failures += probe_nameinfo("static", getnameinfo, inet_aton, htons);
+    failures += probe_ifaddrs("static", getifaddrs, freeifaddrs, if_nametoindex);
 
     void *self = dlopen(NULL, RTLD_NOW);
     getaddrinfo_fn dyn_gai = (getaddrinfo_fn)dlsym(self, "getaddrinfo");
     freeaddrinfo_fn dyn_free = (freeaddrinfo_fn)dlsym(self, "freeaddrinfo");
     getnameinfo_fn dyn_nameinfo = (getnameinfo_fn)dlsym(self, "getnameinfo");
+    getifaddrs_fn dyn_ifaddrs = (getifaddrs_fn)dlsym(self, "getifaddrs");
+    freeifaddrs_fn dyn_freeifaddrs = (freeifaddrs_fn)dlsym(self, "freeifaddrs");
+    if_nametoindex_fn dyn_ifindex = (if_nametoindex_fn)dlsym(self, "if_nametoindex");
     inet_addr_fn dyn_inet_addr = (inet_addr_fn)dlsym(self, "inet_addr");
     inet_aton_fn dyn_inet_aton = (inet_aton_fn)dlsym(self, "inet_aton");
     inet_ntop_fn dyn_inet_ntop = (inet_ntop_fn)dlsym(self, "inet_ntop");
@@ -1965,10 +2008,13 @@ int main(void) {
     sendmsg_fn dyn_sendmsg = (sendmsg_fn)dlsym(self, "sendmsg");
     recvmsg_fn dyn_recvmsg = (recvmsg_fn)dlsym(self, "recvmsg");
     printf(
-        "compat dlsym network ptrs gai=%p free=%p nameinfo=%p inet_addr=%p inet_aton=%p inet_ntop=%p htonl=%p htons=%p ntohl=%p ntohs=%p send=%p recv=%p sendmsg=%p recvmsg=%p\n",
+        "compat dlsym network ptrs gai=%p free=%p nameinfo=%p ifaddrs=%p freeifaddrs=%p ifindex=%p inet_addr=%p inet_aton=%p inet_ntop=%p htonl=%p htons=%p ntohl=%p ntohs=%p send=%p recv=%p sendmsg=%p recvmsg=%p\n",
         (void *)dyn_gai,
         (void *)dyn_free,
         (void *)dyn_nameinfo,
+        (void *)dyn_ifaddrs,
+        (void *)dyn_freeifaddrs,
+        (void *)dyn_ifindex,
         (void *)dyn_inet_addr,
         (void *)dyn_inet_aton,
         (void *)dyn_inet_ntop,
@@ -1981,13 +2027,14 @@ int main(void) {
         (void *)dyn_sendmsg,
         (void *)dyn_recvmsg
     );
-    if (dyn_gai == 0 || dyn_free == 0 || dyn_nameinfo == 0 || dyn_inet_addr == 0 || dyn_inet_aton == 0 || dyn_inet_ntop == 0 || dyn_htonl == 0 || dyn_htons == 0 || dyn_ntohl == 0 || dyn_ntohs == 0 || dyn_send == 0 || dyn_recv == 0 || dyn_sendmsg == 0 || dyn_recvmsg == 0) {
+    if (dyn_gai == 0 || dyn_free == 0 || dyn_nameinfo == 0 || dyn_ifaddrs == 0 || dyn_freeifaddrs == 0 || dyn_ifindex == 0 || dyn_inet_addr == 0 || dyn_inet_aton == 0 || dyn_inet_ntop == 0 || dyn_htonl == 0 || dyn_htons == 0 || dyn_ntohl == 0 || dyn_ntohs == 0 || dyn_send == 0 || dyn_recv == 0 || dyn_sendmsg == 0 || dyn_recvmsg == 0) {
         return 4;
     }
     failures += probe_gai("dlsym", dyn_gai, dyn_free);
     failures += probe_msg("dlsym", dyn_sendmsg, dyn_recvmsg);
     failures += probe_inet_legacy("dlsym", dyn_inet_addr, dyn_inet_aton, dyn_inet_ntop, dyn_htonl, dyn_htons, dyn_ntohl, dyn_ntohs);
     failures += probe_nameinfo("dlsym", dyn_nameinfo, dyn_inet_aton, dyn_htons);
+    failures += probe_ifaddrs("dlsym", dyn_ifaddrs, dyn_freeifaddrs, dyn_ifindex);
 
     int sv[2] = {-1, -1};
     int pair_ret = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
@@ -3466,6 +3513,7 @@ fn compile_arm64_path_fixture() -> (PathBuf, PathBuf) {
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #define SYS_CHMOD 0x200000F
@@ -3500,6 +3548,14 @@ typedef ssize_t (*readlink_fn)(const char *, char *, size_t);
 typedef ssize_t (*readlinkat_fn)(int, const char *, char *, size_t);
 typedef int (*symlink_fn)(const char *, const char *);
 typedef char *(*realpath_fn)(const char *, char *);
+typedef ssize_t (*getxattr_fn)(const char *, const char *, void *, size_t, uint32_t, int);
+typedef ssize_t (*fgetxattr_fn)(int, const char *, void *, size_t, uint32_t, int);
+typedef int (*setxattr_fn)(const char *, const char *, const void *, size_t, uint32_t, int);
+typedef int (*fsetxattr_fn)(int, const char *, const void *, size_t, uint32_t, int);
+typedef ssize_t (*listxattr_fn)(const char *, char *, size_t, int);
+typedef ssize_t (*flistxattr_fn)(int, char *, size_t, int);
+typedef int (*removexattr_fn)(const char *, const char *, int);
+typedef int (*fremovexattr_fn)(int, const char *, int);
 
 extern char *realpath(const char *, char *);
 
@@ -3521,6 +3577,22 @@ static long compatra_syscall6(long num, long a0, long a1, long a2, long a3, long
 
 static int text_is(const char *text, const char *expected) {{
     return strcmp(text, expected) == 0;
+}}
+
+static int xattr_list_has_name(const char *list, ssize_t len, const char *name) {{
+    ssize_t offset = 0;
+    while (offset < len) {{
+        const char *entry = list + offset;
+        size_t entry_len = strlen(entry);
+        if (entry_len == 0) {{
+            break;
+        }}
+        if (strcmp(entry, name) == 0) {{
+            return 1;
+        }}
+        offset += (ssize_t)entry_len + 1;
+    }}
+    return 0;
 }}
 
 static void fixture_dir_from_argv0(const char *argv0, char *out, size_t out_len) {{
@@ -3625,6 +3697,18 @@ int main(int argc, char **argv) {{
     int lstat_ret = lstat("alpha.link", &lst);
     char resolved[4096] = {{0}};
     char *realpath_ret = realpath("alpha.txt", resolved);
+    const char *xattr_name = "com.compatra.test";
+    const char *xattr_value = "xattr-ok";
+    char xattr_buf[64] = {{0}};
+    char xattr_list[256] = {{0}};
+    int xattr_set = setxattr("alpha.txt", xattr_name, xattr_value, strlen(xattr_value), 0, 0);
+    ssize_t xattr_get = getxattr("alpha.txt", xattr_name, xattr_buf, sizeof(xattr_buf) - 1, 0, 0);
+    if (xattr_get >= 0 && xattr_get < (ssize_t)sizeof(xattr_buf)) {{
+        xattr_buf[xattr_get] = 0;
+    }}
+    ssize_t xattr_list_ret = listxattr("alpha.txt", xattr_list, sizeof(xattr_list), 0);
+    int xattr_has = xattr_list_has_name(xattr_list, xattr_list_ret, xattr_name);
+    int xattr_remove = removexattr("alpha.txt", xattr_name, 0);
     printf(
         "compat path static access=%d stat=%d size=%lld fstat=%d size=%lld symlink=%d readlink=%ld target=%s lstat=%d linksize=%lld realpath=%p resolved=%s errno=%d\n",
         access_ret,
@@ -3645,8 +3729,12 @@ int main(int argc, char **argv) {{
     printf("compat path static mode chmod=%d fchmod=%d truncate=%d ftruncate=%d errno=%d\n", chmod_ret, fchmod_ret, truncate_ret, ftruncate_ret, errno);
     printf("compat path static sizes stat=%lld fstat=%lld link=%lld\n", (long long)st.st_size, (long long)fst.st_size, (long long)lst.st_size);
     printf("compat path static link symlink=%d readlink=%ld target=%s realpath=%p errno=%d\n", symlink_ret, readlink_ret, link_target, (void *)realpath_ret, errno);
+    printf("compat path static xattr set=%d get=%ld text=%s list=%ld has=%d remove=%d errno=%d\n", xattr_set, (long)xattr_get, xattr_buf, (long)xattr_list_ret, xattr_has, xattr_remove, errno);
     if (fd < 0 || chmod_ret != 0 || fchmod_ret != 0 || truncate_ret != 0 || ftruncate_ret != 0 || access_ret != 0 || stat_ret != 0 || st.st_size != 5 || fstat_ret != 0 || fst.st_size != 5 || symlink_ret != 0 || readlink_ret != 9 || !text_is(link_target, "alpha.txt") || lstat_ret != 0 || realpath_ret == 0) {{
         failures += 20;
+    }}
+    if (xattr_set != 0 || xattr_get != (ssize_t)strlen(xattr_value) || !text_is(xattr_buf, xattr_value) || xattr_list_ret <= 0 || !xattr_has || xattr_remove != 0) {{
+        failures += 25;
     }}
     close(fd);
 
@@ -3710,6 +3798,14 @@ int main(int argc, char **argv) {{
     readlinkat_fn dyn_readlinkat = (readlinkat_fn)dlsym(self, "readlinkat");
     symlink_fn dyn_symlink = (symlink_fn)dlsym(self, "symlink");
     realpath_fn dyn_realpath = (realpath_fn)dlsym(self, "realpath");
+    getxattr_fn dyn_getxattr = (getxattr_fn)dlsym(self, "getxattr");
+    fgetxattr_fn dyn_fgetxattr = (fgetxattr_fn)dlsym(self, "fgetxattr");
+    setxattr_fn dyn_setxattr = (setxattr_fn)dlsym(self, "setxattr");
+    fsetxattr_fn dyn_fsetxattr = (fsetxattr_fn)dlsym(self, "fsetxattr");
+    listxattr_fn dyn_listxattr = (listxattr_fn)dlsym(self, "listxattr");
+    flistxattr_fn dyn_flistxattr = (flistxattr_fn)dlsym(self, "flistxattr");
+    removexattr_fn dyn_removexattr = (removexattr_fn)dlsym(self, "removexattr");
+    fremovexattr_fn dyn_fremovexattr = (fremovexattr_fn)dlsym(self, "fremovexattr");
     printf(
         "compat path dlsym ptrs %p %p %p %p %p %p %p %p %p %p %p %p %p\n",
         (void *)dyn_access,
@@ -3738,7 +3834,18 @@ int main(int argc, char **argv) {{
         (void *)dyn_renameat,
         (void *)dyn_readlinkat
     );
-    if (!dyn_access || !dyn_chmod || !dyn_fchmod || !dyn_fchmodat || !dyn_chdir || !dyn_getcwd || !dyn_stat || !dyn_lstat || !dyn_fstat || !dyn_truncate || !dyn_ftruncate || !dyn_mkdir || !dyn_mkdirat || !dyn_rmdir || !dyn_unlink || !dyn_unlinkat || !dyn_rename || !dyn_renameat || !dyn_readlink || !dyn_readlinkat || !dyn_symlink || !dyn_realpath) {{
+    printf(
+        "compat path dlsym xattr ptrs get=%p fget=%p set=%p fset=%p list=%p flist=%p remove=%p fremove=%p\n",
+        (void *)dyn_getxattr,
+        (void *)dyn_fgetxattr,
+        (void *)dyn_setxattr,
+        (void *)dyn_fsetxattr,
+        (void *)dyn_listxattr,
+        (void *)dyn_flistxattr,
+        (void *)dyn_removexattr,
+        (void *)dyn_fremovexattr
+    );
+    if (!dyn_access || !dyn_chmod || !dyn_fchmod || !dyn_fchmodat || !dyn_chdir || !dyn_getcwd || !dyn_stat || !dyn_lstat || !dyn_fstat || !dyn_truncate || !dyn_ftruncate || !dyn_mkdir || !dyn_mkdirat || !dyn_rmdir || !dyn_unlink || !dyn_unlinkat || !dyn_rename || !dyn_renameat || !dyn_readlink || !dyn_readlinkat || !dyn_symlink || !dyn_realpath || !dyn_getxattr || !dyn_fgetxattr || !dyn_setxattr || !dyn_fsetxattr || !dyn_listxattr || !dyn_flistxattr || !dyn_removexattr || !dyn_fremovexattr) {{
         return 40;
     }}
 
@@ -3770,6 +3877,30 @@ int main(int argc, char **argv) {{
     int dyn_lstat_ret = dyn_lstat("dyn.link", &dyn_lst);
     char dyn_resolved[4096] = {{0}};
     char *dyn_realpath_ret = dyn_realpath("dyn-new.txt", dyn_resolved);
+    const char *dyn_xattr_name = "com.compatra.dynamic";
+    const char *dyn_xattr_value = "dyn-xattr-ok";
+    const char *dyn_fxattr_name = "com.compatra.fd";
+    const char *dyn_fxattr_value = "fd-xattr-ok";
+    char dyn_xattr_buf[64] = {{0}};
+    char dyn_fxattr_buf[64] = {{0}};
+    char dyn_xattr_list[256] = {{0}};
+    char dyn_fxattr_list[256] = {{0}};
+    int dyn_xattr_set = dyn_setxattr("dyn-new.txt", dyn_xattr_name, dyn_xattr_value, strlen(dyn_xattr_value), 0, 0);
+    ssize_t dyn_xattr_get = dyn_getxattr("dyn-new.txt", dyn_xattr_name, dyn_xattr_buf, sizeof(dyn_xattr_buf) - 1, 0, 0);
+    if (dyn_xattr_get >= 0 && dyn_xattr_get < (ssize_t)sizeof(dyn_xattr_buf)) {{
+        dyn_xattr_buf[dyn_xattr_get] = 0;
+    }}
+    ssize_t dyn_xattr_list_ret = dyn_listxattr("dyn-new.txt", dyn_xattr_list, sizeof(dyn_xattr_list), 0);
+    int dyn_xattr_has = xattr_list_has_name(dyn_xattr_list, dyn_xattr_list_ret, dyn_xattr_name);
+    int dyn_fxattr_set = dyn_fsetxattr(dyn_fd, dyn_fxattr_name, dyn_fxattr_value, strlen(dyn_fxattr_value), 0, 0);
+    ssize_t dyn_fxattr_get = dyn_fgetxattr(dyn_fd, dyn_fxattr_name, dyn_fxattr_buf, sizeof(dyn_fxattr_buf) - 1, 0, 0);
+    if (dyn_fxattr_get >= 0 && dyn_fxattr_get < (ssize_t)sizeof(dyn_fxattr_buf)) {{
+        dyn_fxattr_buf[dyn_fxattr_get] = 0;
+    }}
+    ssize_t dyn_fxattr_list_ret = dyn_flistxattr(dyn_fd, dyn_fxattr_list, sizeof(dyn_fxattr_list), 0);
+    int dyn_fxattr_has = xattr_list_has_name(dyn_fxattr_list, dyn_fxattr_list_ret, dyn_fxattr_name);
+    int dyn_fxattr_remove = dyn_fremovexattr(dyn_fd, dyn_fxattr_name, 0);
+    int dyn_xattr_remove = dyn_removexattr("dyn-new.txt", dyn_xattr_name, 0);
     printf(
         "compat path dlsym file rename=%d access=%d stat=%d size=%lld fstat=%d size=%lld symlink=%d readlink=%ld target=%s lstat=%d realpath=%p resolved=%s errno=%d\n",
         dyn_rename_ret,
@@ -3789,8 +3920,26 @@ int main(int argc, char **argv) {{
     printf("compat path dlsym stat rename=%d access=%d stat=%d fstat=%d lstat=%d errno=%d\n", dyn_rename_ret, dyn_access_ret, dyn_stat_ret, dyn_fstat_ret, dyn_lstat_ret, errno);
     printf("compat path dlsym sizes stat=%lld fstat=%lld\n", (long long)dyn_st.st_size, (long long)dyn_fst.st_size);
     printf("compat path dlsym link symlink=%d readlink=%ld target=%s realpath=%p errno=%d\n", dyn_symlink_ret, dyn_readlink_ret, dyn_link_target, (void *)dyn_realpath_ret, errno);
+    printf("compat path dlsym xattr set=%d get=%ld text=%s list=%ld has=%d remove=%d fset=%d fget=%ld ftext=%s flist=%ld fhas=%d fremove=%d errno=%d\n",
+        dyn_xattr_set,
+        (long)dyn_xattr_get,
+        dyn_xattr_buf,
+        (long)dyn_xattr_list_ret,
+        dyn_xattr_has,
+        dyn_xattr_remove,
+        dyn_fxattr_set,
+        (long)dyn_fxattr_get,
+        dyn_fxattr_buf,
+        (long)dyn_fxattr_list_ret,
+        dyn_fxattr_has,
+        dyn_fxattr_remove,
+        errno
+    );
     if (dyn_fd < 0 || dyn_rename_ret != 0 || dyn_access_ret != 0 || dyn_stat_ret != 0 || dyn_st.st_size != 7 || dyn_fstat_ret != 0 || dyn_fst.st_size != 7 || dyn_symlink_ret != 0 || dyn_readlink_ret != 11 || !text_is(dyn_link_target, "dyn-new.txt") || dyn_lstat_ret != 0 || dyn_realpath_ret == 0) {{
         failures += 60;
+    }}
+    if (dyn_xattr_set != 0 || dyn_xattr_get != (ssize_t)strlen(dyn_xattr_value) || !text_is(dyn_xattr_buf, dyn_xattr_value) || dyn_xattr_list_ret <= 0 || !dyn_xattr_has || dyn_xattr_remove != 0 || dyn_fxattr_set != 0 || dyn_fxattr_get != (ssize_t)strlen(dyn_fxattr_value) || !text_is(dyn_fxattr_buf, dyn_fxattr_value) || dyn_fxattr_list_ret <= 0 || !dyn_fxattr_has || dyn_fxattr_remove != 0) {{
+        failures += 65;
     }}
     close(dyn_fd);
     int dyn_unlink_file = dyn_unlink("dyn-new.txt");
@@ -3898,6 +4047,8 @@ typedef char *(*getenv_fn)(const char *);
 typedef int (*setenv_fn)(const char *, const char *, int);
 typedef int (*unsetenv_fn)(const char *);
 typedef pid_t (*getpid_fn)(void);
+typedef int (*proc_pidpath_fn)(int, void *, uint32_t);
+typedef int (*proc_name_fn)(int, void *, uint32_t);
 typedef int (*gettimeofday_fn)(struct timeval *, void *);
 typedef int (*clock_gettime_fn)(clockid_t, struct timespec *);
 typedef int (*nanosleep_fn)(const struct timespec *, struct timespec *);
@@ -3906,6 +4057,9 @@ typedef kern_return_t (*mach_timebase_info_fn)(mach_timebase_info_t);
 typedef int (*getrlimit_fn)(int, struct rlimit *);
 typedef long (*sysconf_fn)(int);
 typedef int (*sysctlbyname_fn)(const char *, void *, size_t *, void *, size_t);
+
+extern int proc_pidpath(int, void *, uint32_t);
+extern int proc_name(int, void *, uint32_t);
 
 static long compatra_syscall6(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
     register long x0 __asm__("x0") = a0;
@@ -3946,6 +4100,14 @@ int main(void) {
     printf("compat proc syscall pid=%ld host_pid=%d\n", syscall_pid, pid);
     if (pid <= 0 || syscall_pid <= 0) {
         failures += 20;
+    }
+    char proc_path[4096] = {0};
+    char proc_name_buf[1024] = {0};
+    int proc_path_ret = proc_pidpath(pid, proc_path, sizeof(proc_path));
+    int proc_name_ret = proc_name(pid, proc_name_buf, sizeof(proc_name_buf));
+    printf("compat proc libproc static pidpath=%d path=%s name=%d text=%s errno=%d\n", proc_path_ret, proc_path, proc_name_ret, proc_name_buf, errno);
+    if (proc_path_ret <= 0 || strstr(proc_path, "arm64_env_time_compat") == 0 || proc_name_ret <= 0 || strstr(proc_name_buf, "arm64_env_time") == 0) {
+        failures += 25;
     }
 
     long page_size = sysconf(_SC_PAGESIZE);
@@ -4052,6 +4214,8 @@ int main(void) {
     setenv_fn dyn_setenv = (setenv_fn)dlsym(self, "setenv");
     unsetenv_fn dyn_unsetenv = (unsetenv_fn)dlsym(self, "unsetenv");
     getpid_fn dyn_getpid = (getpid_fn)dlsym(self, "getpid");
+    proc_pidpath_fn dyn_proc_pidpath = (proc_pidpath_fn)dlsym(self, "proc_pidpath");
+    proc_name_fn dyn_proc_name = (proc_name_fn)dlsym(self, "proc_name");
     gettimeofday_fn dyn_gettimeofday = (gettimeofday_fn)dlsym(self, "gettimeofday");
     clock_gettime_fn dyn_clock_gettime = (clock_gettime_fn)dlsym(self, "clock_gettime");
     nanosleep_fn dyn_nanosleep = (nanosleep_fn)dlsym(self, "nanosleep");
@@ -4060,14 +4224,18 @@ int main(void) {
     getrlimit_fn dyn_getrlimit = (getrlimit_fn)dlsym(self, "getrlimit");
     sysconf_fn dyn_sysconf = (sysconf_fn)dlsym(self, "sysconf");
     sysctlbyname_fn dyn_sysctlbyname = (sysctlbyname_fn)dlsym(self, "sysctlbyname");
-    printf("compat envtime dlsym ptrs env=%p pid=%p time=%p rlimit=%p sysctl=%p\n", (void *)dyn_getenv, (void *)dyn_getpid, (void *)dyn_gettimeofday, (void *)dyn_getrlimit, (void *)dyn_sysctlbyname);
-    if (!dyn_getenv || !dyn_setenv || !dyn_unsetenv || !dyn_getpid || !dyn_gettimeofday || !dyn_clock_gettime || !dyn_nanosleep || !dyn_mach_absolute_time || !dyn_mach_timebase_info || !dyn_getrlimit || !dyn_sysconf || !dyn_sysctlbyname) {
+    printf("compat envtime dlsym ptrs env=%p pid=%p proc_pidpath=%p proc_name=%p time=%p rlimit=%p sysctl=%p\n", (void *)dyn_getenv, (void *)dyn_getpid, (void *)dyn_proc_pidpath, (void *)dyn_proc_name, (void *)dyn_gettimeofday, (void *)dyn_getrlimit, (void *)dyn_sysctlbyname);
+    if (!dyn_getenv || !dyn_setenv || !dyn_unsetenv || !dyn_getpid || !dyn_proc_pidpath || !dyn_proc_name || !dyn_gettimeofday || !dyn_clock_gettime || !dyn_nanosleep || !dyn_mach_absolute_time || !dyn_mach_timebase_info || !dyn_getrlimit || !dyn_sysconf || !dyn_sysctlbyname) {
         return 70;
     }
 
     int dyn_set = dyn_setenv("COMPATRA_COMPAT_DYN_ENV", "dyn-ok", 1);
     char *dyn_env = dyn_getenv("COMPATRA_COMPAT_DYN_ENV");
     int dyn_unset = dyn_unsetenv("COMPATRA_COMPAT_DYN_ENV");
+    char dyn_proc_path[4096] = {0};
+    char dyn_proc_name_buf[1024] = {0};
+    int dyn_proc_path_ret = dyn_proc_pidpath(dyn_getpid(), dyn_proc_path, sizeof(dyn_proc_path));
+    int dyn_proc_name_ret = dyn_proc_name(dyn_getpid(), dyn_proc_name_buf, sizeof(dyn_proc_name_buf));
     struct timeval dyn_tv = {0};
     int dyn_gtod = dyn_gettimeofday(&dyn_tv, 0);
     struct timespec dyn_ts = {0};
@@ -4098,7 +4266,8 @@ int main(void) {
         dyn_page,
         dyn_byname,
         dyn_byname_page);
-    if (dyn_set != 0 || dyn_env == 0 || dyn_env[0] != 'd' || dyn_unset != 0 || dyn_getpid() <= 0 || dyn_gtod != 0 || dyn_clock != 0 || dyn_nano != 0 || dyn_mach == 0 || dyn_timebase_ret != 0 || dyn_timebase.numer == 0 || dyn_timebase.denom == 0 || dyn_rlimit != 0 || dyn_page <= 0 || dyn_byname != 0 || dyn_byname_page <= 0) {
+    printf("compat proc libproc dlsym pidpath=%d path=%s name=%d text=%s errno=%d\n", dyn_proc_path_ret, dyn_proc_path, dyn_proc_name_ret, dyn_proc_name_buf, errno);
+    if (dyn_set != 0 || dyn_env == 0 || dyn_env[0] != 'd' || dyn_unset != 0 || dyn_getpid() <= 0 || dyn_proc_path_ret <= 0 || strstr(dyn_proc_path, "arm64_env_time_compat") == 0 || dyn_proc_name_ret <= 0 || strstr(dyn_proc_name_buf, "arm64_env_time") == 0 || dyn_gtod != 0 || dyn_clock != 0 || dyn_nano != 0 || dyn_mach == 0 || dyn_timebase_ret != 0 || dyn_timebase.numer == 0 || dyn_timebase.denom == 0 || dyn_rlimit != 0 || dyn_page <= 0 || dyn_byname != 0 || dyn_byname_page <= 0) {
         failures += 80;
     }
 
@@ -4118,6 +4287,7 @@ int main(void) {
         .arg("-fno-builtin-printf")
         .arg("-fno-stack-protector")
         .arg(&source)
+        .arg("-lproc")
         .arg("-o")
         .arg(&binary)
         .stdout(Stdio::piped())
@@ -5008,6 +5178,7 @@ fn compile_arm64_foundation_startup_fixture() -> PathBuf {
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 extern void *NSHomeDirectory(void);
 extern void *NSTemporaryDirectory(void);
@@ -5105,6 +5276,31 @@ int main(void) {
     uintptr_t cwd_exists = msg2_uint(fm, "fileExistsAtPath:isDirectory:", cwd, &is_dir);
     void *cwd_entries = msg2_obj(fm, "contentsOfDirectoryAtPath:error:", cwd, 0);
     uintptr_t entry_count = msg0_uint(cwd_entries, "count");
+    FILE *seed = fopen("foundation-data.txt", "w");
+    if (seed) {
+        fputs("foundation-data-ok", seed);
+        fclose(seed);
+    }
+    void *data_path = ns_string("foundation-data.txt");
+    void *data = msg1_obj(cls("NSData"), "dataWithContentsOfFile:", data_path);
+    uintptr_t data_len = msg0_uint(data, "length");
+    const char *data_bytes = data ? (const char *)msg0_obj(data, "bytes") : 0;
+    void *out_path = ns_string("foundation-data-out.txt");
+    uintptr_t data_write = data ? msg2_uint(data, "writeToFile:atomically:", out_path, (void *)1) : 0;
+    void *data_roundtrip = msg1_obj(cls("NSData"), "dataWithContentsOfFile:", out_path);
+    uintptr_t roundtrip_len = msg0_uint(data_roundtrip, "length");
+    const char *roundtrip_bytes = data_roundtrip ? (const char *)msg0_obj(data_roundtrip, "bytes") : 0;
+    mkdir("foundation-enum", 0700);
+    mkdir("foundation-enum/sub", 0700);
+    FILE *enum_file = fopen("foundation-enum/sub/item.txt", "w");
+    if (enum_file) {
+        fputs("enum", enum_file);
+        fclose(enum_file);
+    }
+    void *enumerator = msg1_obj(fm, "enumeratorAtPath:", ns_string("foundation-enum"));
+    void *enum_first = msg0_obj(enumerator, "nextObject");
+    void *enum_second = msg0_obj(enumerator, "nextObject");
+    void *enum_done_probe = msg0_obj(enumerator, "nextObject");
 
     int static_ok = has_text(home)
         && has_text(temp)
@@ -5118,10 +5314,20 @@ int main(void) {
         && has_text(bundle_exe)
         && cwd_exists
         && is_dir
-        && entry_count > 0;
+        && entry_count > 0
+        && data_len == strlen("foundation-data-ok")
+        && data_bytes
+        && memcmp(data_bytes, "foundation-data-ok", strlen("foundation-data-ok")) == 0
+        && data_write
+        && roundtrip_len == strlen("foundation-data-ok")
+        && roundtrip_bytes
+        && memcmp(roundtrip_bytes, "foundation-data-ok", strlen("foundation-data-ok")) == 0
+        && has_text(enum_first)
+        && has_text(enum_second)
+        && enum_done_probe == 0;
 
     printf(
-        "compat foundation static home=%s temp=%s user=%s paths=%lu first=%s process=%s args=%lu env_home=%s bundle=%s exe=%s cwd=%s exists=%lu isdir=%u entries=%lu pass=%d\n",
+        "compat foundation static home=%s temp=%s user=%s paths=%lu first=%s process=%s args=%lu env_home=%s bundle=%s exe=%s cwd=%s exists=%lu isdir=%u entries=%lu data_len=%lu write=%lu roundtrip=%lu enum_first=%s enum_second=%s enum_done_null=%lu pass=%d\n",
         utf8_or_null(home),
         utf8_or_null(temp),
         utf8_or_null(user),
@@ -5136,6 +5342,12 @@ int main(void) {
         (unsigned long)cwd_exists,
         (unsigned int)is_dir,
         (unsigned long)entry_count,
+        (unsigned long)data_len,
+        (unsigned long)data_write,
+        (unsigned long)roundtrip_len,
+        utf8_or_null(enum_first),
+        utf8_or_null(enum_second),
+        (unsigned long)(enum_done_probe == 0),
         static_ok
     );
 
@@ -6872,8 +7084,12 @@ fn compat_mode_proxies_foundation_startup_glue() {
             && line.contains(" env_home=")
             && line.contains(" bundle=")
             && line.contains(" exists=1 isdir=1 ")
+            && line.contains(" data_len=18 write=1 roundtrip=18 ")
+            && line.contains(" enum_first=")
+            && line.contains(" enum_second=")
+            && line.contains(" enum_done_null=1 ")
             && line.contains(" pass=1")),
-        "Foundation startup fixture did not complete static NSProcessInfo/NSBundle/NSFileManager glue; stdout:\n{stdout}"
+        "Foundation startup fixture did not complete static NSProcessInfo/NSBundle/NSFileManager/Foundation file-data glue; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat foundation dlsym ptrs home=0x")
@@ -7084,6 +7300,9 @@ fn compat_mode_proxies_network_resolver_and_socket_imports() {
     );
     assert!(
         stdout.contains("compat dlsym network ptrs gai=0x")
+            && stdout.contains("ifaddrs=0x")
+            && stdout.contains("freeifaddrs=0x")
+            && stdout.contains("ifindex=0x")
             && stdout.contains("inet_addr=0x")
             && stdout.contains("ntohs=0x"),
         "network fixture did not receive dlsym trampolines; stdout:\n{stdout}"
@@ -7107,6 +7326,22 @@ fn compat_mode_proxies_network_resolver_and_socket_imports() {
     assert!(
         stdout.contains("compat getnameinfo dlsym ret=0 host=127.0.0.1 service=443"),
         "network fixture did not complete dlsym getnameinfo proxy; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("compat ifaddrs static ret=0")
+            && line.contains(" count=")
+            && line.contains(" saw_lo=1 ")
+            && line.contains(" lo_index=")),
+        "network fixture did not complete static getifaddrs/if_nametoindex proxy; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat ifaddrs dlsym ret=0")
+                && line.contains(" count=")
+                && line.contains(" saw_lo=1 ")
+                && line.contains(" lo_index=")),
+        "network fixture did not complete dlsym getifaddrs/if_nametoindex proxy; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat sendmsg static sent=6 recv=6 text=msg-ok"),
@@ -7613,6 +7848,11 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         "path fixture did not complete static symlink/readlink/lstat; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("compat path static xattr set=0 get=8 text=xattr-ok")
+            && stdout.contains(" has=1 remove=0"),
+        "path fixture did not complete static xattr host proxy roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
         stdout
             .contains("compat path static mutate rename=0 unlink=0 unlink_link=0 mkdir=0 rmdir=0"),
         "path fixture did not complete static rename/unlink/rmdir; stdout:\n{stdout}"
@@ -7634,6 +7874,12 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
         "path fixture did not receive dlsym chmod/truncate/*at trampolines; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("compat path dlsym xattr ptrs get=0x")
+            && stdout.contains(" fget=0x")
+            && stdout.contains(" fremove=0x"),
+        "path fixture did not receive dlsym xattr trampolines; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("compat path dlsym cwd mkdir=0 chdir=0 ret=0x")
             && stdout.contains("dyn-dir"),
         "path fixture did not complete dlsym chdir/getcwd; stdout:\n{stdout}"
@@ -7648,6 +7894,12 @@ fn compat_mode_proxies_path_metadata_and_mutation_imports() {
             "compat path dlsym link symlink=0 readlink=11 target=dyn-new.txt realpath=0x"
         ),
         "path fixture did not complete dlsym readlink/realpath; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat path dlsym xattr set=0 get=12 text=dyn-xattr-ok")
+            && stdout.contains("remove=0 fset=0 fget=11 ftext=fd-xattr-ok")
+            && stdout.contains("fhas=1 fremove=0"),
+        "path fixture did not complete dlsym xattr host proxy roundtrip; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat path dlsym cleanup unlink=0 unlink_link=0 rmdir=0"),
@@ -7686,7 +7938,7 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
         .arg("--compat-log")
         .arg("verbose")
         .arg("--compat-log-filter")
-        .arg("gethostname,uname,sysctl,sysctlbyname")
+        .arg("gethostname,uname,sysctl,sysctlbyname,proc_pidpath,proc_name")
         .arg(&fixture)
         .env("COMPATRA_PLUGIN_TRACE", "1")
         .env("COMPATRA_TRACE_FORMAT", "jsonl")
@@ -7710,7 +7962,7 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
         .join(" | ");
 
     eprintln!(
-        "compat proof(env/time/syscall): command={} --mode compat --compat-log verbose --compat-log-filter gethostname,uname,sysctl,sysctlbyname {}",
+        "compat proof(env/time/syscall): command={} --mode compat --compat-log verbose --compat-log-filter gethostname,uname,sysctl,sysctlbyname,proc_pidpath,proc_name {}",
         compatra.display(),
         fixture.display()
     );
@@ -7737,6 +7989,13 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
         "env/time fixture did not print host-backed process identity and raw syscall pid; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("compat proc libproc static pidpath=")
+            && stdout.contains(" path=")
+            && stdout.contains("arm64_env_time_compat")
+            && stdout.contains(" text=arm64_env_time"),
+        "env/time fixture did not complete static proc_pidpath/proc_name host proxy calls; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("compat system sysconf_pagesize=")
             && stdout.contains(" gethostname=0 ")
             && stdout.contains(" uname=0 "),
@@ -7755,7 +8014,11 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
             && stderr.contains("\"Call\":\"sysctlbyname\"")
             && stderr.contains("\"Query\":\"hw.machine\"")
             && stderr.contains("\"GuestValueHex\":\"61726D363400\"")
-            && stderr.contains("\"GuestValueBytes\":\"6\""),
+            && stderr.contains("\"GuestValueBytes\":\"6\"")
+            && stderr.contains("\"Call\":\"proc_pidpath\"")
+            && stderr.contains("\"Call\":\"proc_name\"")
+            && stderr.contains("\"Model\":\"host-libproc+guest-self-override\"")
+            && stderr.contains("\"HostText\""),
         "verbose compat log did not include guest-facing OS identity payloads; stderr:\n{stderr}"
     );
     assert!(
@@ -7777,8 +8040,16 @@ fn compat_mode_proxies_env_time_resource_and_syscall_imports() {
     assert!(
         stdout.contains("compat envtime dlsym ptrs env=0x")
             && stdout.contains(" pid=0x")
+            && stdout.contains(" proc_pidpath=0x")
+            && stdout.contains(" proc_name=0x")
             && stdout.contains(" time=0x"),
         "env/time fixture did not receive dlsym trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat proc libproc dlsym pidpath=")
+            && stdout.contains("arm64_env_time_compat")
+            && stdout.contains(" text=arm64_env_time"),
+        "env/time fixture did not complete dlsym proc_pidpath/proc_name host proxy calls; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat envtime dlsym env set=0 value=dyn-ok unset=0")

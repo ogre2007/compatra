@@ -306,12 +306,10 @@ pub(crate) fn compat_log_config() -> &'static CompatLogConfig {
 }
 
 pub(crate) fn normalize_log_call_name(call: &str) -> String {
-    let mut normalized = call.trim();
+    let canonical = crate::normalize_darwin_import_name(call);
+    let mut normalized = canonical.as_ref();
     while let Some(rest) = normalized.strip_prefix('_') {
         normalized = rest;
-    }
-    if let Some((base, _suffix)) = normalized.split_once('$') {
-        normalized = base;
     }
     normalized.to_ascii_lowercase()
 }
@@ -338,6 +336,9 @@ fn summary_log_call(call: &str) -> bool {
             | "shutdown"
             | "getaddrinfo"
             | "getnameinfo"
+            | "getifaddrs"
+            | "freeifaddrs"
+            | "if_nametoindex"
             | "popen"
             | "pclose"
             | "system"
@@ -346,6 +347,8 @@ fn summary_log_call(call: &str) -> bool {
             | "getpwuid"
             | "getpwnam"
             | "getgroups"
+            | "proc_pidpath"
+            | "proc_name"
             | "stat"
             | "lstat"
             | "fstat"
@@ -355,6 +358,14 @@ fn summary_log_call(call: &str) -> bool {
             | "rmdir"
             | "symlink"
             | "readlink"
+            | "getxattr"
+            | "fgetxattr"
+            | "setxattr"
+            | "fsetxattr"
+            | "listxattr"
+            | "flistxattr"
+            | "removexattr"
+            | "fremovexattr"
             | "getentropy"
     )
 }

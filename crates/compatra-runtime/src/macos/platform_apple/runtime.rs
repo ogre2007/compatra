@@ -18,6 +18,10 @@ pub enum AppleObject {
         values: Vec<u64>,
         host_ptr: Option<u64>,
     },
+    Enumerator {
+        values: Vec<u64>,
+        index: usize,
+    },
     Dictionary {
         entries: Vec<(u64, u64)>,
         host_ptr: Option<u64>,
@@ -263,6 +267,34 @@ impl AppleRuntime {
         }
     }
 
+    pub fn alloc_enumerator(&mut self, values: Vec<u64>) -> u64 {
+        self.alloc(AppleObject::Enumerator { values, index: 0 })
+    }
+
+    pub fn enumerator_next(&mut self, enumerator_ref: u64) -> Option<u64> {
+        match self.objects.get_mut(&enumerator_ref) {
+            Some(AppleObject::Enumerator { values, index }) => {
+                let value = values.get(*index).copied().unwrap_or(0);
+                if value != 0 {
+                    *index = index.saturating_add(1);
+                }
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn enumerator_remaining(&mut self, enumerator_ref: u64) -> Option<Vec<u64>> {
+        match self.objects.get_mut(&enumerator_ref) {
+            Some(AppleObject::Enumerator { values, index }) => {
+                let remaining = values.get(*index..).unwrap_or(&[]).to_vec();
+                *index = values.len();
+                Some(remaining)
+            }
+            _ => None,
+        }
+    }
+
     pub fn alloc_certificate(&mut self, data_ref: u64) -> u64 {
         self.alloc(AppleObject::Certificate { data_ref })
     }
@@ -484,6 +516,7 @@ impl AppleRuntime {
             Some(AppleObject::String { .. }) => Some("NSString".to_string()),
             Some(AppleObject::Data { .. }) => Some("NSData".to_string()),
             Some(AppleObject::Array { .. }) => Some("NSArray".to_string()),
+            Some(AppleObject::Enumerator { .. }) => Some("NSEnumerator".to_string()),
             Some(AppleObject::Dictionary { .. }) => Some("NSDictionary".to_string()),
             Some(AppleObject::Number { .. }) | Some(AppleObject::Boolean { .. }) => {
                 Some("NSNumber".to_string())
@@ -566,6 +599,7 @@ impl AppleRuntime {
             Some(AppleObject::Error { .. }) => Self::TYPE_ID_ERROR,
             Some(AppleObject::Url { .. }) => 0,
             Some(AppleObject::Bundle { .. }) => 0,
+            Some(AppleObject::Enumerator { .. }) => 0,
             Some(AppleObject::ObjcClass { .. }) => 0,
             Some(AppleObject::ObjcSelector { .. }) => 0,
             Some(AppleObject::ObjcObject { .. }) => 0,
@@ -658,6 +692,9 @@ impl AppleRuntime {
                 Some(host_ptr) => format!("CFArray(count={}, host=0x{:X})", values.len(), host_ptr),
                 None => format!("CFArray(count={})", values.len()),
             },
+            Some(AppleObject::Enumerator { values, index }) => {
+                format!("NSEnumerator(index={}, count={})", index, values.len())
+            }
             Some(AppleObject::Dictionary { entries, host_ptr }) => match host_ptr {
                 Some(host_ptr) => {
                     format!(
@@ -858,6 +895,22 @@ mod tests {
         assert_eq!(runtime.host_ptr(dict_ref), Some(0x1234_B000));
         assert_eq!(runtime.dictionary_len(dict_ref), Some(1));
         assert_eq!(runtime.dictionary_get(dict_ref, 0x30), Some(0x40));
+    }
+
+    #[test]
+    fn synthetic_enumerator_advances_once_per_next_object() {
+        let mut runtime = AppleRuntime::default();
+
+        let enumerator = runtime.alloc_enumerator(vec![0x10, 0x20]);
+
+        assert_eq!(
+            runtime.objc_object_kind(enumerator),
+            Some("NSEnumerator".to_string())
+        );
+        assert_eq!(runtime.enumerator_next(enumerator), Some(0x10));
+        assert_eq!(runtime.enumerator_remaining(enumerator), Some(vec![0x20]));
+        assert_eq!(runtime.enumerator_next(enumerator), Some(0));
+        assert_eq!(runtime.enumerator_next(enumerator), Some(0));
     }
 
     #[test]

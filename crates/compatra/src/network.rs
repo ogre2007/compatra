@@ -45,6 +45,24 @@ const DARWIN_ADDRINFO_AI_ADDR: usize = 32;
 const DARWIN_ADDRINFO_AI_NEXT: usize = 40;
 #[cfg(target_os = "macos")]
 const MAX_ADDRINFO_RESULTS: usize = 64;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_SIZE: usize = 56;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_NEXT: usize = 0;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_NAME: usize = 8;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_FLAGS: usize = 16;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_ADDR: usize = 24;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_NETMASK: usize = 32;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_DSTADDR: usize = 40;
+#[cfg(target_os = "macos")]
+const DARWIN_IFADDRS_DATA: usize = 48;
+#[cfg(target_os = "macos")]
+const MAX_IFADDRS_RESULTS: usize = 128;
 #[cfg(any(target_os = "macos", test))]
 const DARWIN_MSGHDR_SIZE: usize = 48;
 #[cfg(any(target_os = "macos", test))]
@@ -832,6 +850,75 @@ impl CompatibilityServices {
                 ("flags", hex_arg(flags)),
             ];
             log_scope.call_result("direct", "getnameinfo", &log_args, &result);
+            result
+        }
+    }
+
+    pub fn getifaddrs<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        result_ptr: u64,
+    ) -> Option<HostCallResult> {
+        let log_scope = CompatLogScope::enter();
+        #[cfg(target_os = "macos")]
+        {
+            let result = proxy_host_getifaddrs(memory, result_ptr);
+            let log_args = [("result_ptr", hex_arg(result_ptr))];
+            log_scope.call_result("direct", "getifaddrs", &log_args, &result);
+            return result;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, result_ptr);
+            let result = None;
+            let log_args = [("result_ptr", hex_arg(result_ptr))];
+            log_scope.call_result("direct", "getifaddrs", &log_args, &result);
+            result
+        }
+    }
+
+    pub fn freeifaddrs<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        ifaddrs_ptr: u64,
+    ) -> Option<HostCallResult> {
+        let log_scope = CompatLogScope::enter();
+        #[cfg(target_os = "macos")]
+        {
+            let result = proxy_host_freeifaddrs(memory, ifaddrs_ptr);
+            let log_args = [("ifaddrs", hex_arg(ifaddrs_ptr))];
+            log_scope.call_result("direct", "freeifaddrs", &log_args, &result);
+            return result;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, ifaddrs_ptr);
+            let result = None;
+            let log_args = [("ifaddrs", hex_arg(ifaddrs_ptr))];
+            log_scope.call_result("direct", "freeifaddrs", &log_args, &result);
+            result
+        }
+    }
+
+    pub fn if_nametoindex<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        name_ptr: u64,
+    ) -> Option<HostCallResult> {
+        let log_scope = CompatLogScope::enter();
+        #[cfg(target_os = "macos")]
+        {
+            let result = proxy_host_if_nametoindex(memory, name_ptr);
+            let log_args = [("name", hex_arg(name_ptr))];
+            log_scope.call_result("direct", "if_nametoindex", &log_args, &result);
+            return result;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, name_ptr);
+            let result = None;
+            let log_args = [("name", hex_arg(name_ptr))];
+            log_scope.call_result("direct", "if_nametoindex", &log_args, &result);
             result
         }
     }
@@ -2022,6 +2109,258 @@ fn proxy_host_getnameinfo<M: GuestMemory + ?Sized>(
         }
     }
     Some(gai_call_result(ret))
+}
+
+#[cfg(target_os = "macos")]
+struct GuestIfAddrsEntry {
+    ptr: u64,
+    name: u64,
+    flags: u32,
+    addr: u64,
+    netmask: u64,
+    dstaddr: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn copy_host_sockaddr_to_guest<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    sockaddr: *const libc::sockaddr,
+) -> Option<Option<u64>> {
+    if sockaddr.is_null() {
+        return Some(Some(0));
+    }
+    let len = unsafe { (*sockaddr).sa_len as usize };
+    if len == 0 {
+        return Some(Some(0));
+    }
+    let copy_len = len.min(mem::size_of::<libc::sockaddr_storage>());
+    let bytes = unsafe { std::slice::from_raw_parts(sockaddr.cast::<u8>(), copy_len) };
+    Some(allocate_guest_bytes(memory, bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn write_guest_ifaddrs<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    entry: &GuestIfAddrsEntry,
+    next: u64,
+) -> Result<(), GuestMemoryError> {
+    let mut bytes = vec![0u8; DARWIN_IFADDRS_SIZE];
+    write_u64_at(&mut bytes, DARWIN_IFADDRS_NEXT, next).ok_or(GuestMemoryError)?;
+    write_u64_at(&mut bytes, DARWIN_IFADDRS_NAME, entry.name).ok_or(GuestMemoryError)?;
+    write_u32_at(&mut bytes, DARWIN_IFADDRS_FLAGS, entry.flags).ok_or(GuestMemoryError)?;
+    write_u64_at(&mut bytes, DARWIN_IFADDRS_ADDR, entry.addr).ok_or(GuestMemoryError)?;
+    write_u64_at(&mut bytes, DARWIN_IFADDRS_NETMASK, entry.netmask).ok_or(GuestMemoryError)?;
+    write_u64_at(&mut bytes, DARWIN_IFADDRS_DSTADDR, entry.dstaddr).ok_or(GuestMemoryError)?;
+    write_u64_at(&mut bytes, DARWIN_IFADDRS_DATA, 0).ok_or(GuestMemoryError)?;
+    memory.write_memory(entry.ptr, &bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn free_guest_ifaddrs_entries<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    entries: &[GuestIfAddrsEntry],
+) {
+    for entry in entries {
+        for ptr in [entry.name, entry.addr, entry.netmask, entry.dstaddr] {
+            if ptr != 0 {
+                let _ = memory.free_memory(ptr);
+            }
+        }
+        let _ = memory.free_memory(entry.ptr);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_getifaddrs<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    result_ptr: u64,
+) -> Option<HostCallResult> {
+    if result_ptr == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+
+    let mut host_list: *mut libc::ifaddrs = ptr::null_mut();
+    clear_errno();
+    let ret = unsafe { libc::getifaddrs(&mut host_list) };
+    if ret != 0 {
+        let _ = write_guest_u64(memory, result_ptr, 0);
+        return Some(host_call_result(ret as isize));
+    }
+
+    let mut entries = Vec::new();
+    let mut current = host_list;
+    while !current.is_null() && entries.len() < MAX_IFADDRS_RESULTS {
+        let ifa = unsafe { &*current };
+        let guest_ptr = match memory.allocate_memory(DARWIN_IFADDRS_SIZE, 8) {
+            Ok(addr) => addr,
+            Err(_) => {
+                unsafe { libc::freeifaddrs(host_list) };
+                free_guest_ifaddrs_entries(memory, &entries);
+                let _ = write_guest_u64(memory, result_ptr, 0);
+                return Some(host_call_error(libc::ENOMEM as u32));
+            }
+        };
+        let name = if ifa.ifa_name.is_null() {
+            0
+        } else {
+            let bytes = unsafe { CStr::from_ptr(ifa.ifa_name).to_bytes_with_nul() };
+            match allocate_guest_bytes(memory, bytes) {
+                Some(addr) => addr,
+                None => {
+                    unsafe { libc::freeifaddrs(host_list) };
+                    let partial = GuestIfAddrsEntry {
+                        ptr: guest_ptr,
+                        name: 0,
+                        flags: 0,
+                        addr: 0,
+                        netmask: 0,
+                        dstaddr: 0,
+                    };
+                    entries.push(partial);
+                    free_guest_ifaddrs_entries(memory, &entries);
+                    let _ = write_guest_u64(memory, result_ptr, 0);
+                    return Some(host_call_error(libc::ENOMEM as u32));
+                }
+            }
+        };
+        let addr = match copy_host_sockaddr_to_guest(memory, ifa.ifa_addr) {
+            Some(Some(addr)) => addr,
+            _ => {
+                unsafe { libc::freeifaddrs(host_list) };
+                let partial = GuestIfAddrsEntry {
+                    ptr: guest_ptr,
+                    name,
+                    flags: 0,
+                    addr: 0,
+                    netmask: 0,
+                    dstaddr: 0,
+                };
+                entries.push(partial);
+                free_guest_ifaddrs_entries(memory, &entries);
+                let _ = write_guest_u64(memory, result_ptr, 0);
+                return Some(host_call_error(libc::ENOMEM as u32));
+            }
+        };
+        let netmask = match copy_host_sockaddr_to_guest(memory, ifa.ifa_netmask) {
+            Some(Some(addr)) => addr,
+            _ => {
+                unsafe { libc::freeifaddrs(host_list) };
+                let partial = GuestIfAddrsEntry {
+                    ptr: guest_ptr,
+                    name,
+                    flags: 0,
+                    addr,
+                    netmask: 0,
+                    dstaddr: 0,
+                };
+                entries.push(partial);
+                free_guest_ifaddrs_entries(memory, &entries);
+                let _ = write_guest_u64(memory, result_ptr, 0);
+                return Some(host_call_error(libc::ENOMEM as u32));
+            }
+        };
+        let dstaddr = match copy_host_sockaddr_to_guest(memory, ifa.ifa_dstaddr) {
+            Some(Some(addr)) => addr,
+            _ => {
+                unsafe { libc::freeifaddrs(host_list) };
+                let partial = GuestIfAddrsEntry {
+                    ptr: guest_ptr,
+                    name,
+                    flags: 0,
+                    addr,
+                    netmask,
+                    dstaddr: 0,
+                };
+                entries.push(partial);
+                free_guest_ifaddrs_entries(memory, &entries);
+                let _ = write_guest_u64(memory, result_ptr, 0);
+                return Some(host_call_error(libc::ENOMEM as u32));
+            }
+        };
+        entries.push(GuestIfAddrsEntry {
+            ptr: guest_ptr,
+            name,
+            flags: ifa.ifa_flags,
+            addr,
+            netmask,
+            dstaddr,
+        });
+        current = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(host_list) };
+
+    for idx in 0..entries.len() {
+        let next = entries.get(idx + 1).map_or(0, |entry| entry.ptr);
+        if write_guest_ifaddrs(memory, &entries[idx], next).is_err() {
+            free_guest_ifaddrs_entries(memory, &entries);
+            let _ = write_guest_u64(memory, result_ptr, 0);
+            return Some(host_call_error(libc::EFAULT as u32));
+        }
+    }
+
+    let first = entries.first().map_or(0, |entry| entry.ptr);
+    if write_guest_u64(memory, result_ptr, first).is_err() {
+        free_guest_ifaddrs_entries(memory, &entries);
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    Some(host_call_result(0))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_freeifaddrs<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    ifaddrs_ptr: u64,
+) -> Option<HostCallResult> {
+    let mut current = ifaddrs_ptr;
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_IFADDRS_RESULTS {
+        if current == 0 || !seen.insert(current) {
+            break;
+        }
+        let Ok(bytes) = memory.read_memory(current, DARWIN_IFADDRS_SIZE) else {
+            break;
+        };
+        let next = read_u64_at(&bytes, DARWIN_IFADDRS_NEXT).unwrap_or(0);
+        for offset in [
+            DARWIN_IFADDRS_NAME,
+            DARWIN_IFADDRS_ADDR,
+            DARWIN_IFADDRS_NETMASK,
+            DARWIN_IFADDRS_DSTADDR,
+            DARWIN_IFADDRS_DATA,
+        ] {
+            let ptr = read_u64_at(&bytes, offset).unwrap_or(0);
+            if ptr != 0 {
+                let _ = memory.free_memory(ptr);
+            }
+        }
+        let _ = memory.free_memory(current);
+        current = next;
+    }
+    Some(HostCallResult {
+        return_value: 0,
+        errno: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_if_nametoindex<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    name_ptr: u64,
+) -> Option<HostCallResult> {
+    if name_ptr == 0 {
+        return Some(HostCallResult {
+            return_value: 0,
+            errno: Some(libc::EFAULT as u32),
+        });
+    }
+    let name = read_cstring(memory, name_ptr, libc::IFNAMSIZ as usize).ok()?;
+    let host_name = CString::new(name).ok()?;
+    clear_errno();
+    let ret = unsafe { libc::if_nametoindex(host_name.as_ptr()) };
+    Some(HostCallResult {
+        return_value: ret as u64,
+        errno: (ret == 0).then(host_errno),
+    })
 }
 
 #[cfg(target_os = "macos")]

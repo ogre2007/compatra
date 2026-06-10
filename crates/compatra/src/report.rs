@@ -342,6 +342,9 @@ fn compat_call_family(raw_call: &str, normalized: &str) -> &'static str {
             | "getaddrinfo"
             | "freeaddrinfo"
             | "getnameinfo"
+            | "getifaddrs"
+            | "freeifaddrs"
+            | "if_nametoindex"
     ) {
         return "network";
     }
@@ -395,6 +398,14 @@ fn compat_call_family(raw_call: &str, normalized: &str) -> &'static str {
             | "realpath"
             | "getattrlist"
             | "fgetattrlist"
+            | "getxattr"
+            | "fgetxattr"
+            | "setxattr"
+            | "fsetxattr"
+            | "listxattr"
+            | "flistxattr"
+            | "removexattr"
+            | "fremovexattr"
             | "opendir"
             | "closedir"
             | "fdopendir"
@@ -504,6 +515,8 @@ fn compat_call_family(raw_call: &str, normalized: &str) -> &'static str {
             | "getpwuid"
             | "getpwnam"
             | "getgroups"
+            | "proc_pidpath"
+            | "proc_name"
             | "issetugid"
             | "sysconf"
             | "getpagesize"

@@ -313,14 +313,8 @@ fn should_emit_import_trace(symbol: &str, policy: &ImportReturnPolicy) -> bool {
     }
 }
 
-pub fn normalize_import_symbol(mut s: String) -> String {
-    if let Some(stripped) = s.strip_prefix('_') {
-        s = stripped.to_string();
-    }
-    if let Some((base, _)) = s.split_once('$') {
-        return base.to_string();
-    }
-    s
+pub fn normalize_import_symbol(s: String) -> String {
+    compatra::canonical_darwin_import_symbol(&s)
 }
 
 fn get_symtab_cmd(loader: &MachOLoader) -> Option<&SymtabCommand> {
@@ -3604,6 +3598,35 @@ mod tests {
     use crate::macos::loader::header::MachOMagic;
     use crate::macos::loader::parser::MachoBinary;
     use std::collections::HashMap;
+
+    #[test]
+    fn normalize_import_symbol_uses_darwin_alias_resolver() {
+        assert_eq!(
+            normalize_import_symbol("_open$NOCANCEL".to_string()),
+            "open"
+        );
+        assert_eq!(
+            normalize_import_symbol("_fopen$UNIX2003".to_string()),
+            "fopen"
+        );
+        assert_eq!(
+            normalize_import_symbol("_realpath$DARWIN_EXTSN".to_string()),
+            "realpath"
+        );
+        assert_eq!(
+            normalize_import_symbol("_readdir$INODE64".to_string()),
+            "readdir"
+        );
+        assert_eq!(normalize_import_symbol("_stat64".to_string()), "stat");
+        assert_eq!(
+            normalize_import_symbol("___memcpy_chk".to_string()),
+            "memcpy"
+        );
+        assert_eq!(
+            normalize_import_symbol("__dyld_image_count".to_string()),
+            "dyld_image_count"
+        );
+    }
 
     #[test]
     fn chained_fixup_import_symbols_reads_static_dyld_import_table() {

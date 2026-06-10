@@ -2188,6 +2188,59 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
+fn write_foundation_data_file(path: &[u8], data: &[u8], atomic: bool) -> bool {
+    let path = bytes_to_path(path);
+    if !atomic {
+        return fs::write(&path, data).is_ok();
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "compatra-data".to_string());
+    let tmp_path = parent.join(format!(".{name}.compatra-tmp-{}", std::process::id()));
+    fs::write(&tmp_path, data)
+        .and_then(|_| fs::rename(&tmp_path, &path))
+        .map(|_| true)
+        .unwrap_or_else(|_| {
+            let _ = fs::remove_file(&tmp_path);
+            false
+        })
+}
+
+fn foundation_recursive_directory_entries(root: &Path, max_entries: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    foundation_collect_directory_entries(root, root, max_entries, &mut out);
+    out
+}
+
+fn foundation_collect_directory_entries(
+    root: &Path,
+    dir: &Path,
+    max_entries: usize,
+    out: &mut Vec<Vec<u8>>,
+) {
+    if out.len() >= max_entries {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= max_entries {
+            break;
+        }
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        out.push(guest_path_bytes(relative));
+        if path.is_dir() {
+            foundation_collect_directory_entries(root, &path, max_entries, out);
+        }
+    }
+}
+
 fn env_value_bytes(keys: &[&str], fallback: &str) -> Vec<u8> {
     keys.iter()
         .find_map(|key| env::var_os(key))
@@ -2569,6 +2622,7 @@ fn synthetic_objc_class_known(name: &str) -> bool {
             | "NSBundle"
             | "NSProcessInfo"
             | "NSFileManager"
+            | "NSEnumerator"
             | "NSApplication"
             | "NSThread"
             | "NSRunLoop"
@@ -2600,6 +2654,13 @@ fn foundation_shim_supports_selector(receiver_kind: &str, selector: &str) -> boo
             | (_, "respondsToSelector:")
             | ("NSString", "isEqualToString:")
             | ("NSString", "isEqual:")
+            | ("NSData", "dataWithContentsOfFile:")
+            | ("NSData", "dataWithContentsOfFile:options:error:")
+            | ("NSData", "initWithContentsOfFile:")
+            | ("NSData", "initWithContentsOfFile:options:error:")
+            | ("NSData", "writeToFile:atomically:")
+            | ("NSEnumerator", "nextObject")
+            | ("NSEnumerator", "allObjects")
             | ("NSProcessInfo", "processInfo")
             | ("NSProcessInfo", "arguments")
             | ("NSProcessInfo", "environment")
@@ -2677,6 +2738,7 @@ fn foundation_shim_supports_selector(receiver_kind: &str, selector: &str) -> boo
             | ("NSFileManager", "isExecutableFileAtPath:")
             | ("NSFileManager", "contentsAtPath:")
             | ("NSFileManager", "contentsOfDirectoryAtPath:error:")
+            | ("NSFileManager", "enumeratorAtPath:")
             | (
                 "NSFileManager",
                 "createDirectoryAtPath:withIntermediateDirectories:attributes:error:"
@@ -3154,6 +3216,71 @@ fn dispatch_foundation_msg_send_shim(
                 preview: Some(data),
             })
         }
+        "dataWithContentsOfFile:" | "initWithContentsOfFile:" if receiver_kind == "NSData" => {
+            let path_ref = emu.read_reg("x2").unwrap_or(0);
+            let path = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime_object_data_or_host_foundation(&runtime, path_ref).unwrap_or_default()
+            };
+            let result = fs::read(bytes_to_path(&path))
+                .ok()
+                .map(|data| {
+                    let mut runtime = apple_runtime.lock().ok()?;
+                    Some(make_foundation_data_result(&mut runtime, data).0)
+                })
+                .flatten()
+                .unwrap_or(0);
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSDataContentsOfFile",
+                host_proxy: true,
+                preview: Some(path),
+            })
+        }
+        "dataWithContentsOfFile:options:error:" | "initWithContentsOfFile:options:error:"
+            if receiver_kind == "NSData" =>
+        {
+            let path_ref = emu.read_reg("x2").unwrap_or(0);
+            let error_out = emu.read_reg("x4").unwrap_or(0);
+            clear_nserror_out(emu, error_out);
+            let path = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime_object_data_or_host_foundation(&runtime, path_ref).unwrap_or_default()
+            };
+            let result = fs::read(bytes_to_path(&path))
+                .ok()
+                .map(|data| {
+                    let mut runtime = apple_runtime.lock().ok()?;
+                    Some(make_foundation_data_result(&mut runtime, data).0)
+                })
+                .flatten()
+                .unwrap_or(0);
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSDataContentsOfFileOptions",
+                host_proxy: true,
+                preview: Some(path),
+            })
+        }
+        "writeToFile:atomically:" if receiver_kind == "NSData" => {
+            let path_ref = emu.read_reg("x2").unwrap_or(0);
+            let atomic = emu.read_reg("x3").unwrap_or(0) != 0;
+            let (path, data) = {
+                let runtime = apple_runtime.lock().ok()?;
+                (
+                    runtime_object_data_or_host_foundation(&runtime, path_ref).unwrap_or_default(),
+                    runtime_object_data_or_host_foundation(&runtime, receiver_ref)
+                        .unwrap_or_default(),
+                )
+            };
+            let ok = write_foundation_data_file(&path, &data, atomic);
+            Some(ObjcMsgSendShimResult {
+                result: ok as u64,
+                shim: "NSDataWriteToFile",
+                host_proxy: true,
+                preview: Some(path),
+            })
+        }
         "bytes" => {
             let data = {
                 let runtime = apple_runtime.lock().ok()?;
@@ -3250,6 +3377,36 @@ fn dispatch_foundation_msg_send_shim(
             Some(ObjcMsgSendShimResult {
                 result,
                 shim: "NSDictionaryObjectForKey",
+                host_proxy,
+                preview: None,
+            })
+        }
+        "nextObject" if receiver_kind == "NSEnumerator" => {
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.enumerator_next(receiver_ref).unwrap_or(0)
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSEnumeratorNextObject",
+                host_proxy: false,
+                preview: None,
+            })
+        }
+        "allObjects" if receiver_kind == "NSEnumerator" => {
+            let values = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime
+                    .enumerator_remaining(receiver_ref)
+                    .unwrap_or_default()
+            };
+            let (result, host_proxy) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                make_foundation_array_result(&mut runtime, values)
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSEnumeratorAllObjects",
                 host_proxy,
                 preview: None,
             })
@@ -3840,6 +3997,29 @@ fn dispatch_foundation_msg_send_shim(
                 result,
                 shim: "NSFileManagerDirectoryContents",
                 host_proxy,
+                preview: Some(path),
+            })
+        }
+        "enumeratorAtPath:" if receiver_kind == "NSFileManager" => {
+            let path_ref = emu.read_reg("x2").unwrap_or(0);
+            let path = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime_object_data_or_host_foundation(&runtime, path_ref).unwrap_or_default()
+            };
+            let relative_paths =
+                foundation_recursive_directory_entries(&bytes_to_path(&path), 4096);
+            let result = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let values = relative_paths
+                    .iter()
+                    .map(|entry| make_foundation_string_result(&mut runtime, entry.clone()).0)
+                    .collect::<Vec<_>>();
+                runtime.alloc_enumerator(values)
+            };
+            Some(ObjcMsgSendShimResult {
+                result,
+                shim: "NSFileManagerEnumeratorAtPath",
+                host_proxy: true,
                 preview: Some(path),
             })
         }
@@ -7942,9 +8122,15 @@ mod tests {
             ("NSProcessInfo", "environment"),
             ("NSBundle", "mainBundle"),
             ("NSBundle", "objectForInfoDictionaryKey:"),
+            ("NSData", "dataWithContentsOfFile:"),
+            ("NSData", "dataWithContentsOfFile:options:error:"),
+            ("NSData", "writeToFile:atomically:"),
+            ("NSEnumerator", "nextObject"),
+            ("NSEnumerator", "allObjects"),
             ("NSFileManager", "defaultManager"),
             ("NSFileManager", "fileExistsAtPath:isDirectory:"),
             ("NSFileManager", "URLsForDirectory:inDomains:"),
+            ("NSFileManager", "enumeratorAtPath:"),
         ] {
             assert!(
                 foundation_shim_supports_selector(kind, selector),

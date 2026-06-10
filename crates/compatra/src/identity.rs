@@ -15,6 +15,13 @@ use std::ffi::{CStr, CString};
 #[cfg(target_os = "macos")]
 use std::ptr;
 
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
+    fn proc_name(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
+}
+
 impl CompatibilityServices {
     pub fn getlogin_name<M: GuestMemory + ?Sized>(&self, memory: &mut M) -> Option<HostCallResult> {
         #[cfg(target_os = "macos")]
@@ -93,8 +100,46 @@ impl CompatibilityServices {
             None
         }
     }
+
+    pub fn proc_pidpath_info<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        pid: u64,
+        buffer_ptr: u64,
+        buffer_size: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_proc_pidpath(memory, pid, buffer_ptr, buffer_size);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, pid, buffer_ptr, buffer_size);
+            None
+        }
+    }
+
+    pub fn proc_name_info<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        pid: u64,
+        buffer_ptr: u64,
+        buffer_size: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_proc_name(memory, pid, buffer_ptr, buffer_size);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, pid, buffer_ptr, buffer_size);
+            None
+        }
+    }
 }
 
+#[cfg(target_os = "macos")]
+const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 #[cfg(target_os = "macos")]
 const DARWIN_PASSWD_SIZE: usize = 72;
 #[cfg(target_os = "macos")]
@@ -284,6 +329,291 @@ fn proxy_host_getgroups<M: GuestMemory + ?Sized>(
         transferred: returned.saturating_mul(4),
         preview: Vec::new(),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_proc_pidpath<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    pid: u64,
+    buffer_ptr: u64,
+    buffer_size: u64,
+) -> Option<HostIoResult> {
+    if let Some(error) = validate_proc_buffer(buffer_ptr, buffer_size) {
+        emit_proc_identity_io_log(
+            "proc_pidpath",
+            pid,
+            buffer_ptr,
+            buffer_size,
+            vec![("Model", Some("invalid-guest-buffer".to_string()))],
+            &error,
+        );
+        return Some(error);
+    }
+
+    let host = call_host_proc_string(
+        pid,
+        buffer_size,
+        PROC_PIDPATHINFO_MAXSIZE,
+        |pid, buffer, size| unsafe { proc_pidpath(pid, buffer.cast::<libc::c_void>(), size) },
+    );
+
+    if pid == unsafe { libc::getpid() } as u64 {
+        if let Some(path) = memory.guest_executable_path() {
+            let result = write_proc_string_result(memory, buffer_ptr, buffer_size, &path);
+            emit_proc_identity_io_log(
+                "proc_pidpath",
+                pid,
+                buffer_ptr,
+                buffer_size,
+                vec![
+                    ("Path", Some(path)),
+                    ("HostText", Some(host.text)),
+                    (
+                        "HostReturn",
+                        Some(crate::logging::format_return(host.result.return_value)),
+                    ),
+                    ("HostErrno", Some(host.result.errno.to_string())),
+                    (
+                        "Model",
+                        Some("host-libproc+guest-self-override".to_string()),
+                    ),
+                ],
+                &result,
+            );
+            return Some(result);
+        }
+    }
+
+    let result = write_host_proc_string_result(memory, buffer_ptr, &host);
+    emit_proc_identity_io_log(
+        "proc_pidpath",
+        pid,
+        buffer_ptr,
+        buffer_size,
+        vec![
+            ("Path", Some(host.text)),
+            (
+                "HostReturn",
+                Some(crate::logging::format_return(host.result.return_value)),
+            ),
+            ("HostErrno", Some(host.result.errno.to_string())),
+            ("Model", Some("host-libproc".to_string())),
+        ],
+        &result,
+    );
+    Some(result)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_proc_name<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    pid: u64,
+    buffer_ptr: u64,
+    buffer_size: u64,
+) -> Option<HostIoResult> {
+    if let Some(error) = validate_proc_buffer(buffer_ptr, buffer_size) {
+        emit_proc_identity_io_log(
+            "proc_name",
+            pid,
+            buffer_ptr,
+            buffer_size,
+            vec![("Model", Some("invalid-guest-buffer".to_string()))],
+            &error,
+        );
+        return Some(error);
+    }
+
+    let host = call_host_proc_string(pid, buffer_size, 1024, |pid, buffer, size| unsafe {
+        proc_name(pid, buffer.cast::<libc::c_void>(), size)
+    });
+
+    if pid == unsafe { libc::getpid() } as u64 {
+        if let Some(path) = memory.guest_executable_path() {
+            let name = path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path.as_str())
+                .to_string();
+            let result = write_proc_string_result(memory, buffer_ptr, buffer_size, &name);
+            emit_proc_identity_io_log(
+                "proc_name",
+                pid,
+                buffer_ptr,
+                buffer_size,
+                vec![
+                    ("Name", Some(name)),
+                    ("HostText", Some(host.text)),
+                    (
+                        "HostReturn",
+                        Some(crate::logging::format_return(host.result.return_value)),
+                    ),
+                    ("HostErrno", Some(host.result.errno.to_string())),
+                    (
+                        "Model",
+                        Some("host-libproc+guest-self-override".to_string()),
+                    ),
+                ],
+                &result,
+            );
+            return Some(result);
+        }
+    }
+
+    let result = write_host_proc_string_result(memory, buffer_ptr, &host);
+    emit_proc_identity_io_log(
+        "proc_name",
+        pid,
+        buffer_ptr,
+        buffer_size,
+        vec![
+            ("Name", Some(host.text)),
+            (
+                "HostReturn",
+                Some(crate::logging::format_return(host.result.return_value)),
+            ),
+            ("HostErrno", Some(host.result.errno.to_string())),
+            ("Model", Some("host-libproc".to_string())),
+        ],
+        &result,
+    );
+    Some(result)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct HostProcString {
+    result: HostIoResult,
+    bytes: Vec<u8>,
+    text: String,
+}
+
+#[cfg(target_os = "macos")]
+fn validate_proc_buffer(buffer_ptr: u64, buffer_size: u64) -> Option<HostIoResult> {
+    if buffer_ptr == 0 || buffer_size == 0 || buffer_size > u32::MAX as u64 {
+        Some(proc_zero_error(libc::EINVAL as u32))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn call_host_proc_string(
+    pid: u64,
+    buffer_size: u64,
+    max_size: usize,
+    call: impl FnOnce(libc::c_int, *mut libc::c_char, u32) -> libc::c_int,
+) -> HostProcString {
+    let mut bytes = vec![0u8; (buffer_size as usize).min(max_size)];
+    clear_errno();
+    let ret = call(
+        pid as libc::c_int,
+        bytes.as_mut_ptr().cast::<libc::c_char>(),
+        bytes.len() as u32,
+    );
+    if ret <= 0 {
+        return HostProcString {
+            result: proc_zero_error(host_errno()),
+            bytes: Vec::new(),
+            text: String::new(),
+        };
+    }
+    let transferred = (ret as usize).min(bytes.len());
+    let copy_len = if transferred < bytes.len() {
+        transferred.saturating_add(1)
+    } else {
+        transferred
+    };
+    let text_len = bytes[..transferred]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(transferred);
+    let text = String::from_utf8_lossy(&bytes[..text_len]).into_owned();
+    HostProcString {
+        result: HostIoResult {
+            return_value: ret as u64,
+            errno: 0,
+            transferred,
+            preview: bytes[..copy_len].to_vec(),
+        },
+        bytes: bytes[..copy_len].to_vec(),
+        text,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_host_proc_string_result<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    buffer_ptr: u64,
+    host: &HostProcString,
+) -> HostIoResult {
+    if host.result.return_value == 0 {
+        return host.result.clone();
+    }
+    if memory.write_memory(buffer_ptr, &host.bytes).is_err() {
+        return proc_zero_error(libc::EFAULT as u32);
+    }
+    host.result.clone()
+}
+
+#[cfg(target_os = "macos")]
+fn write_proc_string_result<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    buffer_ptr: u64,
+    buffer_size: u64,
+    text: &str,
+) -> HostIoResult {
+    if buffer_ptr == 0 || buffer_size == 0 || buffer_size > u32::MAX as u64 {
+        return proc_zero_error(libc::EINVAL as u32);
+    }
+    let capacity = buffer_size as usize;
+    let mut bytes = Vec::with_capacity(capacity.min(text.len().saturating_add(1)));
+    bytes.extend_from_slice(text.as_bytes());
+    if bytes.len() >= capacity {
+        bytes.truncate(capacity.saturating_sub(1));
+    }
+    bytes.push(0);
+    if memory.write_memory(buffer_ptr, &bytes).is_err() {
+        return proc_zero_error(libc::EFAULT as u32);
+    }
+    let transferred = bytes.len().saturating_sub(1);
+    HostIoResult {
+        return_value: transferred as u64,
+        errno: 0,
+        transferred,
+        preview: bytes,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proc_zero_error(errno: u32) -> HostIoResult {
+    HostIoResult {
+        return_value: 0,
+        errno,
+        transferred: 0,
+        preview: Vec::new(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn emit_proc_identity_io_log(
+    call: &str,
+    pid: u64,
+    buffer_ptr: u64,
+    buffer_size: u64,
+    fields: Vec<(&str, Option<String>)>,
+    result: &HostIoResult,
+) {
+    emit_identity_io_log(
+        call,
+        vec![
+            ("pid", pid.to_string()),
+            ("buffer", hex_arg(buffer_ptr)),
+            ("size", buffer_size.to_string()),
+        ],
+        fields,
+        result,
+    );
 }
 
 #[cfg(target_os = "macos")]

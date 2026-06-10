@@ -1,5 +1,6 @@
 //! Compatibility-mode host service boundary.
 
+mod aliases;
 mod cxx;
 mod filesystem;
 mod identity;
@@ -12,6 +13,8 @@ mod report;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
+pub use aliases::canonical_darwin_import_symbol;
+pub(crate) use aliases::normalize_darwin_import_name;
 #[cfg(target_os = "macos")]
 use cxx::CxxImportKind;
 pub use logging::{take_pending_stop_reason, CompatLogLevel};
@@ -277,6 +280,22 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     FGetAttrList,
     #[cfg(target_os = "macos")]
+    GetXAttr,
+    #[cfg(target_os = "macos")]
+    FGetXAttr,
+    #[cfg(target_os = "macos")]
+    SetXAttr,
+    #[cfg(target_os = "macos")]
+    FSetXAttr,
+    #[cfg(target_os = "macos")]
+    ListXAttr,
+    #[cfg(target_os = "macos")]
+    FListXAttr,
+    #[cfg(target_os = "macos")]
+    RemoveXAttr,
+    #[cfg(target_os = "macos")]
+    FRemoveXAttr,
+    #[cfg(target_os = "macos")]
     GetAddrInfo,
     #[cfg(target_os = "macos")]
     FreeAddrInfo,
@@ -284,6 +303,12 @@ enum HostImportKind {
     GaiStrError,
     #[cfg(target_os = "macos")]
     GetNameInfo,
+    #[cfg(target_os = "macos")]
+    GetIfAddrs,
+    #[cfg(target_os = "macos")]
+    FreeIfAddrs,
+    #[cfg(target_os = "macos")]
+    IfNameToIndex,
     #[cfg(target_os = "macos")]
     InetPton,
     #[cfg(target_os = "macos")]
@@ -328,6 +353,10 @@ enum HostImportKind {
     GetPwNam,
     #[cfg(target_os = "macos")]
     GetGroups,
+    #[cfg(target_os = "macos")]
+    ProcPidPath,
+    #[cfg(target_os = "macos")]
+    ProcName,
     #[cfg(target_os = "macos")]
     SysConf,
     #[cfg(target_os = "macos")]
@@ -910,6 +939,46 @@ impl CompatibilityServices {
                     )?
                     .into(),
                 ),
+                HostImportKind::GetXAttr => Some(
+                    self.getxattr_path(
+                        memory, args[0], args[1], args[2], args[3], args[4], args[5],
+                    )?
+                    .into(),
+                ),
+                HostImportKind::FGetXAttr => Some(
+                    self.fgetxattr_fd(
+                        memory, args[0], args[1], args[2], args[3], args[4], args[5],
+                    )?
+                    .into(),
+                ),
+                HostImportKind::SetXAttr => Some(
+                    self.setxattr_path(
+                        memory, args[0], args[1], args[2], args[3], args[4], args[5],
+                    )?
+                    .into(),
+                ),
+                HostImportKind::FSetXAttr => Some(
+                    self.fsetxattr_fd(
+                        memory, args[0], args[1], args[2], args[3], args[4], args[5],
+                    )?
+                    .into(),
+                ),
+                HostImportKind::ListXAttr => Some(
+                    self.listxattr_path(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::FListXAttr => Some(
+                    self.flistxattr_fd(memory, args[0], args[1], args[2], args[3])?
+                        .into(),
+                ),
+                HostImportKind::RemoveXAttr => Some(
+                    self.removexattr_path(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::FRemoveXAttr => Some(
+                    self.fremovexattr_fd(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
                 HostImportKind::GetAddrInfo => {
                     Some(self.getaddrinfo(memory, args[0], args[1], args[2], args[3])?)
                 }
@@ -918,6 +987,9 @@ impl CompatibilityServices {
                 HostImportKind::GetNameInfo => Some(self.getnameinfo(
                     memory, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
                 )?),
+                HostImportKind::GetIfAddrs => Some(self.getifaddrs(memory, args[0])?),
+                HostImportKind::FreeIfAddrs => Some(self.freeifaddrs(memory, args[0])?),
+                HostImportKind::IfNameToIndex => Some(self.if_nametoindex(memory, args[0])?),
                 HostImportKind::InetPton => {
                     Some(self.inet_pton(memory, args[0], args[1], args[2])?)
                 }
@@ -960,6 +1032,14 @@ impl CompatibilityServices {
                 HostImportKind::GetGroups => {
                     Some(self.getgroups_list(memory, args[0], args[1])?.into())
                 }
+                HostImportKind::ProcPidPath => Some(
+                    self.proc_pidpath_info(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
+                HostImportKind::ProcName => Some(
+                    self.proc_name_info(memory, args[0], args[1], args[2])?
+                        .into(),
+                ),
                 HostImportKind::SysConf => Some(self.sysconf(args[0])?),
                 HostImportKind::GetPageSize => Some(self.getpagesize()?),
                 HostImportKind::GetHostName => {
@@ -3050,7 +3130,8 @@ fn proxy_guest_os_unfair_lock_unlock<M: GuestMemory + ?Sized>(
 fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
     #[cfg(target_os = "macos")]
     {
-        let symbol = normalize_import_name(symbol);
+        let symbol = normalize_darwin_import_name(symbol);
+        let symbol = symbol.as_ref();
         if let Some(kind) = cxx::classify_import(symbol) {
             return Some(HostImportKind::Cxx(kind));
         }
@@ -3060,41 +3141,41 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "snprintf" => Some(HostImportKind::SnPrintf),
             "__snprintf_chk" => Some(HostImportKind::SnPrintfChk),
             "putchar" => Some(HostImportKind::Putchar),
-            "open" | "open$NOCANCEL" => Some(HostImportKind::Open),
+            "open" => Some(HostImportKind::Open),
             "openat" => Some(HostImportKind::OpenAt),
-            "read" | "read$NOCANCEL" => Some(HostImportKind::Read),
-            "write" | "write$NOCANCEL" => Some(HostImportKind::Write),
-            "close" | "close$NOCANCEL" => Some(HostImportKind::Close),
+            "read" => Some(HostImportKind::Read),
+            "write" => Some(HostImportKind::Write),
+            "close" => Some(HostImportKind::Close),
             "socket" => Some(HostImportKind::Socket),
-            "connect" | "connect$NOCANCEL" => Some(HostImportKind::Connect),
+            "connect" => Some(HostImportKind::Connect),
             "bind" => Some(HostImportKind::Bind),
             "listen" => Some(HostImportKind::Listen),
-            "send" | "send$NOCANCEL" => Some(HostImportKind::Send),
-            "recv" | "recv$NOCANCEL" => Some(HostImportKind::Recv),
-            "sendto" | "sendto$NOCANCEL" => Some(HostImportKind::SendTo),
-            "recvfrom" | "recvfrom$NOCANCEL" => Some(HostImportKind::RecvFrom),
-            "sendmsg" | "sendmsg$NOCANCEL" => Some(HostImportKind::SendMsg),
-            "recvmsg" | "recvmsg$NOCANCEL" => Some(HostImportKind::RecvMsg),
+            "send" => Some(HostImportKind::Send),
+            "recv" => Some(HostImportKind::Recv),
+            "sendto" => Some(HostImportKind::SendTo),
+            "recvfrom" => Some(HostImportKind::RecvFrom),
+            "sendmsg" => Some(HostImportKind::SendMsg),
+            "recvmsg" => Some(HostImportKind::RecvMsg),
             "shutdown" => Some(HostImportKind::Shutdown),
             "setsockopt" => Some(HostImportKind::SetSockOpt),
             "getsockopt" => Some(HostImportKind::GetSockOpt),
-            "accept" | "accept$NOCANCEL" => Some(HostImportKind::Accept),
+            "accept" => Some(HostImportKind::Accept),
             "getpeername" => Some(HostImportKind::GetPeerName),
             "getsockname" => Some(HostImportKind::GetSockName),
             "socketpair" => Some(HostImportKind::SocketPair),
             "fcntl" => Some(HostImportKind::Fcntl),
             "ioctl" => Some(HostImportKind::Ioctl),
             "fsync" => Some(HostImportKind::Fsync),
-            "poll" | "poll$NOCANCEL" => Some(HostImportKind::Poll),
-            "readv" | "readv$NOCANCEL" => Some(HostImportKind::Readv),
-            "writev" | "writev$NOCANCEL" => Some(HostImportKind::Writev),
-            "pread" | "pread$NOCANCEL" => Some(HostImportKind::Pread),
-            "pwrite" | "pwrite$NOCANCEL" => Some(HostImportKind::Pwrite),
+            "poll" => Some(HostImportKind::Poll),
+            "readv" => Some(HostImportKind::Readv),
+            "writev" => Some(HostImportKind::Writev),
+            "pread" => Some(HostImportKind::Pread),
+            "pwrite" => Some(HostImportKind::Pwrite),
             "lseek" => Some(HostImportKind::Lseek),
             "dup" => Some(HostImportKind::Dup),
             "dup2" => Some(HostImportKind::Dup2),
             "pipe" => Some(HostImportKind::Pipe),
-            "select" | "select$NOCANCEL" => Some(HostImportKind::Select),
+            "select" => Some(HostImportKind::Select),
             "__darwin_check_fd_set_overflow" => Some(HostImportKind::DarwinCheckFdSetOverflow),
             "__chkstk_darwin" | "_chkstk_darwin" | "chkstk_darwin" => {
                 Some(HostImportKind::DarwinChkstk)
@@ -3107,12 +3188,12 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "chdir" => Some(HostImportKind::Chdir),
             "fchdir" => Some(HostImportKind::Fchdir),
             "getcwd" => Some(HostImportKind::GetCwd),
-            "stat" | "stat64" | "stat$INODE64" => Some(HostImportKind::Stat),
-            "lstat" | "lstat64" | "lstat$INODE64" => Some(HostImportKind::LStat),
-            "fstat" | "fstat64" | "fstat$INODE64" => Some(HostImportKind::FStat),
-            "fstatat" | "fstatat64" | "fstatat$INODE64" => Some(HostImportKind::FStatAt),
-            "statfs" | "statfs64" | "statfs$INODE64" => Some(HostImportKind::StatFs),
-            "fstatfs" | "fstatfs64" | "fstatfs$INODE64" => Some(HostImportKind::FStatFs),
+            "stat" => Some(HostImportKind::Stat),
+            "lstat" => Some(HostImportKind::LStat),
+            "fstat" => Some(HostImportKind::FStat),
+            "fstatat" => Some(HostImportKind::FStatAt),
+            "statfs" => Some(HostImportKind::StatFs),
+            "fstatfs" => Some(HostImportKind::FStatFs),
             "truncate" => Some(HostImportKind::Truncate),
             "ftruncate" => Some(HostImportKind::Ftruncate),
             "mkdir" => Some(HostImportKind::Mkdir),
@@ -3128,10 +3209,21 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "realpath" => Some(HostImportKind::Realpath),
             "getattrlist" => Some(HostImportKind::GetAttrList),
             "fgetattrlist" => Some(HostImportKind::FGetAttrList),
+            "getxattr" => Some(HostImportKind::GetXAttr),
+            "fgetxattr" => Some(HostImportKind::FGetXAttr),
+            "setxattr" => Some(HostImportKind::SetXAttr),
+            "fsetxattr" => Some(HostImportKind::FSetXAttr),
+            "listxattr" => Some(HostImportKind::ListXAttr),
+            "flistxattr" => Some(HostImportKind::FListXAttr),
+            "removexattr" => Some(HostImportKind::RemoveXAttr),
+            "fremovexattr" => Some(HostImportKind::FRemoveXAttr),
             "getaddrinfo" => Some(HostImportKind::GetAddrInfo),
             "freeaddrinfo" => Some(HostImportKind::FreeAddrInfo),
             "gai_strerror" => Some(HostImportKind::GaiStrError),
             "getnameinfo" => Some(HostImportKind::GetNameInfo),
+            "getifaddrs" => Some(HostImportKind::GetIfAddrs),
+            "freeifaddrs" => Some(HostImportKind::FreeIfAddrs),
+            "if_nametoindex" => Some(HostImportKind::IfNameToIndex),
             "inet_pton" => Some(HostImportKind::InetPton),
             "inet_ntop" => Some(HostImportKind::InetNtop),
             "inet_addr" => Some(HostImportKind::InetAddr),
@@ -3154,6 +3246,8 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "getpwuid" => Some(HostImportKind::GetPwUid),
             "getpwnam" => Some(HostImportKind::GetPwNam),
             "getgroups" => Some(HostImportKind::GetGroups),
+            "proc_pidpath" => Some(HostImportKind::ProcPidPath),
+            "proc_name" => Some(HostImportKind::ProcName),
             "sysconf" => Some(HostImportKind::SysConf),
             "getpagesize" => Some(HostImportKind::GetPageSize),
             "gethostname" => Some(HostImportKind::GetHostName),
@@ -3173,16 +3267,16 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "munlock" => Some(HostImportKind::Munlock),
             "madvise" => Some(HostImportKind::Madvise),
             "umask" => Some(HostImportKind::Umask),
-            "fopen" | "fopen$UNIX2003" => Some(HostImportKind::FOpen),
-            "fdopen" | "fdopen$UNIX2003" => Some(HostImportKind::FdOpen),
+            "fopen" => Some(HostImportKind::FOpen),
+            "fdopen" => Some(HostImportKind::FdOpen),
             "popen" => Some(HostImportKind::POpen),
             "pclose" => Some(HostImportKind::PClose),
             "fclose" => Some(HostImportKind::FClose),
             "fread" => Some(HostImportKind::FRead),
             "fwrite" => Some(HostImportKind::FWrite),
             "fflush" => Some(HostImportKind::FFlush),
-            "fseek" | "fseek$UNIX2003" => Some(HostImportKind::FSeek),
-            "ftell" | "ftell$UNIX2003" => Some(HostImportKind::FTell),
+            "fseek" => Some(HostImportKind::FSeek),
+            "ftell" => Some(HostImportKind::FTell),
             "fgets" => Some(HostImportKind::FGetS),
             "fputs" => Some(HostImportKind::FPutS),
             "feof" => Some(HostImportKind::FEOF),
@@ -3194,23 +3288,23 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "realloc" => Some(HostImportKind::Realloc),
             "free" => Some(HostImportKind::Free),
             "posix_memalign" => Some(HostImportKind::PosixMemalign),
-            "memcpy" | "__memcpy_chk" => Some(HostImportKind::Memcpy),
-            "memmove" | "__memmove_chk" => Some(HostImportKind::Memmove),
-            "memset" | "__memset_chk" => Some(HostImportKind::Memset),
+            "memcpy" => Some(HostImportKind::Memcpy),
+            "memmove" => Some(HostImportKind::Memmove),
+            "memset" => Some(HostImportKind::Memset),
             "bzero" => Some(HostImportKind::BZero),
             "memcmp" => Some(HostImportKind::Memcmp),
-            "memchr" | "__memchr_chk" => Some(HostImportKind::Memchr),
+            "memchr" => Some(HostImportKind::Memchr),
             "memmem" => Some(HostImportKind::Memmem),
             "strlen" => Some(HostImportKind::Strlen),
             "strcmp" => Some(HostImportKind::Strcmp),
             "strncmp" => Some(HostImportKind::Strncmp),
             "strcasecmp" => Some(HostImportKind::Strcasecmp),
             "strncasecmp" => Some(HostImportKind::Strncasecmp),
-            "strcpy" | "__strcpy_chk" => Some(HostImportKind::Strcpy),
-            "strncpy" | "__strncpy_chk" => Some(HostImportKind::Strncpy),
-            "strcat" | "__strcat_chk" => Some(HostImportKind::Strcat),
-            "strlcpy" | "__strlcpy_chk" => Some(HostImportKind::Strlcpy),
-            "strlcat" | "__strlcat_chk" => Some(HostImportKind::Strlcat),
+            "strcpy" => Some(HostImportKind::Strcpy),
+            "strncpy" => Some(HostImportKind::Strncpy),
+            "strcat" => Some(HostImportKind::Strcat),
+            "strlcpy" => Some(HostImportKind::Strlcpy),
+            "strlcat" => Some(HostImportKind::Strlcat),
             "strchr" => Some(HostImportKind::Strchr),
             "strrchr" => Some(HostImportKind::Strrchr),
             "strstr" => Some(HostImportKind::Strstr),
@@ -3232,17 +3326,15 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "rewinddir" => Some(HostImportKind::RewindDir),
             "telldir" => Some(HostImportKind::Telldir),
             "seekdir" => Some(HostImportKind::Seekdir),
-            "scandir" | "scandir$INODE64" => Some(HostImportKind::ScanDir),
-            "alphasort" | "alphasort$INODE64" => Some(HostImportKind::AlphaSort),
+            "scandir" => Some(HostImportKind::ScanDir),
+            "alphasort" => Some(HostImportKind::AlphaSort),
             "glob" => Some(HostImportKind::Glob),
             "globfree" => Some(HostImportKind::GlobFree),
             "getentropy" => Some(HostImportKind::GetEntropy),
             "pthread_threading_np" => Some(HostImportKind::PthreadThreadingNp),
             "pthread_threadid_np" => Some(HostImportKind::PthreadThreadIdNp),
             "pthread_sigmask" => Some(HostImportKind::PthreadSigmask),
-            "_NSGetExecutablePath" | "NSGetExecutablePath" => {
-                Some(HostImportKind::NSGetExecutablePath)
-            }
+            "NSGetExecutablePath" => Some(HostImportKind::NSGetExecutablePath),
             "issetugid" | "issetguid" => Some(HostImportKind::IsSetUGid),
             "execl" => Some(HostImportKind::Execl),
             "execlp" => Some(HostImportKind::Execlp),
@@ -3252,16 +3344,10 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "system" => Some(HostImportKind::System),
             "getprogname" => Some(HostImportKind::GetProgName),
             "setprogname" => Some(HostImportKind::SetProgName),
-            "_dyld_image_count" | "dyld_image_count" => Some(HostImportKind::DyldImageCount),
-            "_dyld_get_image_name" | "dyld_get_image_name" => {
-                Some(HostImportKind::DyldGetImageName)
-            }
-            "_dyld_get_image_header" | "dyld_get_image_header" => {
-                Some(HostImportKind::DyldGetImageHeader)
-            }
-            "_dyld_get_image_vmaddr_slide" | "dyld_get_image_vmaddr_slide" => {
-                Some(HostImportKind::DyldGetImageVmaddrSlide)
-            }
+            "dyld_image_count" => Some(HostImportKind::DyldImageCount),
+            "dyld_get_image_name" => Some(HostImportKind::DyldGetImageName),
+            "dyld_get_image_header" => Some(HostImportKind::DyldGetImageHeader),
+            "dyld_get_image_vmaddr_slide" => Some(HostImportKind::DyldGetImageVmaddrSlide),
             "dladdr" => Some(HostImportKind::Dladdr),
             "pthread_once" => Some(HostImportKind::PthreadOnce),
             "pthread_mutexattr_init" => Some(HostImportKind::PthreadMutexAttrInit),
@@ -3285,15 +3371,6 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
         let _ = symbol;
         None
     }
-}
-
-#[cfg(target_os = "macos")]
-fn normalize_import_name(symbol: &str) -> &str {
-    let symbol = symbol.strip_prefix('_').unwrap_or(symbol);
-    symbol
-        .split_once('$')
-        .map(|(base, _suffix)| base)
-        .unwrap_or(symbol)
 }
 
 #[cfg(target_os = "macos")]
@@ -5561,6 +5638,30 @@ mod tests {
     }
 
     #[test]
+    fn darwin_import_aliases_canonicalize_to_host_proxy_names() {
+        assert_eq!(canonical_darwin_import_symbol("_open$NOCANCEL"), "open");
+        assert_eq!(canonical_darwin_import_symbol("_read$NOCANCEL"), "read");
+        assert_eq!(canonical_darwin_import_symbol("_close$NOCANCEL"), "close");
+        assert_eq!(canonical_darwin_import_symbol("_stat$INODE64"), "stat");
+        assert_eq!(canonical_darwin_import_symbol("_stat64"), "stat");
+        assert_eq!(
+            canonical_darwin_import_symbol("_readdir$INODE64"),
+            "readdir"
+        );
+        assert_eq!(
+            canonical_darwin_import_symbol("_realpath$DARWIN_EXTSN"),
+            "realpath"
+        );
+        assert_eq!(canonical_darwin_import_symbol("_fopen$UNIX2003"), "fopen");
+        assert_eq!(canonical_darwin_import_symbol("___memcpy_chk"), "memcpy");
+        assert_eq!(canonical_darwin_import_symbol("__memcpy_chk"), "memcpy");
+        assert_eq!(
+            canonical_darwin_import_symbol("___snprintf_chk"),
+            "__snprintf_chk"
+        );
+    }
+
+    #[test]
     fn host_proxy_imports_are_darwin_bound() {
         let compat = CompatibilityServices;
         #[cfg(target_os = "macos")]
@@ -5571,12 +5672,16 @@ mod tests {
             assert!(compat.should_proxy_import("___snprintf_chk"));
             assert!(compat.should_proxy_import("_putchar"));
             assert!(compat.should_proxy_import("_open"));
+            assert!(compat.should_proxy_import("_open$NOCANCEL"));
             assert!(compat.should_proxy_import("_openat"));
             assert!(compat.should_proxy_import("_read"));
+            assert!(compat.should_proxy_import("_read$NOCANCEL"));
             assert!(compat.should_proxy_import("_write"));
             assert!(compat.should_proxy_import("_close"));
+            assert!(compat.should_proxy_import("_close$NOCANCEL"));
             assert!(compat.should_proxy_import("_socket"));
             assert!(compat.should_proxy_import("_connect"));
+            assert!(compat.should_proxy_import("_connect$NOCANCEL"));
             assert!(compat.should_proxy_import("_send"));
             assert!(compat.should_proxy_import("_recv"));
             assert!(compat.should_proxy_import("_sendto"));
@@ -5592,6 +5697,9 @@ mod tests {
             assert!(compat.should_proxy_import("_freeaddrinfo"));
             assert!(compat.should_proxy_import("_gai_strerror"));
             assert!(compat.should_proxy_import("_getnameinfo"));
+            assert!(compat.should_proxy_import("_getifaddrs"));
+            assert!(compat.should_proxy_import("_freeifaddrs"));
+            assert!(compat.should_proxy_import("_if_nametoindex"));
             assert!(compat.should_proxy_import("_inet_pton"));
             assert!(compat.should_proxy_import("_inet_ntop"));
             assert!(compat.should_proxy_import("_inet_addr"));
@@ -5623,6 +5731,7 @@ mod tests {
             assert!(compat.should_proxy_import("_fchdir"));
             assert!(compat.should_proxy_import("_getcwd"));
             assert!(compat.should_proxy_import("_stat$INODE64"));
+            assert!(compat.should_proxy_import("_stat64$INODE64"));
             assert!(compat.should_proxy_import("_lstat64"));
             assert!(compat.should_proxy_import("_fstat"));
             assert!(compat.should_proxy_import("_fstatat$INODE64"));
@@ -5641,8 +5750,17 @@ mod tests {
             assert!(compat.should_proxy_import("_readlinkat"));
             assert!(compat.should_proxy_import("_symlink"));
             assert!(compat.should_proxy_import("_realpath"));
+            assert!(compat.should_proxy_import("_realpath$DARWIN_EXTSN"));
             assert!(compat.should_proxy_import("_getattrlist"));
             assert!(compat.should_proxy_import("_fgetattrlist"));
+            assert!(compat.should_proxy_import("_getxattr"));
+            assert!(compat.should_proxy_import("_fgetxattr"));
+            assert!(compat.should_proxy_import("_setxattr"));
+            assert!(compat.should_proxy_import("_fsetxattr"));
+            assert!(compat.should_proxy_import("_listxattr"));
+            assert!(compat.should_proxy_import("_flistxattr"));
+            assert!(compat.should_proxy_import("_removexattr"));
+            assert!(compat.should_proxy_import("_fremovexattr"));
             assert!(compat.should_proxy_import("_getenv"));
             assert!(compat.should_proxy_import("_setenv"));
             assert!(compat.should_proxy_import("_unsetenv"));
@@ -5657,6 +5775,8 @@ mod tests {
             assert!(compat.should_proxy_import("_getpwuid"));
             assert!(compat.should_proxy_import("_getpwnam"));
             assert!(compat.should_proxy_import("_getgroups"));
+            assert!(compat.should_proxy_import("_proc_pidpath"));
+            assert!(compat.should_proxy_import("_proc_name"));
             assert!(compat.should_proxy_import("_sysconf"));
             assert!(compat.should_proxy_import("_gethostname"));
             assert!(compat.should_proxy_import("_uname"));
@@ -5676,7 +5796,9 @@ mod tests {
             assert!(compat.should_proxy_import("_madvise"));
             assert!(compat.should_proxy_import("_umask"));
             assert!(compat.should_proxy_import("_fopen"));
+            assert!(compat.should_proxy_import("_fopen$UNIX2003"));
             assert!(compat.should_proxy_import("_fdopen"));
+            assert!(compat.should_proxy_import("_fdopen$UNIX2003"));
             assert!(compat.should_proxy_import("_popen"));
             assert!(compat.should_proxy_import("_pclose"));
             assert!(compat.should_proxy_import("_fclose"));
@@ -5697,6 +5819,8 @@ mod tests {
             assert!(compat.should_proxy_import("_free"));
             assert!(compat.should_proxy_import("_posix_memalign"));
             assert!(compat.should_proxy_import("_memcpy"));
+            assert!(compat.should_proxy_import("___memcpy_chk"));
+            assert!(compat.should_proxy_import("__memcpy_chk"));
             assert!(compat.should_proxy_import("_memmove"));
             assert!(compat.should_proxy_import("_memset"));
             assert!(compat.should_proxy_import("_bzero"));
@@ -5709,6 +5833,7 @@ mod tests {
             assert!(compat.should_proxy_import("_strcasecmp"));
             assert!(compat.should_proxy_import("_strncasecmp"));
             assert!(compat.should_proxy_import("_strcpy"));
+            assert!(compat.should_proxy_import("___strcpy_chk"));
             assert!(compat.should_proxy_import("_strncpy"));
             assert!(compat.should_proxy_import("_strcat"));
             assert!(compat.should_proxy_import("_strlcpy"));
@@ -5780,6 +5905,7 @@ mod tests {
             assert!(compat.should_proxy_import("_opendir"));
             assert!(compat.should_proxy_import("_fdopendir"));
             assert!(compat.should_proxy_import("_readdir"));
+            assert!(compat.should_proxy_import("_readdir$INODE64"));
             assert!(compat.should_proxy_import("_readdir_r"));
             assert!(compat.should_proxy_import("_closedir"));
             assert!(compat.should_proxy_import("_dirfd"));
@@ -5787,7 +5913,9 @@ mod tests {
             assert!(compat.should_proxy_import("_telldir"));
             assert!(compat.should_proxy_import("_seekdir"));
             assert!(compat.should_proxy_import("_scandir"));
+            assert!(compat.should_proxy_import("_scandir$INODE64"));
             assert!(compat.should_proxy_import("_alphasort"));
+            assert!(compat.should_proxy_import("_alphasort$INODE64"));
             assert!(compat.should_proxy_import("_glob"));
             assert!(compat.should_proxy_import("_globfree"));
             assert!(compat.should_proxy_import("_getentropy"));

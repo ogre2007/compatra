@@ -1278,6 +1278,200 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn getxattr_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        name_ptr: u64,
+        value_ptr: u64,
+        size: u64,
+        position: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_getxattr(
+                memory, path_ptr, name_ptr, value_ptr, size, position, options,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                &mut *memory,
+                path_ptr,
+                name_ptr,
+                value_ptr,
+                size,
+                position,
+                options,
+            );
+            None
+        }
+    }
+
+    pub fn fgetxattr_fd<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        fd: u64,
+        name_ptr: u64,
+        value_ptr: u64,
+        size: u64,
+        position: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_fgetxattr(memory, fd, name_ptr, value_ptr, size, position, options);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                &mut *memory,
+                fd,
+                name_ptr,
+                value_ptr,
+                size,
+                position,
+                options,
+            );
+            None
+        }
+    }
+
+    pub fn setxattr_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        name_ptr: u64,
+        value_ptr: u64,
+        size: u64,
+        position: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_setxattr(
+                memory, path_ptr, name_ptr, value_ptr, size, position, options,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                &mut *memory,
+                path_ptr,
+                name_ptr,
+                value_ptr,
+                size,
+                position,
+                options,
+            );
+            None
+        }
+    }
+
+    pub fn fsetxattr_fd<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        fd: u64,
+        name_ptr: u64,
+        value_ptr: u64,
+        size: u64,
+        position: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_fsetxattr(memory, fd, name_ptr, value_ptr, size, position, options);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                &mut *memory,
+                fd,
+                name_ptr,
+                value_ptr,
+                size,
+                position,
+                options,
+            );
+            None
+        }
+    }
+
+    pub fn listxattr_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        namebuf_ptr: u64,
+        size: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_listxattr(memory, path_ptr, namebuf_ptr, size, options);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, path_ptr, namebuf_ptr, size, options);
+            None
+        }
+    }
+
+    pub fn flistxattr_fd<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        fd: u64,
+        namebuf_ptr: u64,
+        size: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_flistxattr(memory, fd, namebuf_ptr, size, options);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, fd, namebuf_ptr, size, options);
+            None
+        }
+    }
+
+    pub fn removexattr_path<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        path_ptr: u64,
+        name_ptr: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_removexattr(memory, path_ptr, name_ptr, options);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, path_ptr, name_ptr, options);
+            None
+        }
+    }
+
+    pub fn fremovexattr_fd<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        fd: u64,
+        name_ptr: u64,
+        options: u64,
+    ) -> Option<HostIoResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_host_fremovexattr(memory, fd, name_ptr, options);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, fd, name_ptr, options);
+            None
+        }
+    }
+
     pub fn fputs_stream<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -2703,6 +2897,325 @@ fn proxy_host_fgetattrlist<M: GuestMemory + ?Sized>(
         }),
         Err(errno) => Some(host_io_error(errno)),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn read_xattr_name<M: GuestMemory + ?Sized>(memory: &mut M, name_ptr: u64) -> Result<CString, u32> {
+    read_cstring(memory, name_ptr, 1024)
+        .map_err(|_| libc::EFAULT as u32)
+        .and_then(|name| CString::new(name).map_err(|_| libc::EINVAL as u32))
+}
+
+#[cfg(target_os = "macos")]
+fn checked_xattr_size(size: u64) -> Result<usize, u32> {
+    usize::try_from(size).map_err(|_| libc::EINVAL as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn read_xattr_value<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    value_ptr: u64,
+    size: usize,
+) -> Result<Vec<u8>, u32> {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    if value_ptr == 0 {
+        return Err(libc::EFAULT as u32);
+    }
+    memory
+        .read_memory(value_ptr, size)
+        .map_err(|_| libc::EFAULT as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn write_xattr_result<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    value_ptr: u64,
+    size: usize,
+    ret: isize,
+    bytes: &[u8],
+) -> Option<HostIoResult> {
+    if ret >= 0 && size > 0 {
+        let written = (ret as usize).min(size).min(bytes.len());
+        if written > 0 && memory.write_memory(value_ptr, &bytes[..written]).is_err() {
+            return Some(host_io_error(libc::EFAULT as u32));
+        }
+    }
+    Some(host_io_result(ret, bytes.to_vec()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_getxattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    position: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let name = match read_xattr_name(memory, name_ptr) {
+        Ok(name) => name,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let size = match checked_xattr_size(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    if size > 0 && value_ptr == 0 {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
+    let mut bytes = vec![0u8; size];
+    clear_errno();
+    let ret = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            if size == 0 {
+                ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr().cast::<libc::c_void>()
+            },
+            size,
+            position as u32,
+            options as libc::c_int,
+        )
+    };
+    write_xattr_result(memory, value_ptr, size, ret, &bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fgetxattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    fd: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    position: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let name = match read_xattr_name(memory, name_ptr) {
+        Ok(name) => name,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let size = match checked_xattr_size(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    if size > 0 && value_ptr == 0 {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
+    let mut bytes = vec![0u8; size];
+    clear_errno();
+    let ret = unsafe {
+        libc::fgetxattr(
+            fd as libc::c_int,
+            name.as_ptr(),
+            if size == 0 {
+                ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr().cast::<libc::c_void>()
+            },
+            size,
+            position as u32,
+            options as libc::c_int,
+        )
+    };
+    write_xattr_result(memory, value_ptr, size, ret, &bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_setxattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    position: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let name = match read_xattr_name(memory, name_ptr) {
+        Ok(name) => name,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let size = match checked_xattr_size(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let value = match read_xattr_value(memory, value_ptr, size) {
+        Ok(value) => value,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            if size == 0 {
+                ptr::null()
+            } else {
+                value.as_ptr().cast::<libc::c_void>()
+            },
+            size,
+            position as u32,
+            options as libc::c_int,
+        )
+    };
+    Some(host_io_result(ret as isize, value))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fsetxattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    fd: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    position: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let name = match read_xattr_name(memory, name_ptr) {
+        Ok(name) => name,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let size = match checked_xattr_size(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let value = match read_xattr_value(memory, value_ptr, size) {
+        Ok(value) => value,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe {
+        libc::fsetxattr(
+            fd as libc::c_int,
+            name.as_ptr(),
+            if size == 0 {
+                ptr::null()
+            } else {
+                value.as_ptr().cast::<libc::c_void>()
+            },
+            size,
+            position as u32,
+            options as libc::c_int,
+        )
+    };
+    Some(host_io_result(ret as isize, value))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_listxattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    namebuf_ptr: u64,
+    size: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let size = match checked_xattr_size(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    if size > 0 && namebuf_ptr == 0 {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
+    let mut bytes = vec![0u8; size];
+    clear_errno();
+    let ret = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            if size == 0 {
+                ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr().cast::<libc::c_char>()
+            },
+            size,
+            options as libc::c_int,
+        )
+    };
+    write_xattr_result(memory, namebuf_ptr, size, ret, &bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_flistxattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    fd: u64,
+    namebuf_ptr: u64,
+    size: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let size = match checked_xattr_size(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    if size > 0 && namebuf_ptr == 0 {
+        return Some(host_io_error(libc::EFAULT as u32));
+    }
+    let mut bytes = vec![0u8; size];
+    clear_errno();
+    let ret = unsafe {
+        libc::flistxattr(
+            fd as libc::c_int,
+            if size == 0 {
+                ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr().cast::<libc::c_char>()
+            },
+            size,
+            options as libc::c_int,
+        )
+    };
+    write_xattr_result(memory, namebuf_ptr, size, ret, &bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_removexattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    path_ptr: u64,
+    name_ptr: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let (_, path) = match read_host_path(memory, path_ptr) {
+        Ok(path) => path,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    let name = match read_xattr_name(memory, name_ptr) {
+        Ok(name) => name,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), options as libc::c_int) };
+    Some(host_io_result(ret as isize, Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_host_fremovexattr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    fd: u64,
+    name_ptr: u64,
+    options: u64,
+) -> Option<HostIoResult> {
+    let name = match read_xattr_name(memory, name_ptr) {
+        Ok(name) => name,
+        Err(errno) => return Some(host_io_error(errno)),
+    };
+    clear_errno();
+    let ret =
+        unsafe { libc::fremovexattr(fd as libc::c_int, name.as_ptr(), options as libc::c_int) };
+    Some(host_io_result(ret as isize, Vec::new()))
 }
 
 #[cfg(target_os = "macos")]
