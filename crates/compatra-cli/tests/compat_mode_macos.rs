@@ -599,6 +599,13 @@ fn compile_arm64_memory_string_fixture() -> PathBuf {
 #include <string.h>
 #include <strings.h>
 
+#ifdef strlcpy
+#undef strlcpy
+#endif
+#ifdef strlcat
+#undef strlcat
+#endif
+
 void *memmem(const void *, size_t, const void *, size_t);
 char *strcasestr(const char *, const char *);
 size_t strlcpy(char *, const char *, size_t);
