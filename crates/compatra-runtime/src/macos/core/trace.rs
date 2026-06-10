@@ -664,6 +664,9 @@ fn is_compact_covered_import_hit(event: &TraceEvent) -> bool {
             | "_IOServiceGetMatchingServices"
             | "_IOIteratorNext"
             | "_IORegistryEntryCreateCFProperty"
+            | "_IORegistryEntryGetName"
+            | "_IORegistryEntryGetPath"
+            | "_IORegistryEntryGetRegistryEntryID"
             | "_IOObjectRelease"
             | "_objc_getClass"
             | "_objc_lookUpClass"
@@ -1051,6 +1054,9 @@ mod tests {
             "_CFBundleCopyBundleURL",
             "_IOServiceMatching",
             "_IORegistryEntryCreateCFProperty",
+            "_IORegistryEntryGetName",
+            "_IORegistryEntryGetPath",
+            "_IORegistryEntryGetRegistryEntryID",
             "_IOObjectRelease",
         ] {
             let import_hit = TraceEvent::new(TraceCategory::Import, symbol)

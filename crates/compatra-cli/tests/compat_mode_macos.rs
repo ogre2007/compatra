@@ -4601,6 +4601,7 @@ fn compile_arm64_apple_framework_fixture() -> PathBuf {
     fs::write(
         &source,
         r#"#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <Security/Security.h>
 #include <dlfcn.h>
 #include <stdint.h>
@@ -4623,6 +4624,13 @@ typedef OSStatus (*sec_keychain_open_fn)(const char *, SecKeychainRef *);
 typedef OSStatus (*sec_keychain_get_path_fn)(SecKeychainRef, UInt32 *, char *);
 typedef OSStatus (*sec_keychain_find_generic_password_fn)(CFTypeRef, UInt32, const char *, UInt32, const char *, UInt32 *, void **, SecKeychainItemRef *);
 typedef OSStatus (*sec_keychain_item_free_content_fn)(SecKeychainAttributeList *, void *);
+typedef CFMutableDictionaryRef (*io_service_matching_fn)(const char *);
+typedef io_service_t (*io_service_get_matching_service_fn)(mach_port_t, CFDictionaryRef);
+typedef kern_return_t (*io_registry_entry_get_name_fn)(io_registry_entry_t, io_name_t);
+typedef kern_return_t (*io_registry_entry_get_path_fn)(io_registry_entry_t, const io_name_t, io_string_t);
+typedef kern_return_t (*io_registry_entry_get_registry_entry_id_fn)(io_registry_entry_t, uint64_t *);
+typedef CFTypeRef (*io_registry_entry_create_cf_property_fn)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits);
+typedef kern_return_t (*io_object_release_fn)(io_object_t);
 
 static int any_nonzero(const unsigned char *buf, unsigned long len) {
     for (unsigned long i = 0; i < len; i++) {
@@ -4631,6 +4639,65 @@ static int any_nonzero(const unsigned char *buf, unsigned long len) {
         }
     }
     return 0;
+}
+
+static int exercise_iokit(
+    const char *label,
+    io_service_matching_fn matching_impl,
+    io_service_get_matching_service_fn get_service_impl,
+    io_registry_entry_get_name_fn get_name_impl,
+    io_registry_entry_get_path_fn get_path_impl,
+    io_registry_entry_get_registry_entry_id_fn get_id_impl,
+    io_registry_entry_create_cf_property_fn property_impl,
+    io_object_release_fn release_impl
+) {
+    CFMutableDictionaryRef matching = matching_impl ? matching_impl("IOPlatformExpertDevice") : 0;
+    io_service_t service = matching && get_service_impl ? get_service_impl(0, matching) : 0;
+    io_name_t name = {0};
+    io_string_t path = {0};
+    uint64_t entry_id = 0;
+    kern_return_t name_ret = service && get_name_impl ? get_name_impl(service, name) : -1;
+    kern_return_t path_ret = service && get_path_impl ? get_path_impl(service, "IOService", path) : -1;
+    kern_return_t id_ret = service && get_id_impl ? get_id_impl(service, &entry_id) : -1;
+
+    CFStringRef uuid_key = CFStringCreateWithCString(0, "IOPlatformUUID", kCFStringEncodingUTF8);
+    CFTypeRef uuid_value = service && property_impl && uuid_key ? property_impl(service, uuid_key, 0, 0) : 0;
+    char uuid_text[128] = {0};
+    int uuid_ok = uuid_value && CFGetTypeID(uuid_value) == CFStringGetTypeID()
+        ? CFStringGetCString((CFStringRef)uuid_value, uuid_text, sizeof(uuid_text), kCFStringEncodingUTF8)
+        : 0;
+    if (uuid_value) {
+        CFRelease(uuid_value);
+    }
+    if (uuid_key) {
+        CFRelease(uuid_key);
+    }
+
+    kern_return_t release_ret = service && release_impl ? release_impl(service) : -1;
+    int ok = service
+        && name_ret == 0
+        && name[0] != 0
+        && path_ret == 0
+        && path[0] != 0
+        && id_ret == 0
+        && entry_id != 0
+        && release_ret == 0;
+    printf(
+        "compat iokit %s service=%p name_ret=%d name=%s path_ret=%d path=%s id_ret=%d id=%llu uuid=%d uuid_text=%s release=%d pass=%d\n",
+        label,
+        (void *)(uintptr_t)service,
+        name_ret,
+        name,
+        path_ret,
+        path,
+        id_ret,
+        (unsigned long long)entry_id,
+        uuid_ok,
+        uuid_text,
+        release_ret,
+        ok
+    );
+    return ok ? 1 : 0;
 }
 
 int main(void) {
@@ -4716,8 +4783,20 @@ int main(void) {
         static_security_ok
     );
 
+    int static_iokit_ok = exercise_iokit(
+        "static",
+        IOServiceMatching,
+        IOServiceGetMatchingService,
+        IORegistryEntryGetName,
+        IORegistryEntryGetPath,
+        IORegistryEntryGetRegistryEntryID,
+        IORegistryEntryCreateCFProperty,
+        IOObjectRelease
+    );
+
     void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
     void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
     cf_create_cstr_fn dyn_create = (cf_create_cstr_fn)dlsym(cf, "CFStringCreateWithCString");
     cf_get_cstr_fn dyn_get = (cf_get_cstr_fn)dlsym(cf, "CFStringGetCString");
     cf_get_len_fn dyn_len = (cf_get_len_fn)dlsym(cf, "CFStringGetLength");
@@ -4735,6 +4814,13 @@ int main(void) {
     sec_keychain_get_path_fn dyn_keychain_path = (sec_keychain_get_path_fn)dlsym(sec, "SecKeychainGetPath");
     sec_keychain_find_generic_password_fn dyn_keychain_find = (sec_keychain_find_generic_password_fn)dlsym(sec, "SecKeychainFindGenericPassword");
     sec_keychain_item_free_content_fn dyn_keychain_free = (sec_keychain_item_free_content_fn)dlsym(sec, "SecKeychainItemFreeContent");
+    io_service_matching_fn dyn_io_matching = (io_service_matching_fn)dlsym(iokit, "IOServiceMatching");
+    io_service_get_matching_service_fn dyn_io_get_service = (io_service_get_matching_service_fn)dlsym(iokit, "IOServiceGetMatchingService");
+    io_registry_entry_get_name_fn dyn_io_get_name = (io_registry_entry_get_name_fn)dlsym(iokit, "IORegistryEntryGetName");
+    io_registry_entry_get_path_fn dyn_io_get_path = (io_registry_entry_get_path_fn)dlsym(iokit, "IORegistryEntryGetPath");
+    io_registry_entry_get_registry_entry_id_fn dyn_io_get_id = (io_registry_entry_get_registry_entry_id_fn)dlsym(iokit, "IORegistryEntryGetRegistryEntryID");
+    io_registry_entry_create_cf_property_fn dyn_io_property = (io_registry_entry_create_cf_property_fn)dlsym(iokit, "IORegistryEntryCreateCFProperty");
+    io_object_release_fn dyn_io_release = (io_object_release_fn)dlsym(iokit, "IOObjectRelease");
     printf(
         "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p random=%p error=%p item_copy=%p kc_default=%p kc_open=%p kc_path=%p kc_find=%p kc_free=%p\n",
         (void *)dyn_create,
@@ -4754,6 +4840,16 @@ int main(void) {
         (void *)dyn_keychain_path,
         (void *)dyn_keychain_find,
         (void *)dyn_keychain_free
+    );
+    printf(
+        "compat iokit dlsym ptrs matching=%p get_service=%p get_name=%p get_path=%p get_id=%p property=%p release=%p\n",
+        (void *)dyn_io_matching,
+        (void *)dyn_io_get_service,
+        (void *)dyn_io_get_name,
+        (void *)dyn_io_get_path,
+        (void *)dyn_io_get_id,
+        (void *)dyn_io_property,
+        (void *)dyn_io_release
     );
 
     char dyn_buf[64] = {0};
@@ -4838,7 +4934,25 @@ int main(void) {
         dyn_security_ok
     );
 
-    return static_ok && dyn_ok && static_security_ok && dyn_security_ok ? 0 : 1;
+    int dyn_iokit_ok = dyn_io_matching
+        && dyn_io_get_service
+        && dyn_io_get_name
+        && dyn_io_get_path
+        && dyn_io_get_id
+        && dyn_io_property
+        && dyn_io_release
+        && exercise_iokit(
+            "dlsym",
+            dyn_io_matching,
+            dyn_io_get_service,
+            dyn_io_get_name,
+            dyn_io_get_path,
+            dyn_io_get_id,
+            dyn_io_property,
+            dyn_io_release
+        );
+
+    return static_ok && dyn_ok && static_security_ok && dyn_security_ok && static_iokit_ok && dyn_iokit_ok ? 0 : 1;
 }
 "#,
     )
@@ -4857,6 +4971,8 @@ int main(void) {
         .arg("CoreFoundation")
         .arg("-framework")
         .arg("Security")
+        .arg("-framework")
+        .arg("IOKit")
         .arg("-o")
         .arg(&binary)
         .stdout(Stdio::piped())
@@ -6650,8 +6766,38 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
     assert!(
         stdout
             .lines()
+            .any(|line| line.contains("compat iokit static")
+                && line.contains(" name_ret=0 ")
+                && line.contains(" path_ret=0 ")
+                && line.contains(" id_ret=0 ")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not complete static IOKit registry calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat iokit dlsym ptrs matching=0x")
+            && stdout.contains(" get_service=0x")
+            && stdout.contains(" get_name=0x")
+            && stdout.contains(" get_path=0x")
+            && stdout.contains(" get_id=0x")
+            && stdout.contains(" property=0x")
+            && stdout.contains(" release=0x"),
+        "Apple framework fixture did not receive dlsym IOKit trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
             .any(|line| line.contains("compat security dlsym") && line.contains(" pass=1")),
         "Apple framework fixture did not complete dlsym Security/keychain calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat iokit dlsym")
+                && line.contains(" name_ret=0 ")
+                && line.contains(" path_ret=0 ")
+                && line.contains(" id_ret=0 ")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not complete dlsym IOKit registry calls; stdout:\n{stdout}"
     );
 }
 

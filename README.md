@@ -176,6 +176,8 @@ outputs, including:
 - static imports and `dlsym` imports for CoreFoundation/Security framework
   glue, including host-backed keychain status/path lookups and
   `SecItemCopyMatching`/`SecKeychainFindGenericPassword` status reporting
+- host-backed IOKit registry inventory helpers for service matching, entry
+  names, registry paths, entry IDs, and selected CF properties
 - host-backed privacy-sensitive framework probes for screen capture, keyboard
   listen/accessibility state, synchronous key-state reads, and AVFoundation
   microphone device discovery. TCC denial is preserved as real host behavior.

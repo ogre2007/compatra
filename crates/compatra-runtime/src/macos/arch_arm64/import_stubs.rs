@@ -382,6 +382,9 @@ mod tests {
             "_IOServiceGetMatchingServices",
             "_IOIteratorNext",
             "_IORegistryEntryCreateCFProperty",
+            "_IORegistryEntryGetName",
+            "_IORegistryEntryGetPath",
+            "_IORegistryEntryGetRegistryEntryID",
             "_IOObjectRelease",
         ] {
             assert!(

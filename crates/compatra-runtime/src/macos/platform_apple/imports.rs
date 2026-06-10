@@ -66,6 +66,9 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "IOServiceGetMatchingServices"
             | "IOIteratorNext"
             | "IORegistryEntryCreateCFProperty"
+            | "IORegistryEntryGetName"
+            | "IORegistryEntryGetPath"
+            | "IORegistryEntryGetRegistryEntryID"
             | "IOObjectRelease"
             | "objc_getClass"
             | "objc_lookUpClass"
@@ -212,6 +215,19 @@ fn write_guest_u32(emu: &mut dyn Emulator, addr: u64, value: u32) -> bool {
     addr != 0 && emu.write_memory(addr, &value.to_le_bytes()).is_ok()
 }
 
+fn write_guest_u64(emu: &mut dyn Emulator, addr: u64, value: u64) -> bool {
+    addr != 0 && emu.write_memory(addr, &value.to_le_bytes()).is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn c_char_buffer_to_bytes<const N: usize>(buffer: &[std::ffi::c_char; N]) -> Vec<u8> {
+    buffer
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect()
+}
+
 fn cf_string_len(data: &[u8]) -> u64 {
     String::from_utf8_lossy(data).encode_utf16().count() as u64
 }
@@ -243,6 +259,9 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_IOServiceGetMatchingServices",
     "_IOIteratorNext",
     "_IORegistryEntryCreateCFProperty",
+    "_IORegistryEntryGetName",
+    "_IORegistryEntryGetPath",
+    "_IORegistryEntryGetRegistryEntryID",
     "_IOObjectRelease",
     "_objc_getClass",
     "_objc_lookUpClass",
@@ -1421,6 +1440,73 @@ fn host_iokit_io_registry_entry_create_cf_property(
 }
 
 #[cfg(target_os = "macos")]
+fn host_iokit_io_registry_entry_get_name(entry: u64) -> (i32, Vec<u8>) {
+    if entry == 0 {
+        return (-536_870_206, Vec::new());
+    }
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryGetName(
+            entry: std::ffi::c_uint,
+            name: *mut std::ffi::c_char,
+        ) -> std::ffi::c_int;
+    }
+    let mut name = [0i8; 128];
+    let kr = unsafe { IORegistryEntryGetName(entry as std::ffi::c_uint, name.as_mut_ptr()) };
+    let bytes = if kr == 0 {
+        c_char_buffer_to_bytes(&name)
+    } else {
+        Vec::new()
+    };
+    (kr, bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn host_iokit_io_registry_entry_get_path(entry: u64, plane: &str) -> (i32, Vec<u8>) {
+    if entry == 0 {
+        return (-536_870_206, Vec::new());
+    }
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryGetPath(
+            entry: std::ffi::c_uint,
+            plane: *const std::ffi::c_char,
+            path: *mut std::ffi::c_char,
+        ) -> std::ffi::c_int;
+    }
+    let Ok(plane) = std::ffi::CString::new(plane) else {
+        return (-536_870_206, Vec::new());
+    };
+    let mut path = [0i8; 512];
+    let kr = unsafe {
+        IORegistryEntryGetPath(entry as std::ffi::c_uint, plane.as_ptr(), path.as_mut_ptr())
+    };
+    let bytes = if kr == 0 {
+        c_char_buffer_to_bytes(&path)
+    } else {
+        Vec::new()
+    };
+    (kr, bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn host_iokit_io_registry_entry_get_registry_entry_id(entry: u64) -> (i32, u64) {
+    if entry == 0 {
+        return (-536_870_206, 0);
+    }
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryGetRegistryEntryID(
+            entry: std::ffi::c_uint,
+            entry_id: *mut u64,
+        ) -> std::ffi::c_int;
+    }
+    let mut entry_id = 0u64;
+    let kr = unsafe { IORegistryEntryGetRegistryEntryID(entry as std::ffi::c_uint, &mut entry_id) };
+    (kr, entry_id)
+}
+
+#[cfg(target_os = "macos")]
 fn host_iokit_io_object_release(object: u64) -> i32 {
     if object == 0 {
         return 0;
@@ -1514,6 +1600,21 @@ fn host_iokit_io_registry_entry_create_cf_property(
     _options: u64,
 ) -> Option<u64> {
     None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_iokit_io_registry_entry_get_name(_entry: u64) -> (i32, Vec<u8>) {
+    (-1, Vec::new())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_iokit_io_registry_entry_get_path(_entry: u64, _plane: &str) -> (i32, Vec<u8>) {
+    (-1, Vec::new())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_iokit_io_registry_entry_get_registry_entry_id(_entry: u64) -> (i32, u64) {
+    (-1, 0)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -5187,6 +5288,100 @@ fn dispatch_apple_import(
             );
             Some(result)
         }
+        "IORegistryEntryGetName" => {
+            let entry_ref = emu.read_reg("x0").unwrap_or(0);
+            let name_out = emu.read_reg("x1").unwrap_or(0);
+            let host_entry = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(entry_ref).unwrap_or(0)
+            };
+            let (kr, name) = host_iokit_io_registry_entry_get_name(host_entry);
+            let wrote = kr == 0 && write_guest_cstring(emu, name_out, 128, &name);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_IORegistryEntryGetName(entry=0x{:X}, name=0x{:X}) -> {} name={}",
+                    entry_ref,
+                    name_out,
+                    kr,
+                    String::from_utf8_lossy(&name)
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "iokit", "IORegistryEntryGetName")
+                    .arg("Entry", format!("0x{:X}", entry_ref))
+                    .arg("NameOut", format!("0x{:X}", name_out))
+                    .arg("Result", kr.to_string())
+                    .arg("HostProxy", (host_entry != 0).to_string())
+                    .arg("Wrote", wrote.to_string())
+                    .arg("Preview", lossy_data_preview(&name, 128)),
+            );
+            Some(kr as i64 as u64)
+        }
+        "IORegistryEntryGetPath" => {
+            let entry_ref = emu.read_reg("x0").unwrap_or(0);
+            let plane_ptr = emu.read_reg("x1").unwrap_or(0);
+            let path_out = emu.read_reg("x2").unwrap_or(0);
+            let plane = read_cstring(emu, plane_ptr, 128).unwrap_or_else(|_| "IOService".into());
+            let host_entry = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(entry_ref).unwrap_or(0)
+            };
+            let (kr, path) = host_iokit_io_registry_entry_get_path(host_entry, &plane);
+            let wrote = kr == 0 && write_guest_cstring(emu, path_out, 512, &path);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_IORegistryEntryGetPath(entry=0x{:X}, plane={}, path=0x{:X}) -> {} path={}",
+                    entry_ref,
+                    plane,
+                    path_out,
+                    kr,
+                    String::from_utf8_lossy(&path)
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "iokit", "IORegistryEntryGetPath")
+                    .arg("Entry", format!("0x{:X}", entry_ref))
+                    .arg("Plane", plane)
+                    .arg("PathOut", format!("0x{:X}", path_out))
+                    .arg("Result", kr.to_string())
+                    .arg("HostProxy", (host_entry != 0).to_string())
+                    .arg("Wrote", wrote.to_string())
+                    .arg("Preview", lossy_data_preview(&path, 128)),
+            );
+            Some(kr as i64 as u64)
+        }
+        "IORegistryEntryGetRegistryEntryID" => {
+            let entry_ref = emu.read_reg("x0").unwrap_or(0);
+            let id_out = emu.read_reg("x1").unwrap_or(0);
+            let host_entry = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(entry_ref).unwrap_or(0)
+            };
+            let (kr, entry_id) = host_iokit_io_registry_entry_get_registry_entry_id(host_entry);
+            let wrote = kr == 0 && write_guest_u64(emu, id_out, entry_id);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_IORegistryEntryGetRegistryEntryID(entry=0x{:X}, id=0x{:X}) -> {} id={}",
+                    entry_ref, id_out, kr, entry_id
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "iokit", "IORegistryEntryGetRegistryEntryID")
+                    .arg("Entry", format!("0x{:X}", entry_ref))
+                    .arg("IdOut", format!("0x{:X}", id_out))
+                    .arg("EntryId", entry_id.to_string())
+                    .arg("Result", kr.to_string())
+                    .arg("HostProxy", (host_entry != 0).to_string())
+                    .arg("Wrote", wrote.to_string()),
+            );
+            Some(kr as i64 as u64)
+        }
         "IOObjectRelease" => {
             let object_ref = emu.read_reg("x0").unwrap_or(0);
             let host_object = {
@@ -7476,6 +7671,9 @@ mod tests {
         assert!(is_apple_import_symbol("_IOServiceGetMatchingServices"));
         assert!(is_apple_import_symbol("_IOIteratorNext"));
         assert!(is_apple_import_symbol("_IORegistryEntryCreateCFProperty"));
+        assert!(is_apple_import_symbol("_IORegistryEntryGetName"));
+        assert!(is_apple_import_symbol("_IORegistryEntryGetPath"));
+        assert!(is_apple_import_symbol("_IORegistryEntryGetRegistryEntryID"));
         assert!(is_apple_import_symbol("_IOObjectRelease"));
     }
 
@@ -7495,6 +7693,9 @@ mod tests {
             "_IOServiceGetMatchingServices",
             "_IOIteratorNext",
             "_IORegistryEntryCreateCFProperty",
+            "_IORegistryEntryGetName",
+            "_IORegistryEntryGetPath",
+            "_IORegistryEntryGetRegistryEntryID",
             "_IOObjectRelease",
         ] {
             assert!(
