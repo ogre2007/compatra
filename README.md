@@ -170,6 +170,9 @@ outputs, including:
 - static imports and `dlsym` imports for file descriptors, positioned I/O,
   path metadata and mutation, directory iteration, `scandir`, `glob`,
   `getattrlist`, environment, time, resource, and entropy calls
+- static imports and `dlsym` imports for common libc memory/string/parse glue
+  such as `memchr`, `memmem`, `strcasestr`, `strlcpy`, `strlcat`, `atoi`, and
+  `strto*` with guest `endptr` handling
 - static imports and `dlsym` imports for CoreFoundation/Security framework
   glue, including host-backed keychain status/path lookups and
   `SecItemCopyMatching`/`SecKeychainFindGenericPassword` status reporting

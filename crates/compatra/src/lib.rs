@@ -419,11 +419,19 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     Memcmp,
     #[cfg(target_os = "macos")]
+    Memchr,
+    #[cfg(target_os = "macos")]
+    Memmem,
+    #[cfg(target_os = "macos")]
     Strlen,
     #[cfg(target_os = "macos")]
     Strcmp,
     #[cfg(target_os = "macos")]
     Strncmp,
+    #[cfg(target_os = "macos")]
+    Strcasecmp,
+    #[cfg(target_os = "macos")]
+    Strncasecmp,
     #[cfg(target_os = "macos")]
     Strcpy,
     #[cfg(target_os = "macos")]
@@ -431,13 +439,33 @@ enum HostImportKind {
     #[cfg(target_os = "macos")]
     Strcat,
     #[cfg(target_os = "macos")]
+    Strlcpy,
+    #[cfg(target_os = "macos")]
+    Strlcat,
+    #[cfg(target_os = "macos")]
     Strchr,
     #[cfg(target_os = "macos")]
     Strrchr,
     #[cfg(target_os = "macos")]
     Strstr,
     #[cfg(target_os = "macos")]
+    Strcasestr,
+    #[cfg(target_os = "macos")]
     Strdup,
+    #[cfg(target_os = "macos")]
+    Atoi,
+    #[cfg(target_os = "macos")]
+    Atol,
+    #[cfg(target_os = "macos")]
+    Atoll,
+    #[cfg(target_os = "macos")]
+    Strtol,
+    #[cfg(target_os = "macos")]
+    Strtoll,
+    #[cfg(target_os = "macos")]
+    Strtoul,
+    #[cfg(target_os = "macos")]
+    Strtoull,
     #[cfg(target_os = "macos")]
     Cxx(CxxImportKind),
     #[cfg(target_os = "macos")]
@@ -532,6 +560,13 @@ enum HostImportKind {
     OsUnfairLockAssertOwner,
     #[cfg(target_os = "macos")]
     OsUnfairLockAssertNotOwner,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntegralParseKind {
+    Signed64,
+    Unsigned64,
 }
 
 impl CompatibilityServices {
@@ -994,16 +1029,45 @@ impl CompatibilityServices {
                 HostImportKind::Memset => Some(self.memset(memory, args[0], args[1], args[2])?),
                 HostImportKind::BZero => Some(self.memset(memory, args[0], 0, args[1])?),
                 HostImportKind::Memcmp => Some(self.memcmp(memory, args[0], args[1], args[2])?),
+                HostImportKind::Memchr => Some(self.memchr(memory, args[0], args[1], args[2])?),
+                HostImportKind::Memmem => {
+                    Some(self.memmem(memory, args[0], args[1], args[2], args[3])?)
+                }
                 HostImportKind::Strlen => Some(self.strlen(memory, args[0])?),
                 HostImportKind::Strcmp => Some(self.strcmp(memory, args[0], args[1])?),
                 HostImportKind::Strncmp => Some(self.strncmp(memory, args[0], args[1], args[2])?),
+                HostImportKind::Strcasecmp => Some(self.strcasecmp(memory, args[0], args[1])?),
+                HostImportKind::Strncasecmp => {
+                    Some(self.strncasecmp(memory, args[0], args[1], args[2])?)
+                }
                 HostImportKind::Strcpy => Some(self.strcpy(memory, args[0], args[1])?),
                 HostImportKind::Strncpy => Some(self.strncpy(memory, args[0], args[1], args[2])?),
                 HostImportKind::Strcat => Some(self.strcat(memory, args[0], args[1])?),
+                HostImportKind::Strlcpy => Some(self.strlcpy(memory, args[0], args[1], args[2])?),
+                HostImportKind::Strlcat => Some(self.strlcat(memory, args[0], args[1], args[2])?),
                 HostImportKind::Strchr => Some(self.strchr(memory, args[0], args[1])?),
                 HostImportKind::Strrchr => Some(self.strrchr(memory, args[0], args[1])?),
                 HostImportKind::Strstr => Some(self.strstr(memory, args[0], args[1])?),
+                HostImportKind::Strcasestr => Some(self.strcasestr(memory, args[0], args[1])?),
                 HostImportKind::Strdup => Some(self.strdup(memory, args[0])?),
+                HostImportKind::Atoi => Some(self.atoi(memory, args[0], false)?),
+                HostImportKind::Atol | HostImportKind::Atoll => {
+                    Some(self.atoi(memory, args[0], true)?)
+                }
+                HostImportKind::Strtol | HostImportKind::Strtoll => Some(self.strto_integral(
+                    memory,
+                    args[0],
+                    args[1],
+                    args[2],
+                    IntegralParseKind::Signed64,
+                )?),
+                HostImportKind::Strtoul | HostImportKind::Strtoull => Some(self.strto_integral(
+                    memory,
+                    args[0],
+                    args[1],
+                    args[2],
+                    IntegralParseKind::Unsigned64,
+                )?),
                 HostImportKind::Cxx(kind) => proxy_cxx_import(kind, memory, args),
                 HostImportKind::OpenDir => Some(self.opendir_path(memory, args[0])?),
                 HostImportKind::FdOpenDir => Some(self.fdopendir_fd(memory, args[0])?),
@@ -1692,6 +1756,49 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn memchr<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        ptr: u64,
+        needle: u64,
+        len: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_memchr(memory, ptr, needle, len);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, ptr, needle, len);
+            None
+        }
+    }
+
+    pub fn memmem<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        haystack_ptr: u64,
+        haystack_len: u64,
+        needle_ptr: u64,
+        needle_len: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_memmem(memory, haystack_ptr, haystack_len, needle_ptr, needle_len);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                &mut *memory,
+                haystack_ptr,
+                haystack_len,
+                needle_ptr,
+                needle_len,
+            );
+            None
+        }
+    }
+
     pub fn strlen<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1735,6 +1842,41 @@ impl CompatibilityServices {
         #[cfg(target_os = "macos")]
         {
             return proxy_guest_strncmp(memory, left, right, len);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, left, right, len);
+            None
+        }
+    }
+
+    pub fn strcasecmp<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        left: u64,
+        right: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_strcasecmp(memory, left, right, None);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, left, right);
+            None
+        }
+    }
+
+    pub fn strncasecmp<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        left: u64,
+        right: u64,
+        len: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_strcasecmp(memory, left, right, Some(len));
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1795,6 +1937,42 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn strlcpy<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        dst: u64,
+        src: u64,
+        size: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_strlcpy(memory, dst, src, size);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, dst, src, size);
+            None
+        }
+    }
+
+    pub fn strlcat<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        dst: u64,
+        src: u64,
+        size: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_strlcat(memory, dst, src, size);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, dst, src, size);
+            None
+        }
+    }
+
     pub fn strchr<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1846,6 +2024,23 @@ impl CompatibilityServices {
         }
     }
 
+    pub fn strcasestr<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        haystack_ptr: u64,
+        needle_ptr: u64,
+    ) -> Option<HostCallResult> {
+        #[cfg(target_os = "macos")]
+        {
+            return proxy_guest_strcasestr(memory, haystack_ptr, needle_ptr);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&mut *memory, haystack_ptr, needle_ptr);
+            None
+        }
+    }
+
     pub fn strdup<M: GuestMemory + ?Sized>(
         &self,
         memory: &mut M,
@@ -1860,6 +2055,33 @@ impl CompatibilityServices {
             let _ = (&mut *memory, str_ptr);
             None
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn atoi<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        nptr: u64,
+        wide: bool,
+    ) -> Option<HostCallResult> {
+        let result = proxy_guest_strto_integral(memory, nptr, 0, 10, IntegralParseKind::Signed64)?;
+        if wide {
+            Some(result)
+        } else {
+            Some(host_call_value(result.return_value as i32 as i64 as u64))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn strto_integral<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        nptr: u64,
+        endptr: u64,
+        base: u64,
+        kind: IntegralParseKind,
+    ) -> Option<HostCallResult> {
+        proxy_guest_strto_integral(memory, nptr, endptr, base, kind)
     }
 }
 
@@ -2977,16 +3199,30 @@ fn host_import_kind(symbol: &str) -> Option<HostImportKind> {
             "memset" | "__memset_chk" => Some(HostImportKind::Memset),
             "bzero" => Some(HostImportKind::BZero),
             "memcmp" => Some(HostImportKind::Memcmp),
+            "memchr" | "__memchr_chk" => Some(HostImportKind::Memchr),
+            "memmem" => Some(HostImportKind::Memmem),
             "strlen" => Some(HostImportKind::Strlen),
             "strcmp" => Some(HostImportKind::Strcmp),
             "strncmp" => Some(HostImportKind::Strncmp),
+            "strcasecmp" => Some(HostImportKind::Strcasecmp),
+            "strncasecmp" => Some(HostImportKind::Strncasecmp),
             "strcpy" | "__strcpy_chk" => Some(HostImportKind::Strcpy),
             "strncpy" | "__strncpy_chk" => Some(HostImportKind::Strncpy),
             "strcat" | "__strcat_chk" => Some(HostImportKind::Strcat),
+            "strlcpy" | "__strlcpy_chk" => Some(HostImportKind::Strlcpy),
+            "strlcat" | "__strlcat_chk" => Some(HostImportKind::Strlcat),
             "strchr" => Some(HostImportKind::Strchr),
             "strrchr" => Some(HostImportKind::Strrchr),
             "strstr" => Some(HostImportKind::Strstr),
+            "strcasestr" => Some(HostImportKind::Strcasestr),
             "strdup" => Some(HostImportKind::Strdup),
+            "atoi" => Some(HostImportKind::Atoi),
+            "atol" => Some(HostImportKind::Atol),
+            "atoll" => Some(HostImportKind::Atoll),
+            "strtol" => Some(HostImportKind::Strtol),
+            "strtoll" => Some(HostImportKind::Strtoll),
+            "strtoul" => Some(HostImportKind::Strtoul),
+            "strtoull" => Some(HostImportKind::Strtoull),
             "opendir" => Some(HostImportKind::OpenDir),
             "fdopendir" => Some(HostImportKind::FdOpenDir),
             "readdir" => Some(HostImportKind::ReadDir),
@@ -4782,6 +5018,76 @@ fn proxy_guest_memcmp<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_guest_memchr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    ptr: u64,
+    needle: u64,
+    len: u64,
+) -> Option<HostCallResult> {
+    let len = match checked_guest_len(len) {
+        Ok(len) => len,
+        Err(errno) => return Some(host_call_error(errno)),
+    };
+    if len == 0 {
+        return Some(host_call_value(0));
+    }
+    if ptr == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    let bytes = match memory.read_memory(ptr, len) {
+        Ok(bytes) => bytes,
+        Err(_) => return Some(host_call_error(libc::EFAULT as u32)),
+    };
+    let found = bytes
+        .iter()
+        .position(|byte| *byte == needle as u8)
+        .map(|idx| ptr.saturating_add(idx as u64))
+        .unwrap_or(0);
+    Some(host_call_value(found))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_memmem<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    haystack_ptr: u64,
+    haystack_len: u64,
+    needle_ptr: u64,
+    needle_len: u64,
+) -> Option<HostCallResult> {
+    let haystack_len = match checked_guest_len(haystack_len) {
+        Ok(len) => len,
+        Err(errno) => return Some(host_call_error(errno)),
+    };
+    let needle_len = match checked_guest_len(needle_len) {
+        Ok(len) => len,
+        Err(errno) => return Some(host_call_error(errno)),
+    };
+    if needle_len == 0 {
+        return Some(host_call_value(haystack_ptr));
+    }
+    if haystack_len == 0 || needle_len > haystack_len {
+        return Some(host_call_value(0));
+    }
+    if haystack_ptr == 0 || needle_ptr == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    let haystack = match memory.read_memory(haystack_ptr, haystack_len) {
+        Ok(bytes) => bytes,
+        Err(_) => return Some(host_call_error(libc::EFAULT as u32)),
+    };
+    let needle = match memory.read_memory(needle_ptr, needle_len) {
+        Ok(bytes) => bytes,
+        Err(_) => return Some(host_call_error(libc::EFAULT as u32)),
+    };
+    let found = haystack
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+        .map(|idx| haystack_ptr.saturating_add(idx as u64))
+        .unwrap_or(0);
+    Some(host_call_value(found))
+}
+
+#[cfg(target_os = "macos")]
 fn compare_bytes(left: &[u8], right: &[u8], len: usize) -> i32 {
     for idx in 0..len {
         let lhs = left.get(idx).copied().unwrap_or(0);
@@ -4801,6 +5107,29 @@ fn compare_cstring_bytes(left: &[u8], right: &[u8], limit: Option<usize>) -> i32
         let rhs = right.get(idx).copied().unwrap_or(0);
         if lhs != rhs {
             return lhs as i32 - rhs as i32;
+        }
+        if lhs == 0 {
+            return 0;
+        }
+    }
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn ascii_casefold(byte: u8) -> u8 {
+    byte.to_ascii_lowercase()
+}
+
+#[cfg(target_os = "macos")]
+fn compare_cstring_bytes_casefold(left: &[u8], right: &[u8], limit: Option<usize>) -> i32 {
+    let len = limit.unwrap_or_else(|| left.len().max(right.len()).saturating_add(1));
+    for idx in 0..len {
+        let lhs = left.get(idx).copied().unwrap_or(0);
+        let rhs = right.get(idx).copied().unwrap_or(0);
+        let folded_lhs = ascii_casefold(lhs);
+        let folded_rhs = ascii_casefold(rhs);
+        if folded_lhs != folded_rhs {
+            return folded_lhs as i32 - folded_rhs as i32;
         }
         if lhs == 0 {
             return 0;
@@ -4848,6 +5177,29 @@ fn proxy_guest_strncmp<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_guest_strcasecmp<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    left: u64,
+    right: u64,
+    limit: Option<u64>,
+) -> Option<HostCallResult> {
+    let limit = match limit {
+        Some(limit) => match checked_guest_len(limit) {
+            Ok(limit) => Some(limit),
+            Err(errno) => return Some(host_call_error(errno)),
+        },
+        None => None,
+    };
+    let read_limit = limit
+        .unwrap_or(MAX_GUEST_STRING_BYTES)
+        .min(MAX_GUEST_STRING_BYTES);
+    let left = read_cstring_bytes(memory, left, read_limit).ok()?;
+    let right = read_cstring_bytes(memory, right, read_limit).ok()?;
+    let cmp = compare_cstring_bytes_casefold(&left, &right, limit);
+    Some(host_call_value(cmp as i64 as u64))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_guest_strcpy<M: GuestMemory + ?Sized>(
     memory: &mut M,
     dst: u64,
@@ -4881,6 +5233,81 @@ fn proxy_guest_strncpy<M: GuestMemory + ?Sized>(
         return Some(host_call_error(libc::EFAULT as u32));
     }
     Some(host_call_value(dst))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_strlcpy<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    dst: u64,
+    src: u64,
+    size: u64,
+) -> Option<HostCallResult> {
+    let size = match checked_guest_len(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_call_error(errno)),
+    };
+    let src_bytes = read_cstring_bytes(memory, src, MAX_GUEST_STRING_BYTES).ok()?;
+    if size == 0 {
+        return Some(host_call_value(src_bytes.len() as u64));
+    }
+    if dst == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    let copy_len = src_bytes.len().min(size.saturating_sub(1));
+    let mut out = Vec::with_capacity(copy_len + 1);
+    out.extend_from_slice(&src_bytes[..copy_len]);
+    out.push(0);
+    if memory.write_memory(dst, &out).is_err() {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+    Some(host_call_value(src_bytes.len() as u64))
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_strlcat<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    dst: u64,
+    src: u64,
+    size: u64,
+) -> Option<HostCallResult> {
+    let size = match checked_guest_len(size) {
+        Ok(size) => size,
+        Err(errno) => return Some(host_call_error(errno)),
+    };
+    let src_bytes = read_cstring_bytes(memory, src, MAX_GUEST_STRING_BYTES).ok()?;
+    if size == 0 {
+        return Some(host_call_value(src_bytes.len() as u64));
+    }
+    if dst == 0 {
+        return Some(host_call_error(libc::EFAULT as u32));
+    }
+
+    let scan_len = size.min(MAX_GUEST_STRING_BYTES);
+    let dst_bytes = match memory.read_memory(dst, scan_len) {
+        Ok(bytes) => bytes,
+        Err(_) => return Some(host_call_error(libc::EFAULT as u32)),
+    };
+    let dst_len = dst_bytes.iter().position(|byte| *byte == 0).unwrap_or(size);
+    if dst_len >= size {
+        return Some(host_call_value(size.saturating_add(src_bytes.len()) as u64));
+    }
+
+    let space = size.saturating_sub(dst_len).saturating_sub(1);
+    let copy_len = src_bytes.len().min(space);
+    if copy_len > 0 || space > 0 {
+        let mut out = Vec::with_capacity(copy_len + 1);
+        out.extend_from_slice(&src_bytes[..copy_len]);
+        out.push(0);
+        if memory
+            .write_memory(dst.saturating_add(dst_len as u64), &out)
+            .is_err()
+        {
+            return Some(host_call_error(libc::EFAULT as u32));
+        }
+    }
+    Some(host_call_value(
+        dst_len.saturating_add(src_bytes.len()) as u64
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -4943,6 +5370,30 @@ fn proxy_guest_strstr<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+fn proxy_guest_strcasestr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    haystack_ptr: u64,
+    needle_ptr: u64,
+) -> Option<HostCallResult> {
+    let haystack = read_cstring_bytes(memory, haystack_ptr, MAX_GUEST_STRING_BYTES).ok()?;
+    let needle = read_cstring_bytes(memory, needle_ptr, MAX_GUEST_STRING_BYTES).ok()?;
+    if needle.is_empty() {
+        return Some(host_call_value(haystack_ptr));
+    }
+    let found = haystack
+        .windows(needle.len())
+        .position(|window| {
+            window
+                .iter()
+                .zip(needle.iter())
+                .all(|(lhs, rhs)| ascii_casefold(*lhs) == ascii_casefold(*rhs))
+        })
+        .map(|idx| haystack_ptr.saturating_add(idx as u64))
+        .unwrap_or(0);
+    Some(host_call_value(found))
+}
+
+#[cfg(target_os = "macos")]
 fn proxy_guest_strdup<M: GuestMemory + ?Sized>(
     memory: &mut M,
     str_ptr: u64,
@@ -4958,6 +5409,142 @@ fn proxy_guest_strdup<M: GuestMemory + ?Sized>(
         return Some(host_null_error(libc::EFAULT as u32));
     }
     Some(host_call_value(addr))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_digit(byte: u8) -> Option<u32> {
+    match byte {
+        b'0'..=b'9' => Some((byte - b'0') as u32),
+        b'a'..=b'z' => Some((byte - b'a' + 10) as u32),
+        b'A'..=b'Z' => Some((byte - b'A' + 10) as u32),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_guest_strto_integral<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    nptr: u64,
+    endptr: u64,
+    base: u64,
+    kind: IntegralParseKind,
+) -> Option<HostCallResult> {
+    let bytes = read_cstring_bytes(memory, nptr, MAX_GUEST_STRING_BYTES).ok()?;
+    let mut idx = 0usize;
+    while bytes
+        .get(idx)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        idx += 1;
+    }
+
+    let negative = match bytes.get(idx) {
+        Some(b'-') => {
+            idx += 1;
+            true
+        }
+        Some(b'+') => {
+            idx += 1;
+            false
+        }
+        _ => false,
+    };
+
+    let mut parsed_base = match i32::try_from(base) {
+        Ok(0) => 0,
+        Ok(value @ 2..=36) => value as u32,
+        _ => {
+            if endptr != 0 {
+                write_guest_u64(memory, endptr, nptr).ok()?;
+            }
+            return Some(HostCallResult {
+                return_value: 0,
+                errno: Some(libc::EINVAL as u32),
+            });
+        }
+    };
+
+    if parsed_base == 0 {
+        if bytes.get(idx) == Some(&b'0')
+            && matches!(bytes.get(idx + 1).copied(), Some(b'x' | b'X'))
+            && bytes
+                .get(idx + 2)
+                .and_then(|byte| parse_digit(*byte))
+                .is_some_and(|digit| digit < 16)
+        {
+            parsed_base = 16;
+            idx += 2;
+        } else if bytes.get(idx) == Some(&b'0') {
+            parsed_base = 8;
+        } else {
+            parsed_base = 10;
+        }
+    } else if parsed_base == 16
+        && bytes.get(idx) == Some(&b'0')
+        && matches!(bytes.get(idx + 1).copied(), Some(b'x' | b'X'))
+        && bytes
+            .get(idx + 2)
+            .and_then(|byte| parse_digit(*byte))
+            .is_some_and(|digit| digit < 16)
+    {
+        idx += 2;
+    }
+
+    let digits_start = idx;
+    let mut value = 0u128;
+    let mut overflow = false;
+    let unsigned_limit = u64::MAX as u128;
+    let signed_limit = if negative {
+        (i64::MAX as u128) + 1
+    } else {
+        i64::MAX as u128
+    };
+    let limit = match kind {
+        IntegralParseKind::Signed64 => signed_limit,
+        IntegralParseKind::Unsigned64 => unsigned_limit,
+    };
+
+    while let Some(digit) = bytes.get(idx).and_then(|byte| parse_digit(*byte)) {
+        if digit >= parsed_base {
+            break;
+        }
+        let digit = digit as u128;
+        if value > (limit.saturating_sub(digit)) / parsed_base as u128 {
+            overflow = true;
+            value = limit;
+        } else if !overflow {
+            value = value * parsed_base as u128 + digit;
+        }
+        idx += 1;
+    }
+
+    if idx == digits_start {
+        if endptr != 0 {
+            write_guest_u64(memory, endptr, nptr).ok()?;
+        }
+        return Some(HostCallResult {
+            return_value: 0,
+            errno: Some(0),
+        });
+    }
+
+    if endptr != 0 {
+        write_guest_u64(memory, endptr, nptr.saturating_add(idx as u64)).ok()?;
+    }
+
+    let return_value = match kind {
+        IntegralParseKind::Signed64 if overflow && negative => i64::MIN as u64,
+        IntegralParseKind::Signed64 if overflow => i64::MAX as u64,
+        IntegralParseKind::Signed64 if negative => (-(value as i128) as i64) as u64,
+        IntegralParseKind::Signed64 => value as i64 as u64,
+        IntegralParseKind::Unsigned64 if negative => (0u64).wrapping_sub(value as u64),
+        IntegralParseKind::Unsigned64 => value as u64,
+    };
+
+    Some(HostCallResult {
+        return_value,
+        errno: Some(if overflow { libc::ERANGE as u32 } else { 0 }),
+    })
 }
 
 #[cfg(test)]
@@ -5114,16 +5701,30 @@ mod tests {
             assert!(compat.should_proxy_import("_memset"));
             assert!(compat.should_proxy_import("_bzero"));
             assert!(compat.should_proxy_import("_memcmp"));
+            assert!(compat.should_proxy_import("_memchr"));
+            assert!(compat.should_proxy_import("_memmem"));
             assert!(compat.should_proxy_import("_strlen"));
             assert!(compat.should_proxy_import("_strcmp"));
             assert!(compat.should_proxy_import("_strncmp"));
+            assert!(compat.should_proxy_import("_strcasecmp"));
+            assert!(compat.should_proxy_import("_strncasecmp"));
             assert!(compat.should_proxy_import("_strcpy"));
             assert!(compat.should_proxy_import("_strncpy"));
             assert!(compat.should_proxy_import("_strcat"));
+            assert!(compat.should_proxy_import("_strlcpy"));
+            assert!(compat.should_proxy_import("_strlcat"));
             assert!(compat.should_proxy_import("_strchr"));
             assert!(compat.should_proxy_import("_strrchr"));
             assert!(compat.should_proxy_import("_strstr"));
+            assert!(compat.should_proxy_import("_strcasestr"));
             assert!(compat.should_proxy_import("_strdup"));
+            assert!(compat.should_proxy_import("_atoi"));
+            assert!(compat.should_proxy_import("_atol"));
+            assert!(compat.should_proxy_import("_atoll"));
+            assert!(compat.should_proxy_import("_strtol"));
+            assert!(compat.should_proxy_import("_strtoll"));
+            assert!(compat.should_proxy_import("_strtoul"));
+            assert!(compat.should_proxy_import("_strtoull"));
             assert!(compat.should_proxy_import("__ZNSt3__112__next_primeEm"));
             assert!(compat.should_proxy_import("_ZNSt3__112__next_primeEm"));
             assert!(compat.should_proxy_import("___cxa_guard_acquire"));

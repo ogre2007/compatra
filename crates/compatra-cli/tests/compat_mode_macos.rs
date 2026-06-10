@@ -599,6 +599,11 @@ fn compile_arm64_memory_string_fixture() -> PathBuf {
 #include <string.h>
 #include <strings.h>
 
+void *memmem(const void *, size_t, const void *, size_t);
+char *strcasestr(const char *, const char *);
+size_t strlcpy(char *, const char *, size_t);
+size_t strlcat(char *, const char *, size_t);
+
 typedef void *(*malloc_fn)(size_t);
 typedef void *(*calloc_fn)(size_t, size_t);
 typedef void *(*realloc_fn)(void *, size_t);
@@ -618,6 +623,17 @@ typedef char *(*strcat_fn)(char *, const char *);
 typedef char *(*strchr_fn)(const char *, int);
 typedef char *(*strrchr_fn)(const char *, int);
 typedef char *(*strdup_fn)(const char *);
+typedef void *(*memchr_fn)(const void *, int, size_t);
+typedef void *(*memmem_fn)(const void *, size_t, const void *, size_t);
+typedef int (*strcasecmp_fn)(const char *, const char *);
+typedef int (*strncasecmp_fn)(const char *, const char *, size_t);
+typedef size_t (*strlcpy_fn)(char *, const char *, size_t);
+typedef size_t (*strlcat_fn)(char *, const char *, size_t);
+typedef char *(*strcasestr_fn)(const char *, const char *);
+typedef int (*atoi_fn)(const char *);
+typedef long (*strtol_fn)(const char *, char **, int);
+typedef unsigned long (*strtoul_fn)(const char *, char **, int);
+typedef unsigned long long (*strtoull_fn)(const char *, char **, int);
 
 static int all_zero(const unsigned char *buf, unsigned long len) {
     for (unsigned long i = 0; i < len; i++) {
@@ -761,6 +777,104 @@ static int exercise_memstr(
     return ok ? 0 : 1;
 }
 
+static int exercise_memstr_extra(
+    const char *label,
+    memchr_fn memchr_impl,
+    memmem_fn memmem_impl,
+    strcasecmp_fn strcasecmp_impl,
+    strncasecmp_fn strncasecmp_impl,
+    strlcpy_fn strlcpy_impl,
+    strlcat_fn strlcat_impl,
+    strcasestr_fn strcasestr_impl,
+    atoi_fn atoi_impl,
+    strtol_fn strtol_impl,
+    strtoul_fn strtoul_impl,
+    strtoull_fn strtoull_impl
+) {
+    char mem_buf[] = "alpha-beta-alpha";
+    char needle[] = "beta";
+    char *memchr_hit = (char *)memchr_impl(mem_buf, '-', sizeof(mem_buf));
+    char *memmem_hit = (char *)memmem_impl(mem_buf, sizeof(mem_buf) - 1, needle, 4);
+    char *memmem_empty = (char *)memmem_impl(mem_buf, sizeof(mem_buf) - 1, "", 0);
+    const char *case_text = "LaunchAgent/Chrome";
+    char *case_hit = strcasestr_impl(case_text, "agent");
+    int scase = strcasecmp_impl("Hello", "hello");
+    int sncase = strncasecmp_impl("LaunchAgent", "launchpad", 6);
+
+    char small[8];
+    size_t lcpy = strlcpy_impl(small, "wallet-db", sizeof(small));
+    char cat[12];
+    strcpy(cat, "key");
+    size_t lcat = strlcat_impl(cat, "chain", sizeof(cat));
+    char shortcat[6];
+    strcpy(shortcat, "ab");
+    size_t lcat_trunc = strlcat_impl(shortcat, "cdef", sizeof(shortcat));
+
+    const char *strtol_text = " -0x2a tail";
+    char *end = 0;
+    long parsed = strtol_impl(strtol_text, &end, 0);
+    long end_off = end ? (long)(end - strtol_text) : -1;
+    const char *strtoul_text = "0755x";
+    end = 0;
+    unsigned long uparsed = strtoul_impl(strtoul_text, &end, 0);
+    long uend_off = end ? (long)(end - strtoul_text) : -1;
+    const char *strtoull_text = "18446744073709551615!";
+    end = 0;
+    unsigned long long ull = strtoull_impl(strtoull_text, &end, 10);
+    long ull_end_off = end ? (long)(end - strtoull_text) : -1;
+    int atoi_val = atoi_impl("1234x");
+
+    long memchr_off = memchr_hit ? (long)(memchr_hit - mem_buf) : -1;
+    long memmem_off = memmem_hit ? (long)(memmem_hit - mem_buf) : -1;
+    long memempty_off = memmem_empty ? (long)(memmem_empty - mem_buf) : -1;
+    long case_off = case_hit ? (long)(case_hit - case_text) : -1;
+    int ok = memchr_off == 5
+        && memmem_off == 6
+        && memempty_off == 0
+        && case_off == 6
+        && scase == 0
+        && sncase == 0
+        && lcpy == 9
+        && text_is(small, "wallet-")
+        && lcat == 8
+        && text_is(cat, "keychain")
+        && lcat_trunc == 6
+        && text_is(shortcat, "abcde")
+        && parsed == -42
+        && end_off == 6
+        && uparsed == 493
+        && uend_off == 4
+        && ull == 18446744073709551615ULL
+        && ull_end_off == 20
+        && atoi_val == 1234;
+
+    printf(
+        "compat memstr-extra %s memchr=%ld memmem=%ld memempty=%ld case=%ld scase=%d sncase=%d lcpy=%lu small=%s lcat=%lu cat=%s trunc=%lu short=%s strtol=%ld end=%ld strtoul=%lu uend=%ld strtoull=%llu ullend=%ld atoi=%d ok=%d\n",
+        label,
+        memchr_off,
+        memmem_off,
+        memempty_off,
+        case_off,
+        scase,
+        sncase,
+        (unsigned long)lcpy,
+        small,
+        (unsigned long)lcat,
+        cat,
+        (unsigned long)lcat_trunc,
+        shortcat,
+        parsed,
+        end_off,
+        uparsed,
+        uend_off,
+        ull,
+        ull_end_off,
+        atoi_val,
+        ok
+    );
+    return ok ? 0 : 1;
+}
+
 int main(void) {
     int failures = 0;
     failures += exercise_memstr(
@@ -785,6 +899,20 @@ int main(void) {
         strrchr,
         strdup
     );
+    failures += exercise_memstr_extra(
+        "static",
+        memchr,
+        memmem,
+        strcasecmp,
+        strncasecmp,
+        strlcpy,
+        strlcat,
+        strcasestr,
+        atoi,
+        strtol,
+        strtoul,
+        strtoull
+    );
 
     void *self = dlopen(NULL, RTLD_NOW);
     malloc_fn dyn_malloc = (malloc_fn)dlsym(self, "malloc");
@@ -805,7 +933,18 @@ int main(void) {
     strcat_fn dyn_strcat = (strcat_fn)dlsym(self, "strcat");
     strchr_fn dyn_strchr = (strchr_fn)dlsym(self, "strchr");
     strrchr_fn dyn_strrchr = (strrchr_fn)dlsym(self, "strrchr");
+    strcasestr_fn dyn_strcasestr = (strcasestr_fn)dlsym(self, "strcasestr");
     strdup_fn dyn_strdup = (strdup_fn)dlsym(self, "strdup");
+    memchr_fn dyn_memchr = (memchr_fn)dlsym(self, "memchr");
+    memmem_fn dyn_memmem = (memmem_fn)dlsym(self, "memmem");
+    strcasecmp_fn dyn_strcasecmp = (strcasecmp_fn)dlsym(self, "strcasecmp");
+    strncasecmp_fn dyn_strncasecmp = (strncasecmp_fn)dlsym(self, "strncasecmp");
+    strlcpy_fn dyn_strlcpy = (strlcpy_fn)dlsym(self, "strlcpy");
+    strlcat_fn dyn_strlcat = (strlcat_fn)dlsym(self, "strlcat");
+    atoi_fn dyn_atoi = (atoi_fn)dlsym(self, "atoi");
+    strtol_fn dyn_strtol = (strtol_fn)dlsym(self, "strtol");
+    strtoul_fn dyn_strtoul = (strtoul_fn)dlsym(self, "strtoul");
+    strtoull_fn dyn_strtoull = (strtoull_fn)dlsym(self, "strtoull");
     printf(
         "compat memstr dlsym ptrs malloc=%p free=%p memcpy=%p bzero=%p strcmp=%p strcpy=%p strchr=%p strdup=%p posix_memalign=%p\n",
         (void *)dyn_malloc,
@@ -818,7 +957,21 @@ int main(void) {
         (void *)dyn_strdup,
         (void *)dyn_posix_memalign
     );
-    if (!dyn_malloc || !dyn_calloc || !dyn_realloc || !dyn_free || !dyn_posix_memalign || !dyn_memcpy || !dyn_memmove || !dyn_memset || !dyn_bzero || !dyn_memcmp || !dyn_strlen || !dyn_strcmp || !dyn_strncmp || !dyn_strcpy || !dyn_strncpy || !dyn_strcat || !dyn_strchr || !dyn_strrchr || !dyn_strdup) {
+    printf(
+        "compat memstr-extra dlsym ptrs memchr=%p memmem=%p strcasecmp=%p strncasecmp=%p strlcpy=%p strlcat=%p strcasestr=%p atoi=%p strtol=%p strtoul=%p strtoull=%p\n",
+        (void *)dyn_memchr,
+        (void *)dyn_memmem,
+        (void *)dyn_strcasecmp,
+        (void *)dyn_strncasecmp,
+        (void *)dyn_strlcpy,
+        (void *)dyn_strlcat,
+        (void *)dyn_strcasestr,
+        (void *)dyn_atoi,
+        (void *)dyn_strtol,
+        (void *)dyn_strtoul,
+        (void *)dyn_strtoull
+    );
+    if (!dyn_malloc || !dyn_calloc || !dyn_realloc || !dyn_free || !dyn_posix_memalign || !dyn_memcpy || !dyn_memmove || !dyn_memset || !dyn_bzero || !dyn_memcmp || !dyn_strlen || !dyn_strcmp || !dyn_strncmp || !dyn_strcpy || !dyn_strncpy || !dyn_strcat || !dyn_strchr || !dyn_strrchr || !dyn_strcasestr || !dyn_strdup || !dyn_memchr || !dyn_memmem || !dyn_strcasecmp || !dyn_strncasecmp || !dyn_strlcpy || !dyn_strlcat || !dyn_atoi || !dyn_strtol || !dyn_strtoul || !dyn_strtoull) {
         return 2;
     }
     failures += exercise_memstr(
@@ -842,6 +995,20 @@ int main(void) {
         dyn_strchr,
         dyn_strrchr,
         dyn_strdup
+    );
+    failures += exercise_memstr_extra(
+        "dlsym",
+        dyn_memchr,
+        dyn_memmem,
+        dyn_strcasecmp,
+        dyn_strncasecmp,
+        dyn_strlcpy,
+        dyn_strlcat,
+        dyn_strcasestr,
+        dyn_atoi,
+        dyn_strtol,
+        dyn_strtoul,
+        dyn_strtoull
     );
     dlclose(self);
     return failures == 0 ? 0 : 1;
@@ -6173,6 +6340,16 @@ fn compat_mode_proxies_memory_and_string_imports() {
         "memory/string fixture did not complete static import roundtrip; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("compat memstr-extra static memchr=5 memmem=6 memempty=0 case=6")
+            && stdout.contains("lcpy=9 small=wallet-")
+            && stdout.contains("lcat=8 cat=keychain")
+            && stdout.contains("trunc=6 short=abcde")
+            && stdout.contains("strtol=-42 end=6")
+            && stdout.contains("strtoul=493 uend=4")
+            && stdout.contains("strtoull=18446744073709551615 ullend=20 atoi=1234 ok=1"),
+        "memory/string fixture did not complete extra static libc roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("compat memstr dlsym ptrs malloc=0x")
             && stdout.contains(" memcpy=0x")
             && stdout.contains(" bzero=0x")
@@ -6180,6 +6357,15 @@ fn compat_mode_proxies_memory_and_string_imports() {
             && stdout.contains(" strdup=0x")
             && stdout.contains(" posix_memalign=0x"),
         "memory/string fixture did not receive dlsym memory/string trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat memstr-extra dlsym ptrs memchr=0x")
+            && stdout.contains(" memmem=0x")
+            && stdout.contains(" strcasecmp=0x")
+            && stdout.contains(" strlcpy=0x")
+            && stdout.contains(" strcasestr=0x")
+            && stdout.contains(" strtoull=0x"),
+        "memory/string fixture did not receive dlsym extra libc trampolines; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat memstr dlsym dst=alpha")
@@ -6190,6 +6376,16 @@ fn compat_mode_proxies_memory_and_string_imports() {
             && stdout.contains("aligned_mod=0")
             && stdout.contains("hit=4 last=9 ok=1"),
         "memory/string fixture did not complete dynamic import roundtrip; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat memstr-extra dlsym memchr=5 memmem=6 memempty=0 case=6")
+            && stdout.contains("lcpy=9 small=wallet-")
+            && stdout.contains("lcat=8 cat=keychain")
+            && stdout.contains("trunc=6 short=abcde")
+            && stdout.contains("strtol=-42 end=6")
+            && stdout.contains("strtoul=493 uend=4")
+            && stdout.contains("strtoull=18446744073709551615 ullend=20 atoi=1234 ok=1"),
+        "memory/string fixture did not complete extra dlsym libc roundtrip; stdout:\n{stdout}"
     );
 }
 
