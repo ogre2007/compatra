@@ -895,6 +895,9 @@ pub fn emulate_macos_arm64_binary_with_mode(
     install_pthread_imports(
         &mut emulator,
         &stub_map,
+        stub_region,
+        stub_name_map.clone(),
+        next_dynamic_stub_addr.clone(),
         errno_ptr,
         thread_exit_stub,
         &trace_bus,

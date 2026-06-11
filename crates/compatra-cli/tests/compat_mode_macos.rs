@@ -4490,6 +4490,252 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_dispatch_runloop_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_dispatch_runloop_compat.c");
+    let binary = out_dir.join("arm64_dispatch_runloop_compat");
+    fs::write(
+        &source,
+        r#"#include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+
+typedef dispatch_queue_t (*dispatch_get_main_queue_fn)(void);
+typedef dispatch_queue_t (*dispatch_get_global_queue_fn)(long, unsigned long);
+typedef dispatch_queue_t (*dispatch_queue_create_fn)(const char *, dispatch_queue_attr_t);
+typedef void (*dispatch_async_fn)(dispatch_queue_t, dispatch_block_t);
+typedef void (*dispatch_sync_fn)(dispatch_queue_t, dispatch_block_t);
+typedef void (*dispatch_once_fn)(dispatch_once_t *, dispatch_block_t);
+typedef void (*dispatch_async_f_fn)(dispatch_queue_t, void *, dispatch_function_t);
+typedef void (*dispatch_sync_f_fn)(dispatch_queue_t, void *, dispatch_function_t);
+typedef void (*dispatch_once_f_fn)(dispatch_once_t *, void *, dispatch_function_t);
+typedef CFRunLoopRef (*cf_runloop_get_fn)(void);
+typedef SInt32 (*cf_runloop_run_fn)(CFStringRef, CFTimeInterval, Boolean);
+
+static volatile int once_hits;
+static volatile int sync_hits;
+static volatile int async_hits;
+
+static void bump_context(void *ctx) {
+    int *value = (int *)ctx;
+    *value += 5;
+}
+
+static dispatch_queue_t static_get_main_queue(void) {
+    return dispatch_get_main_queue();
+}
+
+static dispatch_queue_t static_get_global_queue(long identifier, unsigned long flags) {
+    return dispatch_get_global_queue(identifier, flags);
+}
+
+static dispatch_queue_t static_queue_create(const char *label, dispatch_queue_attr_t attr) {
+    return dispatch_queue_create(label, attr);
+}
+
+static void static_dispatch_async(dispatch_queue_t queue, dispatch_block_t block) {
+    dispatch_async(queue, block);
+}
+
+static void static_dispatch_sync(dispatch_queue_t queue, dispatch_block_t block) {
+    dispatch_sync(queue, block);
+}
+
+static void static_dispatch_once(dispatch_once_t *token, dispatch_block_t block) {
+    dispatch_once(token, block);
+}
+
+static void static_dispatch_async_f(dispatch_queue_t queue, void *context, dispatch_function_t work) {
+    dispatch_async_f(queue, context, work);
+}
+
+static void static_dispatch_sync_f(dispatch_queue_t queue, void *context, dispatch_function_t work) {
+    dispatch_sync_f(queue, context, work);
+}
+
+static void static_dispatch_once_f(dispatch_once_t *token, void *context, dispatch_function_t work) {
+    dispatch_once_f(token, context, work);
+}
+
+static int probe_dispatch(
+    const char *label,
+    dispatch_get_main_queue_fn get_main_queue,
+    dispatch_get_global_queue_fn get_global_queue,
+    dispatch_queue_create_fn queue_create,
+    dispatch_async_fn async_call,
+    dispatch_sync_fn sync_call,
+    dispatch_once_fn once_call,
+    dispatch_async_f_fn async_f_call,
+    dispatch_sync_f_fn sync_f_call,
+    dispatch_once_f_fn once_f_call,
+    cf_runloop_get_fn runloop_get,
+    cf_runloop_run_fn runloop_run
+) {
+    int once_before = once_hits;
+    int sync_before = sync_hits;
+    int async_before = async_hits;
+    int context = 0;
+    dispatch_once_t once_token = 0;
+    dispatch_once_t once_f_token = 0;
+
+    dispatch_queue_t main_queue = get_main_queue ? get_main_queue() : 0;
+    dispatch_queue_t global_queue = get_global_queue ? get_global_queue(0, 0) : main_queue;
+    dispatch_queue_t queue = queue_create ? queue_create("compatra.dispatch.fixture", 0) : global_queue;
+    dispatch_queue_t target_queue = queue ? queue : (global_queue ? global_queue : main_queue);
+
+    if (once_call) {
+        once_call(&once_token, ^{
+            once_hits += 1;
+        });
+        once_call(&once_token, ^{
+            once_hits += 100;
+        });
+    }
+    if (sync_call) {
+        sync_call(target_queue, ^{
+            sync_hits += 2;
+        });
+    }
+    if (async_call) {
+        async_call(target_queue, ^{
+            async_hits += 3;
+        });
+    }
+    if (once_f_call) {
+        once_f_call(&once_f_token, &context, bump_context);
+        once_f_call(&once_f_token, &context, bump_context);
+    }
+    if (sync_f_call) {
+        sync_f_call(target_queue, &context, bump_context);
+    }
+    if (async_f_call) {
+        async_f_call(target_queue, &context, bump_context);
+    }
+
+    CFRunLoopRef runloop = runloop_get ? runloop_get() : 0;
+    SInt32 run_result = runloop_run ? runloop_run(kCFRunLoopDefaultMode, 0.0, true) : -1;
+
+    int once_delta = once_hits - once_before;
+    int sync_delta = sync_hits - sync_before;
+    int async_delta = async_hits - async_before;
+    int pass = target_queue && once_delta == 1 && sync_delta == 2 && async_delta == 3 && context == 15 && runloop && run_result == 3;
+    printf(
+        "compat dispatch %s main=%p global=%p queue=%p once=%d sync=%d async=%d context=%d runloop=%p run=%d pass=%d\n",
+        label,
+        main_queue,
+        global_queue,
+        queue,
+        once_delta,
+        sync_delta,
+        async_delta,
+        context,
+        runloop,
+        run_result,
+        pass
+    );
+    return pass ? 0 : 1;
+}
+
+int main(void) {
+    int failures = 0;
+    failures += probe_dispatch(
+        "static",
+        static_get_main_queue,
+        static_get_global_queue,
+        static_queue_create,
+        static_dispatch_async,
+        static_dispatch_sync,
+        static_dispatch_once,
+        static_dispatch_async_f,
+        static_dispatch_sync_f,
+        static_dispatch_once_f,
+        CFRunLoopGetCurrent,
+        CFRunLoopRunInMode
+    );
+
+    void *dispatch = dlopen("/usr/lib/system/libdispatch.dylib", RTLD_NOW);
+    void *core_foundation = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+    dispatch_get_main_queue_fn dyn_get_main_queue = (dispatch_get_main_queue_fn)dlsym(dispatch, "dispatch_get_main_queue");
+    dispatch_get_global_queue_fn dyn_get_global_queue = (dispatch_get_global_queue_fn)dlsym(dispatch, "dispatch_get_global_queue");
+    dispatch_queue_create_fn dyn_queue_create = (dispatch_queue_create_fn)dlsym(dispatch, "dispatch_queue_create");
+    dispatch_async_fn dyn_async = (dispatch_async_fn)dlsym(dispatch, "dispatch_async");
+    dispatch_sync_fn dyn_sync = (dispatch_sync_fn)dlsym(dispatch, "dispatch_sync");
+    dispatch_once_fn dyn_once = (dispatch_once_fn)dlsym(dispatch, "dispatch_once");
+    dispatch_async_f_fn dyn_async_f = (dispatch_async_f_fn)dlsym(dispatch, "dispatch_async_f");
+    dispatch_sync_f_fn dyn_sync_f = (dispatch_sync_f_fn)dlsym(dispatch, "dispatch_sync_f");
+    dispatch_once_f_fn dyn_once_f = (dispatch_once_f_fn)dlsym(dispatch, "dispatch_once_f");
+    cf_runloop_get_fn dyn_runloop_get = (cf_runloop_get_fn)dlsym(core_foundation, "CFRunLoopGetCurrent");
+    cf_runloop_run_fn dyn_runloop_run = (cf_runloop_run_fn)dlsym(core_foundation, "CFRunLoopRunInMode");
+
+    printf(
+        "compat dispatch dlsym ptrs main=%p global=%p create=%p async=%p sync=%p once=%p async_f=%p sync_f=%p once_f=%p runloop=%p run=%p\n",
+        dyn_get_main_queue,
+        dyn_get_global_queue,
+        dyn_queue_create,
+        dyn_async,
+        dyn_sync,
+        dyn_once,
+        dyn_async_f,
+        dyn_sync_f,
+        dyn_once_f,
+        dyn_runloop_get,
+        dyn_runloop_run
+    );
+    if (!dyn_get_global_queue || !dyn_queue_create || !dyn_async || !dyn_sync || !dyn_once || !dyn_async_f || !dyn_sync_f || !dyn_once_f || !dyn_runloop_get || !dyn_runloop_run) {
+        return 20;
+    }
+    failures += probe_dispatch(
+        "dlsym",
+        dyn_get_main_queue,
+        dyn_get_global_queue,
+        dyn_queue_create,
+        dyn_async,
+        dyn_sync,
+        dyn_once,
+        dyn_async_f,
+        dyn_sync_f,
+        dyn_once_f,
+        dyn_runloop_get,
+        dyn_runloop_run
+    );
+    return failures == 0 ? 0 : 30 + failures;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 dispatch/runloop fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fblocks")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-framework")
+        .arg("CoreFoundation")
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 dispatch/runloop fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 dispatch/runloop fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_directory_entropy_fixture() -> (PathBuf, PathBuf) {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -8250,6 +8496,102 @@ fn compat_mode_keeps_usleep_cooperative_when_guest_threads_are_runnable() {
     assert!(
         stdout.contains("compat pthread scheduler ready=1"),
         "pthread scheduler fixture did not reach the signaling worker; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_runs_dispatch_and_runloop_startup_glue() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode dispatch/runloop test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_dispatch_runloop_fixture();
+    let compatra = compatra_binary();
+    let output = Command::new(&compatra)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("COMPATRA_PLUGIN_TRACE", "1")
+        .env("COMPATRA_TRACE_FORMAT", "jsonl")
+        .env("COMPATRA_PROFILE", "short")
+        .env("COMPATRA_DEBUG_STDOUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch compatra binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("compatra stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let guest_stdout = stdout
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('[')
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    eprintln!(
+        "compat proof(dispatch/runloop): command={} --mode compat {}",
+        compatra.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(dispatch/runloop): status={status}");
+    eprintln!("compat proof(dispatch/runloop): guest stdout={guest_stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(dispatch/runloop): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "compatra exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("compat dispatch static ")
+                && line.contains(" once=1 ")
+                && line.contains(" sync=2 ")
+                && line.contains(" async=3 ")
+                && line.contains(" context=15 ")
+                && line.contains(" run=3 ")
+                && line.contains(" pass=1")
+        }),
+        "dispatch fixture did not execute static blocks/functions inline; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("compat dispatch dlsym ptrs main=")
+            && stdout.contains(" global=0x")
+            && stdout.contains(" create=0x")
+            && stdout.contains(" async=0x")
+            && stdout.contains(" sync=0x")
+            && stdout.contains(" once=0x")
+            && stdout.contains(" async_f=0x")
+            && stdout.contains(" sync_f=0x")
+            && stdout.contains(" once_f=0x")
+            && stdout.contains(" runloop=0x")
+            && stdout.contains(" run=0x"),
+        "dispatch fixture did not receive dlsym trampolines; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("compat dispatch dlsym ")
+                && line.contains(" once=1 ")
+                && line.contains(" sync=2 ")
+                && line.contains(" async=3 ")
+                && line.contains(" context=15 ")
+                && line.contains(" run=3 ")
+                && line.contains(" pass=1")
+        }),
+        "dispatch fixture did not execute dlsym blocks/functions inline; stdout:\n{stdout}"
     );
 }
 

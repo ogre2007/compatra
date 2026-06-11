@@ -59,6 +59,8 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "CFURLCopyFileSystemPath"
             | "CFBundleGetMainBundle"
             | "CFBundleCopyBundleURL"
+            | "CFRunLoopGetCurrent"
+            | "CFRunLoopRunInMode"
             | "CFRelease"
             | "CFRetain"
             | "IONotificationPortCreate"
@@ -259,6 +261,8 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_CFURLCopyFileSystemPath",
     "_CFBundleGetMainBundle",
     "_CFBundleCopyBundleURL",
+    "_CFRunLoopGetCurrent",
+    "_CFRunLoopRunInMode",
     "_IONotificationPortCreate",
     "_IONotificationPortDestroy",
     "_IOServiceMatching",
@@ -4645,6 +4649,52 @@ fn dispatch_apple_import(
             );
             Some(url_ref)
         }
+        "CFRunLoopGetCurrent" => {
+            let run_loop_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.opaque_singleton("CFRunLoopCurrent")
+            };
+            record_arm64_import(
+                tracker,
+                format!("_CFRunLoopGetCurrent() -> 0x{:X}", run_loop_ref),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfrunloop", "CFRunLoopGetCurrent")
+                    .arg("Result", format!("0x{:X}", run_loop_ref))
+                    .arg("HostProxy", "false"),
+            );
+            Some(run_loop_ref)
+        }
+        "CFRunLoopRunInMode" => {
+            let mode_ref = emu.read_reg("x0").unwrap_or(0);
+            let seconds_bits = emu.read_reg("d0").unwrap_or(0);
+            let return_after_source_handled = emu.read_reg("x1").unwrap_or(0) != 0;
+            const K_CF_RUN_LOOP_RUN_TIMED_OUT: u64 = 3;
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFRunLoopRunInMode(mode=0x{:X}, seconds_bits=0x{:X}, return_after={}) -> {}",
+                    mode_ref,
+                    seconds_bits,
+                    return_after_source_handled,
+                    K_CF_RUN_LOOP_RUN_TIMED_OUT
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfrunloop", "CFRunLoopRunInMode")
+                    .arg("Mode", format!("0x{:X}", mode_ref))
+                    .arg("SecondsBits", format!("0x{:X}", seconds_bits))
+                    .arg(
+                        "ReturnAfterSourceHandled",
+                        return_after_source_handled.to_string(),
+                    )
+                    .arg("Result", K_CF_RUN_LOOP_RUN_TIMED_OUT.to_string())
+                    .arg("HostProxy", "false"),
+            );
+            Some(K_CF_RUN_LOOP_RUN_TIMED_OUT)
+        }
         "CFDataCreate" => {
             let bytes_ptr = emu.read_reg("x1").unwrap_or(0);
             let len = emu.read_reg("x2").unwrap_or(0) as usize;
@@ -8200,6 +8250,8 @@ mod tests {
             "_CFNumberGetValue",
             "_CFBooleanGetTypeID",
             "_CFBooleanGetValue",
+            "_CFRunLoopGetCurrent",
+            "_CFRunLoopRunInMode",
             "_xpc_date_create_from_current",
         ] {
             assert!(
@@ -8220,6 +8272,8 @@ mod tests {
             "_CFDictionaryGetValue",
             "_CFBooleanGetTypeID",
             "_CFBooleanGetValue",
+            "_CFRunLoopGetCurrent",
+            "_CFRunLoopRunInMode",
         ] {
             assert!(
                 APPLE_DIRECT_DISPATCH_IMPORTS.contains(&symbol),

@@ -9,6 +9,7 @@ macro_rules! println {
 }
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::macos::arm64_runner_support::{
     arm64_metadata, arm64_thread_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
@@ -17,15 +18,495 @@ use crate::macos::arm64_runner_support::{
 use crate::macos::{
     block_active_arm64_thread_on_cond, block_current_arm64_thread_on_cond,
     dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id_with_exit_action,
-    thread_event, yield_active_arm64_thread, Emulator, SharedTraceBus,
+    thread_event, yield_active_arm64_thread, Emulator, SharedTraceBus, StubRegion,
     ARM64_SYNTHETIC_THREAD_STACK_SIZE, MAX_SYNTHETIC_THREADS,
 };
 use crate::UnicornEmulator;
 use compatra_threading::GuestThreadExitAction;
 
+const DISPATCH_MAIN_QUEUE_HANDLE: u64 = 0x6D15_1000_0000;
+const DISPATCH_GLOBAL_QUEUE_BASE: u64 = 0x6D15_2000_0000;
+const DISPATCH_ONCE_DONE_SENTINEL: u64 = u64::MAX;
 const PTHREAD_ONCE_DONE_SENTINEL: u64 = 0x4D41_4348_4F4E_4345;
 const PTHREAD_ONCE_TRAMPOLINE_ADDR: u64 = 0x6D16_0000_0000;
 const PTHREAD_ONCE_TRAMPOLINE_LR_SLOT: u64 = PTHREAD_ONCE_TRAMPOLINE_ADDR + 0x10;
+
+fn normalized_dispatch_symbol(symbol: &str) -> &str {
+    symbol.strip_prefix('_').unwrap_or(symbol)
+}
+
+fn is_dispatch_import_symbol(symbol: &str) -> bool {
+    matches!(
+        normalized_dispatch_symbol(symbol),
+        "dispatch_get_main_queue"
+            | "dispatch_get_global_queue"
+            | "dispatch_queue_create"
+            | "dispatch_async"
+            | "dispatch_async_f"
+            | "dispatch_sync"
+            | "dispatch_sync_f"
+            | "dispatch_once"
+            | "dispatch_once_f"
+            | "dispatch_release"
+            | "dispatch_semaphore_create"
+            | "dispatch_semaphore_signal"
+            | "dispatch_semaphore_wait"
+    )
+}
+
+fn read_guest_u64(emu: &mut dyn Emulator, addr: u64) -> Option<u64> {
+    if addr == 0 {
+        return None;
+    }
+    let bytes = emu.read_memory(addr, 8).ok()?;
+    let array = <[u8; 8]>::try_from(bytes.as_slice()).ok()?;
+    Some(u64::from_le_bytes(array))
+}
+
+fn dispatch_block_invoke(emu: &mut dyn Emulator, block_ptr: u64) -> Option<u64> {
+    let invoke = read_guest_u64(emu, block_ptr.saturating_add(16))?;
+    (invoke != 0).then_some(invoke)
+}
+
+fn current_thread_id(shared_state: &Arm64SharedState) -> u64 {
+    shared_state
+        .thread_runtime
+        .lock()
+        .ok()
+        .map(|rt| rt.current_thread_id.max(1))
+        .unwrap_or(1)
+}
+
+fn return_to_dispatch_caller(emu: &mut UnicornEmulator, result: u64) {
+    let lr = emu.read_reg("lr").unwrap_or(0);
+    let _ = emu.write_reg("x0", result);
+    if lr != 0 {
+        let _ = emu.write_reg("pc", lr);
+    }
+}
+
+fn enter_dispatch_callback(emu: &mut UnicornEmulator, callback: u64, arg0: u64) -> bool {
+    if callback == 0 {
+        return false;
+    }
+    let lr = emu.read_reg("lr").unwrap_or(0);
+    let _ = emu.write_reg("x0", arg0);
+    if lr != 0 {
+        let _ = emu.write_reg("lr", lr);
+    }
+    emu.write_reg("pc", callback).is_ok()
+}
+
+fn alloc_dispatch_queue(shared_state: &Arm64SharedState, label: impl Into<String>) -> u64 {
+    let handle = {
+        let mut next = match shared_state.dispatch_queue_next.lock() {
+            Ok(next) => next,
+            Err(_) => return 0,
+        };
+        let handle = *next;
+        *next = next.saturating_add(0x100);
+        handle
+    };
+    if let Ok(mut queues) = shared_state.dispatch_queues.lock() {
+        queues.insert(handle, label.into());
+    }
+    handle
+}
+
+fn dispatch_once_should_call(
+    emu: &mut UnicornEmulator,
+    shared_state: &Arm64SharedState,
+    token_ptr: u64,
+) -> bool {
+    if token_ptr == 0 {
+        return false;
+    }
+    let memory_done =
+        read_guest_u64(emu, token_ptr).is_some_and(|value| value == DISPATCH_ONCE_DONE_SENTINEL);
+    let set_done = shared_state
+        .dispatch_once_tokens
+        .lock()
+        .ok()
+        .is_some_and(|tokens| tokens.contains(&token_ptr));
+    if memory_done || set_done {
+        return false;
+    }
+    let _ = emu.write_memory(token_ptr, &DISPATCH_ONCE_DONE_SENTINEL.to_le_bytes());
+    if let Ok(mut tokens) = shared_state.dispatch_once_tokens.lock() {
+        tokens.insert(token_ptr);
+    }
+    true
+}
+
+fn handle_dispatch_import(
+    emu: &mut UnicornEmulator,
+    symbol: &str,
+    shared_state: &Arm64SharedState,
+    trace_bus: &Option<SharedTraceBus>,
+    import_tracker: &Arm64ImportTracker,
+) -> bool {
+    let name = normalized_dispatch_symbol(symbol);
+    let thread_id = current_thread_id(shared_state);
+    match name {
+        "dispatch_get_main_queue" => {
+            return_to_dispatch_caller(emu, DISPATCH_MAIN_QUEUE_HANDLE);
+            record_arm64_import(
+                import_tracker,
+                format!("_dispatch_get_main_queue() -> 0x{DISPATCH_MAIN_QUEUE_HANDLE:X}"),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-queue",
+                "dispatch_get_main_queue",
+            )
+            .arg("Queue", format!("0x{DISPATCH_MAIN_QUEUE_HANDLE:X}"));
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_get_global_queue" => {
+            let identifier = emu.read_reg("x0").unwrap_or(0);
+            let flags = emu.read_reg("x1").unwrap_or(0);
+            let queue = DISPATCH_GLOBAL_QUEUE_BASE | (identifier & 0xFFFF);
+            return_to_dispatch_caller(emu, queue);
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_get_global_queue(identifier={}, flags=0x{:X}) -> 0x{:X}",
+                    identifier, flags, queue
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-queue",
+                "dispatch_get_global_queue",
+            )
+            .arg("Identifier", identifier.to_string())
+            .arg("Flags", format!("0x{flags:X}"))
+            .arg("Queue", format!("0x{queue:X}"));
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_queue_create" => {
+            let label_ptr = emu.read_reg("x0").unwrap_or(0);
+            let attr = emu.read_reg("x1").unwrap_or(0);
+            let label = if label_ptr == 0 {
+                "dispatch.queue".to_string()
+            } else {
+                crate::macos::read_cstring(emu, label_ptr, 512)
+                    .unwrap_or_else(|_| "dispatch.queue".to_string())
+            };
+            let queue = alloc_dispatch_queue(shared_state, label.clone());
+            return_to_dispatch_caller(emu, queue);
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_queue_create(label={:?}, attr=0x{:X}) -> 0x{:X}",
+                    label, attr, queue
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-queue",
+                "dispatch_queue_create",
+            )
+            .arg("Label", label)
+            .arg("Attr", format!("0x{attr:X}"))
+            .arg("Queue", format!("0x{queue:X}"));
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_async" | "dispatch_sync" => {
+            let queue = emu.read_reg("x0").unwrap_or(0);
+            let block = emu.read_reg("x1").unwrap_or(0);
+            let invoke = dispatch_block_invoke(emu, block).unwrap_or(0);
+            let entered = enter_dispatch_callback(emu, invoke, block);
+            if !entered {
+                return_to_dispatch_caller(emu, 0);
+            }
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_{}(queue=0x{:X}, block=0x{:X}, invoke=0x{:X}) -> inline={}",
+                    name, queue, block, invoke, entered
+                ),
+            );
+            let event = thread_event(&arm64_metadata(None, thread_id), "dispatch-block", name)
+                .arg("Queue", format!("0x{queue:X}"))
+                .arg("Block", format!("0x{block:X}"))
+                .arg("Invoke", format!("0x{invoke:X}"))
+                .arg("Inline", entered.to_string());
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_async_f" | "dispatch_sync_f" => {
+            let queue = emu.read_reg("x0").unwrap_or(0);
+            let context = emu.read_reg("x1").unwrap_or(0);
+            let work = emu.read_reg("x2").unwrap_or(0);
+            let entered = enter_dispatch_callback(emu, work, context);
+            if !entered {
+                return_to_dispatch_caller(emu, 0);
+            }
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_{}(queue=0x{:X}, context=0x{:X}, work=0x{:X}) -> inline={}",
+                    name, queue, context, work, entered
+                ),
+            );
+            let event = thread_event(&arm64_metadata(None, thread_id), "dispatch-function", name)
+                .arg("Queue", format!("0x{queue:X}"))
+                .arg("Context", format!("0x{context:X}"))
+                .arg("Work", format!("0x{work:X}"))
+                .arg("Inline", entered.to_string());
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_once" => {
+            let token_ptr = emu.read_reg("x0").unwrap_or(0);
+            let block = emu.read_reg("x1").unwrap_or(0);
+            let invoke = dispatch_block_invoke(emu, block).unwrap_or(0);
+            let should_call = dispatch_once_should_call(emu, shared_state, token_ptr);
+            let entered = should_call && enter_dispatch_callback(emu, invoke, block);
+            if !entered {
+                return_to_dispatch_caller(emu, 0);
+            }
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_once(token=0x{:X}, block=0x{:X}, invoke=0x{:X}) -> call={}",
+                    token_ptr, block, invoke, entered
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-once",
+                "dispatch_once",
+            )
+            .arg("Token", format!("0x{token_ptr:X}"))
+            .arg("Block", format!("0x{block:X}"))
+            .arg("Invoke", format!("0x{invoke:X}"))
+            .arg("Called", entered.to_string());
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_once_f" => {
+            let token_ptr = emu.read_reg("x0").unwrap_or(0);
+            let context = emu.read_reg("x1").unwrap_or(0);
+            let function = emu.read_reg("x2").unwrap_or(0);
+            let should_call = dispatch_once_should_call(emu, shared_state, token_ptr);
+            let entered = should_call && enter_dispatch_callback(emu, function, context);
+            if !entered {
+                return_to_dispatch_caller(emu, 0);
+            }
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_once_f(token=0x{:X}, context=0x{:X}, function=0x{:X}) -> call={}",
+                    token_ptr, context, function, entered
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-once",
+                "dispatch_once_f",
+            )
+            .arg("Token", format!("0x{token_ptr:X}"))
+            .arg("Context", format!("0x{context:X}"))
+            .arg("Function", format!("0x{function:X}"))
+            .arg("Called", entered.to_string());
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_semaphore_create" => {
+            let initial = emu.read_reg("x0").unwrap_or(0) as i64;
+            let handle = {
+                let mut next = match shared_state.dispatch_semaphore_next.lock() {
+                    Ok(next) => next,
+                    Err(_) => return false,
+                };
+                let handle = *next;
+                *next = next.saturating_add(0x100);
+                handle
+            };
+            if let Ok(mut semaphores) = shared_state.dispatch_semaphores.lock() {
+                semaphores.insert(handle, initial);
+            }
+            return_to_dispatch_caller(emu, handle);
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_semaphore_create(value={}) -> 0x{:X}",
+                    initial, handle
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-semaphore-create",
+                "dispatch_semaphore_create",
+            )
+            .arg("Initial", initial.to_string())
+            .arg("Handle", format!("0x{handle:X}"));
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_semaphore_signal" => {
+            let handle = emu.read_reg("x0").unwrap_or(0);
+            let value = {
+                let mut semaphores = match shared_state.dispatch_semaphores.lock() {
+                    Ok(semaphores) => semaphores,
+                    Err(_) => return false,
+                };
+                let slot = semaphores.entry(handle).or_insert(0);
+                *slot = slot.saturating_add(1);
+                *slot
+            };
+            return_to_dispatch_caller(emu, 0);
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_semaphore_signal(handle=0x{:X}) -> {}",
+                    handle, value
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-semaphore-signal",
+                "dispatch_semaphore_signal",
+            )
+            .arg("Handle", format!("0x{handle:X}"))
+            .arg("Value", value.to_string());
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_semaphore_wait" => {
+            let handle = emu.read_reg("x0").unwrap_or(0);
+            let timeout = emu.read_reg("x1").unwrap_or(0);
+            let value = {
+                let mut semaphores = match shared_state.dispatch_semaphores.lock() {
+                    Ok(semaphores) => semaphores,
+                    Err(_) => return false,
+                };
+                let slot = semaphores.entry(handle).or_insert(0);
+                if *slot > 0 {
+                    *slot -= 1;
+                }
+                *slot
+            };
+            return_to_dispatch_caller(emu, 0);
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_semaphore_wait(handle=0x{:X}, timeout=0x{:X}) -> 0 value={}",
+                    handle, timeout, value
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-semaphore-wait",
+                "dispatch_semaphore_wait",
+            )
+            .arg("Handle", format!("0x{handle:X}"))
+            .arg("Timeout", format!("0x{timeout:X}"))
+            .arg("Value", value.to_string());
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        "dispatch_release" => {
+            let handle = emu.read_reg("x0").unwrap_or(0);
+            let queue_existed = shared_state
+                .dispatch_queues
+                .lock()
+                .ok()
+                .and_then(|mut queues| queues.remove(&handle))
+                .is_some();
+            let semaphore_existed = shared_state
+                .dispatch_semaphores
+                .lock()
+                .ok()
+                .and_then(|mut semaphores| semaphores.remove(&handle))
+                .is_some();
+            return_to_dispatch_caller(emu, 0);
+            record_arm64_import(
+                import_tracker,
+                format!(
+                    "_dispatch_release(handle=0x{:X}) -> queue={} semaphore={}",
+                    handle, queue_existed, semaphore_existed
+                ),
+            );
+            let event = thread_event(
+                &arm64_metadata(None, thread_id),
+                "dispatch-release",
+                "dispatch_release",
+            )
+            .arg("Handle", format!("0x{handle:X}"))
+            .arg("Queue", queue_existed.to_string())
+            .arg("Semaphore", semaphore_existed.to_string());
+            emit_arm64_event(trace_bus, event);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn install_dispatch_hook(
+    emulator: &mut UnicornEmulator,
+    addr: u64,
+    symbol: String,
+    shared_state: Arm64SharedState,
+    trace_bus: Option<SharedTraceBus>,
+    import_tracker: Arm64ImportTracker,
+) -> Result<(), Box<dyn std::error::Error>> {
+    emulator.add_code_hook(
+        addr,
+        addr + 4,
+        move |emu: &mut compatra_runtime::UnicornEmulator, _address: u64, _size: u32| {
+            let _ =
+                handle_dispatch_import(emu, &symbol, &shared_state, &trace_bus, &import_tracker);
+        },
+    )?;
+    Ok(())
+}
+
+fn install_dispatch_dynamic_hook(
+    emulator: &mut UnicornEmulator,
+    stub_region: StubRegion,
+    stub_name_map: Arc<Mutex<HashMap<u64, String>>>,
+    next_dynamic_stub_addr: Arc<Mutex<u64>>,
+    shared_state: Arm64SharedState,
+    trace_bus: Option<SharedTraceBus>,
+    import_tracker: Arm64ImportTracker,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dynamic_start = next_dynamic_stub_addr
+        .lock()
+        .ok()
+        .map(|next| *next)
+        .unwrap_or_else(|| stub_region.base.saturating_add(stub_region.size));
+    let dynamic_end = stub_region.base.saturating_add(stub_region.size);
+    if dynamic_start >= dynamic_end {
+        return Ok(());
+    }
+
+    emulator.add_code_hook(
+        dynamic_start,
+        dynamic_end,
+        move |emu: &mut compatra_runtime::UnicornEmulator, address: u64, _size: u32| {
+            let bucket = stub_region.bucket(address);
+            let symbol = stub_name_map
+                .lock()
+                .ok()
+                .and_then(|symbols| symbols.get(&bucket).cloned());
+            let Some(symbol) = symbol else {
+                return;
+            };
+            if !is_dispatch_import_symbol(&symbol) {
+                return;
+            }
+            let _ =
+                handle_dispatch_import(emu, &symbol, &shared_state, &trace_bus, &import_tracker);
+        },
+    )?;
+    Ok(())
+}
 
 fn install_pthread_once_trampoline(
     emulator: &mut UnicornEmulator,
@@ -44,6 +525,9 @@ fn install_pthread_once_trampoline(
 pub fn install_arm64_pthread_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
+    stub_region: StubRegion,
+    stub_name_map: Arc<Mutex<HashMap<u64, String>>>,
+    next_dynamic_stub_addr: Arc<Mutex<u64>>,
     errno_ptr: u64,
     thread_exit_stub: u64,
     trace_bus: &Option<SharedTraceBus>,
@@ -55,6 +539,39 @@ pub fn install_arm64_pthread_imports(
     } else {
         None
     };
+
+    install_dispatch_dynamic_hook(
+        emulator,
+        stub_region,
+        stub_name_map,
+        next_dynamic_stub_addr,
+        shared_state.clone(),
+        trace_bus.clone(),
+        import_tracker.clone(),
+    )?;
+
+    for symbol in [
+        "_dispatch_get_main_queue",
+        "_dispatch_get_global_queue",
+        "_dispatch_queue_create",
+        "_dispatch_async",
+        "_dispatch_async_f",
+        "_dispatch_sync",
+        "_dispatch_sync_f",
+        "_dispatch_once",
+        "_dispatch_once_f",
+    ] {
+        if let Some(&addr) = stub_map.get(symbol) {
+            install_dispatch_hook(
+                emulator,
+                addr,
+                symbol.to_string(),
+                shared_state.clone(),
+                trace_bus.clone(),
+                import_tracker.clone(),
+            )?;
+        }
+    }
 
     if let Some(&addr) = stub_map.get("_pthread_get_stackaddr_np") {
         let thread_runtime = shared_state.thread_runtime.clone();

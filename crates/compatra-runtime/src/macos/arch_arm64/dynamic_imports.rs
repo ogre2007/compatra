@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::macos::apple_imports::is_apple_import_symbol;
 use crate::macos::arm64_import_stubs::{
     allocate_arm64_dynamic_import_stub, arm64_import_can_resolve_to_guest_library,
-    Arm64ImportTracker,
+    arm64_import_has_runtime_hook, Arm64ImportTracker,
 };
 use crate::macos::arm64_runner_support::{
     arm64_process_event, emit_arm64_event, record_arm64_import, Arm64SharedState,
@@ -21,6 +21,17 @@ use crate::macos::{
 };
 use crate::UnicornEmulator;
 use compatra_arch_arm64::abi::DYNAMIC_IMPORT_HANDLE_BASE;
+
+fn dynamic_symbol_has_arm64_runtime_hook(symbol: &str, runtime_mode: RuntimeMode) -> bool {
+    if arm64_import_has_runtime_hook(symbol, runtime_mode) {
+        return true;
+    }
+    if symbol.starts_with('_') {
+        return false;
+    }
+    let underscored = format!("_{symbol}");
+    arm64_import_has_runtime_hook(&underscored, runtime_mode)
+}
 
 pub fn install_arm64_dynamic_imports(
     emulator: &mut UnicornEmulator,
@@ -133,7 +144,9 @@ pub fn install_arm64_dynamic_imports(
                 let (result, source) = if let Some(guest_symbol) = &guest_symbol {
                     (guest_symbol.address, "guest-library")
                 } else if handle_known
-                    && (compat.should_proxy_import(&symbol) || is_apple_import_symbol(&symbol))
+                    && (compat.should_proxy_import(&symbol)
+                        || is_apple_import_symbol(&symbol)
+                        || dynamic_symbol_has_arm64_runtime_hook(&symbol, RuntimeMode::Compat))
                 {
                     if let Some(existing) = dynamic_symbols
                         .lock()

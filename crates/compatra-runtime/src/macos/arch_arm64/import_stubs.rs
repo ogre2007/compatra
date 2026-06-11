@@ -135,10 +135,19 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_cmalloc"
             | "_close"
             | "_closedir"
+            | "_dispatch_async"
+            | "_dispatch_async_f"
+            | "_dispatch_get_global_queue"
+            | "_dispatch_get_main_queue"
+            | "_dispatch_once"
+            | "_dispatch_once_f"
+            | "_dispatch_queue_create"
             | "_dispatch_release"
             | "_dispatch_semaphore_create"
             | "_dispatch_semaphore_signal"
             | "_dispatch_semaphore_wait"
+            | "_dispatch_sync"
+            | "_dispatch_sync_f"
             | "_dlclose"
             | "_dlerror"
             | "_dlopen"
@@ -326,6 +335,22 @@ mod tests {
             "_pthread_threadid_np",
             RuntimeMode::Compat
         ));
+        for symbol in [
+            "_dispatch_get_main_queue",
+            "_dispatch_get_global_queue",
+            "_dispatch_queue_create",
+            "_dispatch_async",
+            "_dispatch_async_f",
+            "_dispatch_sync",
+            "_dispatch_sync_f",
+            "_dispatch_once",
+            "_dispatch_once_f",
+        ] {
+            assert!(
+                arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
+                "{symbol} should be handled by libdispatch startup glue"
+            );
+        }
         assert!(arm64_import_has_runtime_hook("__Znwm", RuntimeMode::Compat));
         assert!(!arm64_import_has_runtime_hook(
             "_future_unhandled_import",
@@ -424,6 +449,8 @@ mod tests {
             "_CFNumberGetValue",
             "_CFBooleanGetTypeID",
             "_CFBooleanGetValue",
+            "_CFRunLoopGetCurrent",
+            "_CFRunLoopRunInMode",
             "_xpc_date_create_from_current",
         ] {
             assert!(

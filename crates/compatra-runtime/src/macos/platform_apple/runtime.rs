@@ -404,6 +404,19 @@ impl AppleRuntime {
         })
     }
 
+    pub fn opaque_singleton(&mut self, kind: impl Into<String>) -> u64 {
+        let kind = kind.into();
+        if let Some(handle) = self.singletons.get(&kind) {
+            return *handle;
+        }
+        let handle = self.alloc(AppleObject::Opaque {
+            kind: kind.clone(),
+            host_ptr: None,
+        });
+        self.singletons.insert(kind, handle);
+        handle
+    }
+
     pub fn register_host_opaque(&mut self, kind: impl Into<String>, host_ptr: u64) -> u64 {
         if host_ptr == 0 {
             return self.alloc_opaque(kind);
@@ -817,6 +830,21 @@ mod tests {
         );
         assert_eq!(runtime.host_ptr(process_info), None);
         assert_eq!(runtime.host_ptr_or_raw_unknown(process_info), None);
+    }
+
+    #[test]
+    fn synthetic_opaque_singletons_are_stable() {
+        let mut runtime = AppleRuntime::default();
+
+        let run_loop = runtime.opaque_singleton("CFRunLoopCurrent");
+        let run_loop_again = runtime.opaque_singleton("CFRunLoopCurrent");
+        let other = runtime.opaque_singleton("OtherOpaque");
+
+        assert_ne!(run_loop, 0);
+        assert_eq!(run_loop, run_loop_again);
+        assert_ne!(run_loop, other);
+        assert_eq!(runtime.host_ptr(run_loop), None);
+        assert_eq!(runtime.host_ptr_or_raw_unknown(run_loop), None);
     }
 
     #[test]
