@@ -411,6 +411,8 @@ mod tests {
             "_CFArrayGetValueAtIndex",
             "_CFArrayGetTypeID",
             "_CFDictionaryCreate",
+            "_CFDictionaryGetCount",
+            "_CFDictionaryGetValue",
             "_CFDictionaryGetValueIfPresent",
             "_CFDictionaryGetTypeID",
             "_CFDateCreate",
@@ -485,6 +487,20 @@ mod tests {
             assert!(
                 arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
                 "{symbol} should be dispatched by the arm64 UI compat runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_hook_classifier_covers_system_configuration_compat_imports() {
+        for symbol in [
+            "_SCNetworkReachabilityCreateWithName",
+            "_SCNetworkReachabilityGetFlags",
+            "_SCDynamicStoreCopyProxies",
+        ] {
+            assert!(
+                arm64_import_has_runtime_hook(symbol, RuntimeMode::Compat),
+                "{symbol} should be dispatched by the arm64 network-environment compat runtime"
             );
         }
     }

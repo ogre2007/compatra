@@ -42,6 +42,8 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "CFArrayGetValueAtIndex"
             | "CFArrayGetTypeID"
             | "CFDictionaryCreate"
+            | "CFDictionaryGetCount"
+            | "CFDictionaryGetValue"
             | "CFDictionaryGetValueIfPresent"
             | "CFDictionaryGetTypeID"
             | "CFDateCreate"
@@ -149,6 +151,9 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "SecTrustGetCertificateCount"
             | "SecTrustGetCertificateAtIndex"
             | "SecTrustSetVerifyDate"
+            | "SCNetworkReachabilityCreateWithName"
+            | "SCNetworkReachabilityGetFlags"
+            | "SCDynamicStoreCopyProxies"
             | "xpc_date_create_from_current"
     )
 }
@@ -246,6 +251,8 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_CFDataGetTypeID",
     "_CFArrayGetTypeID",
     "_CFDictionaryGetTypeID",
+    "_CFDictionaryGetCount",
+    "_CFDictionaryGetValue",
     "_CFBooleanGetTypeID",
     "_CFBooleanGetValue",
     "_CFURLCreateWithFileSystemPath",
@@ -334,6 +341,9 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_SecKeychainGetPath",
     "_SecKeychainFindGenericPassword",
     "_SecKeychainItemFreeContent",
+    "_SCNetworkReachabilityCreateWithName",
+    "_SCNetworkReachabilityGetFlags",
+    "_SCDynamicStoreCopyProxies",
 ];
 
 #[cfg(target_os = "macos")]
@@ -1339,6 +1349,122 @@ fn host_cf_get_type_id(cf: u64) -> Option<u64> {
         fn CFGetTypeID(cf: *const std::ffi::c_void) -> u64;
     }
     Some(unsafe { CFGetTypeID(cf as *const std::ffi::c_void) })
+}
+
+#[cfg(target_os = "macos")]
+fn host_sc_network_reachability_create_with_name(name: &[u8]) -> Option<u64> {
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    unsafe extern "C" {
+        fn SCNetworkReachabilityCreateWithName(
+            allocator: *const std::ffi::c_void,
+            nodename: *const std::ffi::c_char,
+        ) -> *const std::ffi::c_void;
+    }
+    let name = std::ffi::CString::new(name).ok()?;
+    let reachability =
+        unsafe { SCNetworkReachabilityCreateWithName(std::ptr::null(), name.as_ptr()) };
+    (!reachability.is_null()).then_some(reachability as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sc_network_reachability_create_with_name(_name: &[u8]) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_sc_network_reachability_get_flags(reachability: u64) -> Option<u32> {
+    if reachability == 0 {
+        return None;
+    }
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    unsafe extern "C" {
+        fn SCNetworkReachabilityGetFlags(target: *const std::ffi::c_void, flags: *mut u32) -> u8;
+    }
+    let mut flags = 0u32;
+    let ok = unsafe {
+        SCNetworkReachabilityGetFlags(reachability as *const std::ffi::c_void, &mut flags)
+    } != 0;
+    ok.then_some(flags)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sc_network_reachability_get_flags(_reachability: u64) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_sc_dynamic_store_copy_proxies(store: u64) -> Option<u64> {
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    unsafe extern "C" {
+        fn SCDynamicStoreCopyProxies(store: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    }
+    let proxies = unsafe { SCDynamicStoreCopyProxies(store as *const std::ffi::c_void) };
+    (!proxies.is_null()).then_some(proxies as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sc_dynamic_store_copy_proxies(_store: u64) -> Option<u64> {
+    None
+}
+
+fn sc_proxy_dictionary_entries(
+    runtime: &mut crate::macos::AppleRuntime,
+    host_dict: Option<u64>,
+) -> Vec<(u64, u64)> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = host_dict;
+
+    const PROXY_KEYS: &[&str] = &[
+        "HTTPEnable",
+        "HTTPProxy",
+        "HTTPPort",
+        "HTTPSEnable",
+        "HTTPSProxy",
+        "HTTPSPort",
+        "FTPEnable",
+        "FTPProxy",
+        "FTPPort",
+        "SOCKSEnable",
+        "SOCKSProxy",
+        "SOCKSPort",
+        "ProxyAutoConfigEnable",
+        "ProxyAutoConfigURLString",
+        "ExcludeSimpleHostnames",
+        "ExceptionsList",
+    ];
+    const DEFAULT_ZERO_KEYS: &[&str] = &[
+        "HTTPEnable",
+        "HTTPSEnable",
+        "FTPEnable",
+        "SOCKSEnable",
+        "ProxyAutoConfigEnable",
+        "ExcludeSimpleHostnames",
+    ];
+
+    let mut entries = Vec::new();
+    for key in PROXY_KEYS {
+        let key_ref =
+            runtime.alloc_string(key.as_bytes().to_vec(), K_CFSTRING_ENCODING_UTF8 as u64);
+        let mut value_ref = 0;
+
+        #[cfg(target_os = "macos")]
+        if let Some(host_dict) = host_dict {
+            if let Some(host_key) = host_cfstring_create_from_bytes(key.as_bytes()) {
+                value_ref = host_cfdictionary_get_value(host_dict, host_key)
+                    .map(|value| register_borrowed_host_cf_value(runtime, value, "SCProxyValue"))
+                    .unwrap_or(0);
+                host_cf_release(host_key);
+            }
+        }
+
+        if value_ref == 0 && DEFAULT_ZERO_KEYS.contains(key) {
+            value_ref = runtime.alloc_number(0);
+        }
+        if value_ref != 0 {
+            entries.push((key_ref, value_ref));
+        }
+    }
+    entries
 }
 
 #[cfg(target_os = "macos")]
@@ -4670,6 +4796,67 @@ fn dispatch_apple_import(
             );
             Some(dict_ref)
         }
+        "CFDictionaryGetCount" => {
+            let dict_ref = emu.read_reg("x0").unwrap_or(0);
+            let (count, host_proxy) = {
+                let runtime = apple_runtime.lock().ok()?;
+                let synthetic = runtime.dictionary_len(dict_ref);
+                if let Some(count) = synthetic {
+                    (count as u64, false)
+                } else {
+                    let host_dict = runtime.host_ptr_or_raw_unknown(dict_ref).unwrap_or(0);
+                    (
+                        host_cfdictionary_get_count(host_dict).unwrap_or(0) as u64,
+                        host_dict != 0,
+                    )
+                }
+            };
+            record_arm64_import(
+                tracker,
+                format!("_CFDictionaryGetCount(dict=0x{:X}) -> {}", dict_ref, count),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfdictionary", "CFDictionaryGetCount")
+                    .arg("Dictionary", format!("0x{:X}", dict_ref))
+                    .arg("Result", count.to_string())
+                    .arg("HostProxy", host_proxy.to_string()),
+            );
+            Some(count)
+        }
+        "CFDictionaryGetValue" => {
+            let dict_ref = emu.read_reg("x0").unwrap_or(0);
+            let key_ref = emu.read_reg("x1").unwrap_or(0);
+            let (value_ref, host_proxy, key_preview) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let host_dict = runtime.host_ptr_or_raw_unknown(dict_ref).unwrap_or(0);
+                let key_preview = runtime_object_data_or_host_foundation(&runtime, key_ref)
+                    .map(|data| lossy_data_preview(&data, 128))
+                    .unwrap_or_default();
+                (
+                    dictionary_get_matching_key(&mut runtime, dict_ref, key_ref).unwrap_or(0),
+                    host_dict != 0,
+                    key_preview,
+                )
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFDictionaryGetValue(dict=0x{:X}, key=0x{:X}) -> 0x{:X}",
+                    dict_ref, key_ref, value_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfdictionary", "CFDictionaryGetValue")
+                    .arg("Dictionary", format!("0x{:X}", dict_ref))
+                    .arg("Key", format!("0x{:X}", key_ref))
+                    .arg("Result", format!("0x{:X}", value_ref))
+                    .arg("Preview", key_preview)
+                    .arg("HostProxy", host_proxy.to_string()),
+            );
+            Some(value_ref)
+        }
         "CFDictionaryGetValueIfPresent" => {
             let dict_ref = emu.read_reg("x0").unwrap_or(0);
             let key_ref = emu.read_reg("x1").unwrap_or(0);
@@ -4699,6 +4886,104 @@ fn dispatch_apple_import(
                 format!("_CFDictionaryGetTypeID() -> 0x{:X}", type_id),
             );
             Some(type_id)
+        }
+        "SCNetworkReachabilityCreateWithName" => {
+            let name_ptr = emu.read_reg("x1").unwrap_or(0);
+            let name = read_cstring(emu, name_ptr, 4096)
+                .unwrap_or_else(|_| "localhost".to_string())
+                .into_bytes();
+            let host_ptr = host_sc_network_reachability_create_with_name(&name);
+            let reachability_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                match host_ptr {
+                    Some(host_ptr) => {
+                        runtime.register_host_opaque("SCNetworkReachability", host_ptr)
+                    }
+                    None => runtime.alloc_opaque("SCNetworkReachability"),
+                }
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SCNetworkReachabilityCreateWithName(name=0x{:X}) -> 0x{:X}",
+                    name_ptr, reachability_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(
+                    metadata,
+                    "network-env",
+                    "SCNetworkReachabilityCreateWithName",
+                )
+                .arg("Name", lossy_data_preview(&name, 128))
+                .arg("Result", format!("0x{:X}", reachability_ref))
+                .arg("HostProxy", host_ptr.is_some().to_string()),
+            );
+            Some(reachability_ref)
+        }
+        "SCNetworkReachabilityGetFlags" => {
+            let reachability_ref = emu.read_reg("x0").unwrap_or(0);
+            let flags_ptr = emu.read_reg("x1").unwrap_or(0);
+            let host_ptr = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime
+                    .host_ptr_or_raw_unknown(reachability_ref)
+                    .unwrap_or(0)
+            };
+            let flags_result = host_sc_network_reachability_get_flags(host_ptr);
+            let flags = flags_result.unwrap_or(0);
+            let ok =
+                flags_result.is_some() && flags_ptr != 0 && write_guest_u32(emu, flags_ptr, flags);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SCNetworkReachabilityGetFlags(target=0x{:X}, flags=0x{:X}) -> {} flags=0x{:X}",
+                    reachability_ref, flags_ptr, ok as u64, flags
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "network-env", "SCNetworkReachabilityGetFlags")
+                    .arg("Target", format!("0x{:X}", reachability_ref))
+                    .arg("Flags", format!("0x{:X}", flags))
+                    .arg("Result", ok.to_string())
+                    .arg("HostProxy", (host_ptr != 0).to_string()),
+            );
+            Some(ok as u64)
+        }
+        "SCDynamicStoreCopyProxies" => {
+            let store_ref = emu.read_reg("x0").unwrap_or(0);
+            let host_store = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(store_ref).unwrap_or(0)
+            };
+            let host_dict = host_sc_dynamic_store_copy_proxies(host_store);
+            let (dict_ref, count) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let entries = sc_proxy_dictionary_entries(&mut runtime, host_dict);
+                let count = entries.len();
+                (
+                    runtime.alloc_dictionary_with_host(entries, host_dict),
+                    count as u64,
+                )
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SCDynamicStoreCopyProxies(store=0x{:X}) -> 0x{:X} count={}",
+                    store_ref, dict_ref, count
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "network-env", "SCDynamicStoreCopyProxies")
+                    .arg("Store", format!("0x{:X}", store_ref))
+                    .arg("Result", format!("0x{:X}", dict_ref))
+                    .arg("Count", count.to_string())
+                    .arg("HostProxy", host_dict.is_some().to_string()),
+            );
+            Some(dict_ref)
         }
         "CFDateCreate" => {
             let absolute_time = f64::from_bits(emu.read_reg("x1").unwrap_or(0));
@@ -7902,6 +8187,8 @@ mod tests {
             "_CFArrayGetValueAtIndex",
             "_CFArrayGetTypeID",
             "_CFDictionaryCreate",
+            "_CFDictionaryGetCount",
+            "_CFDictionaryGetValue",
             "_CFDictionaryGetValueIfPresent",
             "_CFDictionaryGetTypeID",
             "_CFDateCreate",
@@ -7929,6 +8216,8 @@ mod tests {
             "_CFDataGetTypeID",
             "_CFArrayGetTypeID",
             "_CFDictionaryGetTypeID",
+            "_CFDictionaryGetCount",
+            "_CFDictionaryGetValue",
             "_CFBooleanGetTypeID",
             "_CFBooleanGetValue",
         ] {
@@ -8010,6 +8299,24 @@ mod tests {
             "_SecKeychainGetPath",
             "_SecKeychainFindGenericPassword",
             "_SecKeychainItemFreeContent",
+        ] {
+            assert!(
+                is_apple_import_symbol(symbol),
+                "{symbol} should be Apple-dispatched"
+            );
+            assert!(
+                APPLE_DIRECT_DISPATCH_IMPORTS.contains(&symbol),
+                "{symbol} must be installed by install_apple_imports for static imports"
+            );
+        }
+    }
+
+    #[test]
+    fn system_configuration_imports_use_direct_dispatch_hooks() {
+        for symbol in [
+            "_SCNetworkReachabilityCreateWithName",
+            "_SCNetworkReachabilityGetFlags",
+            "_SCDynamicStoreCopyProxies",
         ] {
             assert!(
                 is_apple_import_symbol(symbol),

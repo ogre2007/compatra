@@ -1768,6 +1768,7 @@ fn compile_arm64_network_fixture() -> PathBuf {
     fs::write(
         &source,
         r#"#include <arpa/inet.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <ifaddrs.h>
@@ -1780,6 +1781,7 @@ fn compile_arm64_network_fixture() -> PathBuf {
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 #include <unistd.h>
 
 typedef int (*getaddrinfo_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
@@ -1799,6 +1801,14 @@ typedef ssize_t (*send_fn)(int, const void *, size_t, int);
 typedef ssize_t (*recv_fn)(int, void *, size_t, int);
 typedef ssize_t (*sendmsg_fn)(int, const struct msghdr *, int);
 typedef ssize_t (*recvmsg_fn)(int, struct msghdr *, int);
+typedef SCNetworkReachabilityRef (*sc_reach_create_fn)(CFAllocatorRef, const char *);
+typedef Boolean (*sc_reach_flags_fn)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *);
+typedef CFDictionaryRef (*sc_copy_proxies_fn)(SCDynamicStoreRef);
+typedef CFIndex (*cf_dict_count_fn)(CFDictionaryRef);
+typedef const void *(*cf_dict_value_fn)(CFDictionaryRef, const void *);
+typedef CFStringRef (*cf_string_create_fn)(CFAllocatorRef, const char *, CFStringEncoding);
+typedef Boolean (*cf_number_get_fn)(CFNumberRef, CFNumberType, void *);
+typedef void (*cf_release_fn)(CFTypeRef);
 
 #undef htonl
 #undef htons
@@ -1981,6 +1991,53 @@ static int probe_ifaddrs(
     return 0;
 }
 
+static int probe_system_configuration(
+    const char *label,
+    sc_reach_create_fn reach_create,
+    sc_reach_flags_fn reach_flags,
+    sc_copy_proxies_fn copy_proxies,
+    cf_dict_count_fn dict_count,
+    cf_dict_value_fn dict_value,
+    cf_string_create_fn string_create,
+    cf_number_get_fn number_get,
+    cf_release_fn release_value
+) {
+    SCNetworkReachabilityRef reach = reach_create(0, "example.com");
+    SCNetworkReachabilityFlags flags = 0;
+    Boolean flags_ok = reach ? reach_flags(reach, &flags) : 0;
+    CFDictionaryRef proxies = copy_proxies(0);
+    CFIndex proxy_count = proxies ? dict_count(proxies) : -1;
+    CFStringRef http_key = string_create(0, "HTTPEnable", kCFStringEncodingUTF8);
+    const void *http_value_ref = proxies && http_key ? dict_value(proxies, http_key) : 0;
+    long long http_value = -1;
+    Boolean number_ok = http_value_ref ? number_get((CFNumberRef)http_value_ref, kCFNumberLongLongType, &http_value) : 0;
+    printf(
+        "compat sc %s reach=%p flags_ok=%u flags=0x%x proxies=%p count=%ld http=%p number_ok=%u http_value=%lld\n",
+        label,
+        reach,
+        (unsigned)flags_ok,
+        (unsigned)flags,
+        proxies,
+        (long)proxy_count,
+        http_value_ref,
+        (unsigned)number_ok,
+        http_value
+    );
+    if (http_key) {
+        release_value(http_key);
+    }
+    if (proxies) {
+        release_value(proxies);
+    }
+    if (reach) {
+        release_value(reach);
+    }
+    if (!reach || !flags_ok || !proxies || proxy_count <= 0 || !http_value_ref || !number_ok || http_value < 0) {
+        return 17;
+    }
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += probe_gai("static", getaddrinfo, freeaddrinfo);
@@ -1988,8 +2045,21 @@ int main(void) {
     failures += probe_inet_legacy("static", inet_addr, inet_aton, inet_ntop, htonl, htons, ntohl, ntohs);
     failures += probe_nameinfo("static", getnameinfo, inet_aton, htons);
     failures += probe_ifaddrs("static", getifaddrs, freeifaddrs, if_nametoindex);
+    failures += probe_system_configuration(
+        "static",
+        SCNetworkReachabilityCreateWithName,
+        SCNetworkReachabilityGetFlags,
+        SCDynamicStoreCopyProxies,
+        CFDictionaryGetCount,
+        CFDictionaryGetValue,
+        CFStringCreateWithCString,
+        CFNumberGetValue,
+        CFRelease
+    );
 
     void *self = dlopen(NULL, RTLD_NOW);
+    void *system_config = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+    void *core_foundation = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
     getaddrinfo_fn dyn_gai = (getaddrinfo_fn)dlsym(self, "getaddrinfo");
     freeaddrinfo_fn dyn_free = (freeaddrinfo_fn)dlsym(self, "freeaddrinfo");
     getnameinfo_fn dyn_nameinfo = (getnameinfo_fn)dlsym(self, "getnameinfo");
@@ -2007,14 +2077,30 @@ int main(void) {
     recv_fn dyn_recv = (recv_fn)dlsym(self, "recv");
     sendmsg_fn dyn_sendmsg = (sendmsg_fn)dlsym(self, "sendmsg");
     recvmsg_fn dyn_recvmsg = (recvmsg_fn)dlsym(self, "recvmsg");
+    sc_reach_create_fn dyn_reach_create = (sc_reach_create_fn)dlsym(system_config, "SCNetworkReachabilityCreateWithName");
+    sc_reach_flags_fn dyn_reach_flags = (sc_reach_flags_fn)dlsym(system_config, "SCNetworkReachabilityGetFlags");
+    sc_copy_proxies_fn dyn_copy_proxies = (sc_copy_proxies_fn)dlsym(system_config, "SCDynamicStoreCopyProxies");
+    cf_dict_count_fn dyn_dict_count = (cf_dict_count_fn)dlsym(core_foundation, "CFDictionaryGetCount");
+    cf_dict_value_fn dyn_dict_value = (cf_dict_value_fn)dlsym(core_foundation, "CFDictionaryGetValue");
+    cf_string_create_fn dyn_string_create = (cf_string_create_fn)dlsym(core_foundation, "CFStringCreateWithCString");
+    cf_number_get_fn dyn_number_get = (cf_number_get_fn)dlsym(core_foundation, "CFNumberGetValue");
+    cf_release_fn dyn_release = (cf_release_fn)dlsym(core_foundation, "CFRelease");
     printf(
-        "compat dlsym network ptrs gai=%p free=%p nameinfo=%p ifaddrs=%p freeifaddrs=%p ifindex=%p inet_addr=%p inet_aton=%p inet_ntop=%p htonl=%p htons=%p ntohl=%p ntohs=%p send=%p recv=%p sendmsg=%p recvmsg=%p\n",
+        "compat dlsym network ptrs gai=%p free=%p nameinfo=%p ifaddrs=%p freeifaddrs=%p ifindex=%p reach=%p flags=%p proxies=%p dict_count=%p dict_value=%p cfstr=%p cfnum=%p cfrelease=%p inet_addr=%p inet_aton=%p inet_ntop=%p htonl=%p htons=%p ntohl=%p ntohs=%p send=%p recv=%p sendmsg=%p recvmsg=%p\n",
         (void *)dyn_gai,
         (void *)dyn_free,
         (void *)dyn_nameinfo,
         (void *)dyn_ifaddrs,
         (void *)dyn_freeifaddrs,
         (void *)dyn_ifindex,
+        (void *)dyn_reach_create,
+        (void *)dyn_reach_flags,
+        (void *)dyn_copy_proxies,
+        (void *)dyn_dict_count,
+        (void *)dyn_dict_value,
+        (void *)dyn_string_create,
+        (void *)dyn_number_get,
+        (void *)dyn_release,
         (void *)dyn_inet_addr,
         (void *)dyn_inet_aton,
         (void *)dyn_inet_ntop,
@@ -2027,7 +2113,7 @@ int main(void) {
         (void *)dyn_sendmsg,
         (void *)dyn_recvmsg
     );
-    if (dyn_gai == 0 || dyn_free == 0 || dyn_nameinfo == 0 || dyn_ifaddrs == 0 || dyn_freeifaddrs == 0 || dyn_ifindex == 0 || dyn_inet_addr == 0 || dyn_inet_aton == 0 || dyn_inet_ntop == 0 || dyn_htonl == 0 || dyn_htons == 0 || dyn_ntohl == 0 || dyn_ntohs == 0 || dyn_send == 0 || dyn_recv == 0 || dyn_sendmsg == 0 || dyn_recvmsg == 0) {
+    if (dyn_gai == 0 || dyn_free == 0 || dyn_nameinfo == 0 || dyn_ifaddrs == 0 || dyn_freeifaddrs == 0 || dyn_ifindex == 0 || dyn_reach_create == 0 || dyn_reach_flags == 0 || dyn_copy_proxies == 0 || dyn_dict_count == 0 || dyn_dict_value == 0 || dyn_string_create == 0 || dyn_number_get == 0 || dyn_release == 0 || dyn_inet_addr == 0 || dyn_inet_aton == 0 || dyn_inet_ntop == 0 || dyn_htonl == 0 || dyn_htons == 0 || dyn_ntohl == 0 || dyn_ntohs == 0 || dyn_send == 0 || dyn_recv == 0 || dyn_sendmsg == 0 || dyn_recvmsg == 0) {
         return 4;
     }
     failures += probe_gai("dlsym", dyn_gai, dyn_free);
@@ -2035,6 +2121,17 @@ int main(void) {
     failures += probe_inet_legacy("dlsym", dyn_inet_addr, dyn_inet_aton, dyn_inet_ntop, dyn_htonl, dyn_htons, dyn_ntohl, dyn_ntohs);
     failures += probe_nameinfo("dlsym", dyn_nameinfo, dyn_inet_aton, dyn_htons);
     failures += probe_ifaddrs("dlsym", dyn_ifaddrs, dyn_freeifaddrs, dyn_ifindex);
+    failures += probe_system_configuration(
+        "dlsym",
+        dyn_reach_create,
+        dyn_reach_flags,
+        dyn_copy_proxies,
+        dyn_dict_count,
+        dyn_dict_value,
+        dyn_string_create,
+        dyn_number_get,
+        dyn_release
+    );
 
     int sv[2] = {-1, -1};
     int pair_ret = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
@@ -2058,6 +2155,8 @@ int main(void) {
     }
 
     dlclose(self);
+    dlclose(system_config);
+    dlclose(core_foundation);
     return failures == 0 ? 0 : 1;
 }
 "#,
@@ -2073,6 +2172,10 @@ int main(void) {
         .arg("-fno-builtin-printf")
         .arg("-fno-stack-protector")
         .arg(&source)
+        .arg("-framework")
+        .arg("CoreFoundation")
+        .arg("-framework")
+        .arg("SystemConfiguration")
         .arg("-o")
         .arg(&binary)
         .stdout(Stdio::piped())
@@ -7303,6 +7406,11 @@ fn compat_mode_proxies_network_resolver_and_socket_imports() {
             && stdout.contains("ifaddrs=0x")
             && stdout.contains("freeifaddrs=0x")
             && stdout.contains("ifindex=0x")
+            && stdout.contains("reach=0x")
+            && stdout.contains("flags=0x")
+            && stdout.contains("proxies=0x")
+            && stdout.contains("dict_count=0x")
+            && stdout.contains("dict_value=0x")
             && stdout.contains("inet_addr=0x")
             && stdout.contains("ntohs=0x"),
         "network fixture did not receive dlsym trampolines; stdout:\n{stdout}"
@@ -7342,6 +7450,24 @@ fn compat_mode_proxies_network_resolver_and_socket_imports() {
                 && line.contains(" saw_lo=1 ")
                 && line.contains(" lo_index=")),
         "network fixture did not complete dlsym getifaddrs/if_nametoindex proxy; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("compat sc static ")
+            && line.contains(" flags_ok=1 ")
+            && line.contains(" proxies=0x")
+            && line.contains(" count=")
+            && line.contains(" number_ok=1 ")
+            && line.contains(" http_value=")),
+        "network fixture did not complete static SystemConfiguration reachability/proxy calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("compat sc dlsym ")
+            && line.contains(" flags_ok=1 ")
+            && line.contains(" proxies=0x")
+            && line.contains(" count=")
+            && line.contains(" number_ok=1 ")
+            && line.contains(" http_value=")),
+        "network fixture did not complete dlsym SystemConfiguration reachability/proxy calls; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("compat sendmsg static sent=6 recv=6 text=msg-ok"),
