@@ -205,6 +205,93 @@ impl AppleRuntime {
         }
     }
 
+    fn dictionary_key_index(&self, dict_ref: u64, key_ref: u64) -> Option<usize> {
+        let needle = self.object_data(key_ref);
+        match self.objects.get(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, .. }) => entries.iter().position(|(key, _)| {
+                if *key == key_ref {
+                    return true;
+                }
+                let Some(needle) = needle.as_ref() else {
+                    return false;
+                };
+                self.object_data(*key)
+                    .map(|candidate| candidate == *needle)
+                    .unwrap_or(false)
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn dictionary_set(&mut self, dict_ref: u64, key_ref: u64, value_ref: u64) -> bool {
+        let existing_index = self.dictionary_key_index(dict_ref, key_ref);
+        match self.objects.get_mut(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, host_ptr }) => {
+                if let Some(index) = existing_index {
+                    entries[index] = (key_ref, value_ref);
+                } else {
+                    entries.push((key_ref, value_ref));
+                }
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn dictionary_add(&mut self, dict_ref: u64, key_ref: u64, value_ref: u64) -> bool {
+        if self.dictionary_key_index(dict_ref, key_ref).is_some() {
+            return false;
+        }
+        match self.objects.get_mut(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, host_ptr }) => {
+                entries.push((key_ref, value_ref));
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn dictionary_replace(&mut self, dict_ref: u64, key_ref: u64, value_ref: u64) -> bool {
+        let Some(existing_index) = self.dictionary_key_index(dict_ref, key_ref) else {
+            return false;
+        };
+        match self.objects.get_mut(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, host_ptr }) => {
+                entries[existing_index] = (key_ref, value_ref);
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn dictionary_remove(&mut self, dict_ref: u64, key_ref: u64) -> bool {
+        let Some(existing_index) = self.dictionary_key_index(dict_ref, key_ref) else {
+            return false;
+        };
+        match self.objects.get_mut(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, host_ptr }) => {
+                entries.remove(existing_index);
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn dictionary_remove_all(&mut self, dict_ref: u64) -> bool {
+        match self.objects.get_mut(&dict_ref) {
+            Some(AppleObject::Dictionary { entries, host_ptr }) => {
+                entries.clear();
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn dictionary_entries(&self, dict_ref: u64) -> Option<Vec<(u64, u64)>> {
         match self.objects.get(&dict_ref) {
             Some(AppleObject::Dictionary { entries, .. }) => Some(entries.clone()),
@@ -923,6 +1010,40 @@ mod tests {
         assert_eq!(runtime.host_ptr(dict_ref), Some(0x1234_B000));
         assert_eq!(runtime.dictionary_len(dict_ref), Some(1));
         assert_eq!(runtime.dictionary_get(dict_ref, 0x30), Some(0x40));
+    }
+
+    #[test]
+    fn dictionary_mutation_matches_string_keys_and_invalidates_host_proxy() {
+        let mut runtime = AppleRuntime::default();
+
+        let key = runtime.alloc_string(b"class".to_vec(), 0x8000_0100);
+        let same_key = runtime.alloc_string(b"class".to_vec(), 0x8000_0100);
+        let other_key = runtime.alloc_string(b"account".to_vec(), 0x8000_0100);
+        let initial_value = runtime.alloc_string(b"generic".to_vec(), 0x8000_0100);
+        let replacement_value = runtime.alloc_string(b"password".to_vec(), 0x8000_0100);
+        let other_value = runtime.alloc_string(b"user".to_vec(), 0x8000_0100);
+        let dict_ref =
+            runtime.alloc_dictionary_with_host(vec![(key, initial_value)], Some(0x1234_C000));
+
+        assert_eq!(runtime.host_ptr(dict_ref), Some(0x1234_C000));
+        assert!(!runtime.dictionary_add(dict_ref, same_key, replacement_value));
+        assert_eq!(runtime.dictionary_len(dict_ref), Some(1));
+        assert!(runtime.dictionary_replace(dict_ref, same_key, replacement_value));
+        assert_eq!(
+            runtime.dictionary_entries(dict_ref),
+            Some(vec![(same_key, replacement_value)])
+        );
+        assert_eq!(runtime.host_ptr(dict_ref), None);
+
+        assert!(runtime.dictionary_set(dict_ref, other_key, other_value));
+        assert_eq!(
+            runtime.dictionary_get(dict_ref, other_key),
+            Some(other_value)
+        );
+        assert!(runtime.dictionary_remove(dict_ref, key));
+        assert_eq!(runtime.dictionary_len(dict_ref), Some(1));
+        assert!(runtime.dictionary_remove_all(dict_ref));
+        assert_eq!(runtime.dictionary_entries(dict_ref), Some(Vec::new()));
     }
 
     #[test]

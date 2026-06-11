@@ -3,14 +3,14 @@
 use crate::macos::analysis_arm64_cpp_imports::{
     install_prepared_analysis_arm64_hooks, prepare_analysis_arm64_hooks,
 };
-use crate::macos::apple_imports::install_apple_imports;
+use crate::macos::apple_imports::{install_apple_data_symbols, install_apple_imports};
 use crate::macos::arm64_dynamic_imports::install_arm64_dynamic_imports;
 use crate::macos::arm64_import_stubs::arm64_import_can_resolve_to_guest_library;
 use crate::macos::binary_bootstrap::{map_binary_segments, setup_bootstrap_state};
 use crate::macos::binary_setup::{
     find_runtime_symbols, install_arm64_indirect_branch_hooks, install_arm64_lse_atomic_hooks,
-    log_runtime_symbols, patch_arm64_symbol_pointers_with_slide, patch_symbol_pointers,
-    resolve_entry,
+    log_runtime_symbols, patch_arm64_symbol_pointers_with_data_symbols,
+    patch_arm64_symbol_pointers_with_slide_and_data_symbols, resolve_entry,
 };
 use crate::macos::diagnostics::{install_diagnostic_hooks, run_with_diagnostics, RunReport};
 use crate::macos::io_imports::install_io_imports;
@@ -537,6 +537,7 @@ fn patch_guest_library_symbol_pointers(
     emulator: &mut UnicornEmulator,
     guest_libraries: &GuestLibrarySet,
     stub_map: &std::collections::HashMap<String, u64>,
+    data_symbols: Option<&std::collections::HashMap<String, u64>>,
     done_addr: u64,
     trace_bus: &Option<SharedTraceBus>,
     metadata: &TraceMetadata,
@@ -544,12 +545,13 @@ fn patch_guest_library_symbol_pointers(
 ) {
     for image in guest_libraries.images() {
         let image_undefs = image.binary.get_undefined_symbols();
-        match patch_arm64_symbol_pointers_with_slide(
+        match patch_arm64_symbol_pointers_with_slide_and_data_symbols(
             emulator,
             &image.binary,
             image.slide,
             &image_undefs,
             stub_map,
+            data_symbols,
             done_addr,
             trace_bus,
             process_name,
@@ -672,6 +674,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
         process_name,
     )?;
     let heap_base = bootstrap_state.heap_base;
+    let mut heap_cursor = bootstrap_state.heap_cursor;
     let mmap_base = bootstrap_state.mmap_base;
     let mmap_end = bootstrap_state.mmap_end;
     let mmap_next = bootstrap_state.mmap_next.clone();
@@ -758,6 +761,23 @@ pub fn emulate_macos_arm64_binary_with_mode(
     shared_state.main_image_header = binary.header_address();
     shared_state.main_image_slide = 0;
 
+    let apple_data_symbols =
+        install_apple_data_symbols(&mut emulator, &shared_state.apple_runtime, &mut heap_cursor)?;
+    if let Some(bus) = &trace_bus {
+        let preview = apple_data_symbols
+            .iter()
+            .filter(|(name, _)| name.starts_with("_kSec"))
+            .take(8)
+            .map(|(name, addr)| format!("{name}=0x{addr:X}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = bus.send(
+            process_event(&metadata, "apple-data-symbols", "apple_data_symbols")
+                .arg("Count", apple_data_symbols.len().to_string())
+                .arg("Preview", preview),
+        );
+    }
+
     let import_tracker = initialize_import_tracker();
     let (mut stub_map, stub_name_map, next_dynamic_stub_addr) = install_return_stubs(
         &mut emulator,
@@ -816,6 +836,13 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &trace_bus,
         &metadata,
     );
+    let mut data_symbols = apple_data_symbols;
+    data_symbols.extend(
+        analysis_hook_plan
+            .cpp_data_symbols
+            .iter()
+            .map(|(name, addr)| (name.clone(), *addr)),
+    );
 
     // Apply LC_DYLD_CHAINED_FIXUPS: walk every chain in the data
     // segments and patch each pointer slot in guest memory. Without
@@ -828,7 +855,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &binary,
         0u64,
         &stub_map,
-        Some(&analysis_hook_plan.cpp_data_symbols),
+        Some(&data_symbols),
         done_addr,
     ) {
         Ok(stats) if stats.bound + stats.rebased + stats.unresolved > 0 => {
@@ -854,7 +881,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
     let guest_library_fixup_reports = guest_libraries.process_chained_fixups(
         &mut emulator,
         &stub_map,
-        Some(&analysis_hook_plan.cpp_data_symbols),
+        Some(&data_symbols),
         done_addr,
     );
     emit_guest_library_chained_fixup_reports(&guest_library_fixup_reports, &trace_bus, &metadata);
@@ -960,11 +987,12 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &shared_state,
         &import_tracker,
     )?;
-    patch_symbol_pointers(
+    patch_arm64_symbol_pointers_with_data_symbols(
         &mut emulator,
         &binary,
         &undefs,
         &stub_map,
+        Some(&data_symbols),
         done_addr,
         &trace_bus,
         &process_name,
@@ -973,6 +1001,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &mut emulator,
         &guest_libraries,
         &stub_map,
+        Some(&data_symbols),
         done_addr,
         &trace_bus,
         &metadata,

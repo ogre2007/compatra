@@ -96,6 +96,29 @@ pub fn patch_arm64_symbol_pointers(
     )
 }
 
+pub fn patch_arm64_symbol_pointers_with_data_symbols(
+    emulator: &mut UnicornEmulator,
+    binary: &MachoBinary,
+    undefs: &[(String, u8)],
+    stub_map: &HashMap<String, u64>,
+    data_symbols: Option<&HashMap<String, u64>>,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    process_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    patch_arm64_symbol_pointers_with_slide_and_data_symbols(
+        emulator,
+        binary,
+        0,
+        undefs,
+        stub_map,
+        data_symbols,
+        done_addr,
+        trace_bus,
+        process_name,
+    )
+}
+
 pub fn patch_arm64_symbol_pointers_with_slide(
     emulator: &mut UnicornEmulator,
     binary: &MachoBinary,
@@ -106,6 +129,50 @@ pub fn patch_arm64_symbol_pointers_with_slide(
     trace_bus: &Option<SharedTraceBus>,
     process_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    patch_arm64_symbol_pointers_with_slide_and_data_symbols(
+        emulator,
+        binary,
+        slide,
+        undefs,
+        stub_map,
+        None,
+        done_addr,
+        trace_bus,
+        process_name,
+    )
+}
+
+pub fn patch_arm64_symbol_pointers_with_slide_and_data_symbols(
+    emulator: &mut UnicornEmulator,
+    binary: &MachoBinary,
+    slide: u64,
+    undefs: &[(String, u8)],
+    stub_map: &HashMap<String, u64>,
+    data_symbols: Option<&HashMap<String, u64>>,
+    done_addr: u64,
+    trace_bus: &Option<SharedTraceBus>,
+    process_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resolve_symbol = |name: Option<String>| -> u64 {
+        let Some(name) = name else {
+            return done_addr;
+        };
+        let normalized = crate::macos::imports::normalize_import_symbol(name.clone());
+        if let Some(data_symbols) = data_symbols {
+            if let Some(&addr) = data_symbols
+                .get(&name)
+                .or_else(|| data_symbols.get(&normalized))
+            {
+                return addr;
+            }
+        }
+        stub_map
+            .get(&name)
+            .or_else(|| stub_map.get(&normalized))
+            .copied()
+            .unwrap_or(done_addr)
+    };
+
     let patch_section = |emulator: &mut UnicornEmulator,
                          section: &crate::macos::loader::command::Section64,
                          section_name: &str|
@@ -124,9 +191,7 @@ pub fn patch_arm64_symbol_pointers_with_slide(
         let mut patched = 0;
         for i in 0..count {
             let slot_addr = section.addr.wrapping_add(slide).wrapping_add(i * 8);
-            let value = section_indirect_symbol_name(binary, section, i)
-                .and_then(|name| stub_map.get(&name).copied())
-                .unwrap_or(done_addr);
+            let value = resolve_symbol(section_indirect_symbol_name(binary, section, i));
             let _ = emulator.write_memory(slot_addr, &value.to_le_bytes());
             patched += 1;
         }

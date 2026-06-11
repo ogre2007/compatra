@@ -5142,6 +5142,12 @@ typedef CFIndex (*cf_data_get_len_fn)(CFDataRef);
 typedef const UInt8 *(*cf_data_get_bytes_fn)(CFDataRef);
 typedef CFTypeID (*cf_get_type_id_fn)(CFTypeRef);
 typedef CFTypeID (*cf_type_id_fn)(void);
+typedef CFMutableDictionaryRef (*cf_dictionary_create_mutable_fn)(CFAllocatorRef, CFIndex, const CFDictionaryKeyCallBacks *, const CFDictionaryValueCallBacks *);
+typedef void (*cf_dictionary_mutate_fn)(CFMutableDictionaryRef, const void *, const void *);
+typedef void (*cf_dictionary_remove_fn)(CFMutableDictionaryRef, const void *);
+typedef void (*cf_dictionary_remove_all_fn)(CFMutableDictionaryRef);
+typedef const void *(*cf_dictionary_get_value_fn)(CFDictionaryRef, const void *);
+typedef CFIndex (*cf_dictionary_get_count_fn)(CFDictionaryRef);
 typedef int (*sec_random_fn)(void *, size_t, uint8_t *);
 typedef CFStringRef (*sec_error_fn)(OSStatus, void *);
 typedef OSStatus (*sec_item_copy_matching_fn)(CFDictionaryRef, CFTypeRef *);
@@ -5177,11 +5183,11 @@ static CFStringRef compat_cfstr(const char *text) {
 }
 
 static CFDictionaryRef make_secitem_query(const char *service, const char *account, int include_value) {
-    CFStringRef key_class = compat_cfstr("class");
-    CFStringRef key_service = compat_cfstr("svce");
-    CFStringRef key_account = compat_cfstr("acct");
-    CFStringRef key_value_data = include_value ? compat_cfstr("v_Data") : 0;
-    CFStringRef value_class = compat_cfstr("genp");
+    CFStringRef key_class = kSecClass;
+    CFStringRef key_service = kSecAttrService;
+    CFStringRef key_account = kSecAttrAccount;
+    CFStringRef key_value_data = include_value ? kSecValueData : 0;
+    CFStringRef value_class = kSecClassGenericPassword;
     CFStringRef value_service = compat_cfstr(service);
     CFStringRef value_account = compat_cfstr(account);
     CFDataRef value_data = include_value ? CFDataCreate(0, (const UInt8 *)"compatra-secitem-bridge", 23) : 0;
@@ -5192,6 +5198,88 @@ static CFDictionaryRef make_secitem_query(const char *service, const char *accou
         return 0;
     }
     return CFDictionaryCreate(0, keys, values, count, 0, 0);
+}
+
+static CFMutableDictionaryRef make_secitem_mutable_query_with(
+    const char *service,
+    const char *account,
+    int include_value,
+    cf_dictionary_create_mutable_fn create_impl,
+    cf_dictionary_mutate_fn set_impl,
+    cf_dictionary_mutate_fn add_impl,
+    cf_dictionary_mutate_fn replace_impl,
+    cf_dictionary_remove_fn remove_impl,
+    cf_dictionary_remove_all_fn remove_all_impl,
+    cf_dictionary_get_value_fn get_impl,
+    cf_dictionary_get_count_fn count_impl,
+    int *ops_ok
+) {
+    if (ops_ok) {
+        *ops_ok = 0;
+    }
+    if (!create_impl || !set_impl || !add_impl || !replace_impl || !remove_impl || !remove_all_impl || !get_impl || !count_impl) {
+        return 0;
+    }
+    if (!kSecClass || !kSecAttrService || !kSecAttrAccount || !kSecClassGenericPassword || (include_value && !kSecValueData)) {
+        return 0;
+    }
+
+    CFMutableDictionaryRef query = create_impl(0, 0, 0, 0);
+    if (!query) {
+        return 0;
+    }
+
+    CFStringRef value_service = compat_cfstr(service);
+    CFStringRef value_account = compat_cfstr(account);
+    CFStringRef value_account_replacement = compat_cfstr(account);
+    const char value_payload[] = "compatra-secitem-mutable";
+    CFDataRef value_data = include_value ? CFDataCreate(0, (const UInt8 *)value_payload, (CFIndex)strlen(value_payload)) : 0;
+    if (!value_service || !value_account || !value_account_replacement || (include_value && !value_data)) {
+        return 0;
+    }
+
+    set_impl(query, kSecClass, kSecClassGenericPassword);
+    set_impl(query, kSecAttrService, value_service);
+    set_impl(query, kSecAttrAccount, value_account);
+    replace_impl(query, kSecAttrAccount, value_account_replacement);
+    if (include_value) {
+        set_impl(query, kSecValueData, value_data);
+    }
+
+    CFStringRef temp_key = compat_cfstr("compatra-temp-key");
+    CFStringRef temp_value = compat_cfstr("compatra-temp-value");
+    add_impl(query, temp_key, temp_value);
+    const void *temp_found = get_impl(query, temp_key);
+    remove_impl(query, temp_key);
+    const void *temp_removed = get_impl(query, temp_key);
+
+    CFMutableDictionaryRef scratch = create_impl(0, 0, 0, 0);
+    if (scratch) {
+        set_impl(scratch, temp_key, temp_value);
+        remove_all_impl(scratch);
+    }
+    int local_ops_ok = temp_found && !temp_removed && scratch && count_impl(scratch) == 0;
+    if (ops_ok) {
+        *ops_ok = local_ops_ok;
+    }
+    return local_ops_ok ? query : 0;
+}
+
+static CFMutableDictionaryRef make_secitem_mutable_query(const char *service, const char *account, int include_value, int *ops_ok) {
+    return make_secitem_mutable_query_with(
+        service,
+        account,
+        include_value,
+        CFDictionaryCreateMutable,
+        CFDictionarySetValue,
+        CFDictionaryAddValue,
+        CFDictionaryReplaceValue,
+        CFDictionaryRemoveValue,
+        CFDictionaryRemoveAllValues,
+        CFDictionaryGetValue,
+        CFDictionaryGetCount,
+        ops_ok
+    );
 }
 
 static int exercise_iokit(
@@ -5332,16 +5420,31 @@ int main(void) {
     OSStatus null_content_ret = SecKeychainItemCopyContent(0, &null_content_class, 0, &null_content_len, &null_content_data);
     OSStatus add_null_ret = SecItemAdd(0, 0);
     OSStatus delete_null_ret = SecItemDelete(0);
+    char static_sec_class_text[32] = {0};
+    char static_sec_value_text[32] = {0};
+    int static_sec_constants_ok = CFStringGetCString(kSecClass, static_sec_class_text, sizeof(static_sec_class_text), kCFStringEncodingUTF8)
+        && CFStringGetCString(kSecValueData, static_sec_value_text, sizeof(static_sec_value_text), kCFStringEncodingUTF8)
+        && strcmp(static_sec_class_text, "class") == 0
+        && strcmp(static_sec_value_text, "v_Data") == 0;
     CFDictionaryRef static_delete_query = make_secitem_query("compatra-ci-secitem-static", "bridge-static", 0);
     CFDictionaryRef static_add_query = make_secitem_query("compatra-ci-secitem-static", "bridge-static", 1);
     OSStatus static_delete_before = static_delete_query ? SecItemDelete(static_delete_query) : -1;
     OSStatus static_add_ret = static_add_query ? SecItemAdd(static_add_query, 0) : -1;
     OSStatus static_delete_after = static_delete_query ? SecItemDelete(static_delete_query) : -1;
     int static_secitem_bridge_ok = static_delete_query && static_add_query && (static_delete_before != -50 || static_add_ret != -50 || static_delete_after != -50);
+    int static_mut_delete_ops_ok = 0;
+    int static_mut_add_ops_ok = 0;
+    CFMutableDictionaryRef static_mut_delete_query = make_secitem_mutable_query("compatra-ci-secitem-mutable-static", "bridge-mut-static", 0, &static_mut_delete_ops_ok);
+    CFMutableDictionaryRef static_mut_add_query = make_secitem_mutable_query("compatra-ci-secitem-mutable-static", "bridge-mut-static", 1, &static_mut_add_ops_ok);
+    OSStatus static_mut_delete_before = static_mut_delete_query ? SecItemDelete(static_mut_delete_query) : -1;
+    OSStatus static_mut_add_ret = static_mut_add_query ? SecItemAdd(static_mut_add_query, 0) : -1;
+    OSStatus static_mut_delete_after = static_mut_delete_query ? SecItemDelete(static_mut_delete_query) : -1;
+    int static_mut_ops_ok = static_mut_delete_ops_ok && static_mut_add_ops_ok;
+    int static_mut_secitem_bridge_ok = static_mut_delete_query && static_mut_add_query && static_mut_ops_ok && (static_mut_delete_before != -50 || static_mut_add_ret != -50 || static_mut_delete_after != -50);
     int default_keychain_ok = default_ret != 0 || (default_keychain && path_ret == 0 && keychain_path_len > 0 && keychain_path[0] != 0);
     int find_ok = find_ret != 0 || password_data || item_ref;
     int search_ok = search_ret != 0 || search_ref;
-    int static_security_ok = default_keychain_ok && find_ok && null_item_ret != 0 && search_ok && null_next_ret != 0 && null_content_ret != 0 && add_null_ret != 0 && delete_null_ret != 0 && static_secitem_bridge_ok;
+    int static_security_ok = default_keychain_ok && find_ok && null_item_ret != 0 && search_ok && null_next_ret != 0 && null_content_ret != 0 && add_null_ret != 0 && delete_null_ret != 0 && static_sec_constants_ok && static_secitem_bridge_ok && static_mut_secitem_bridge_ok;
     printf(
         "compat security static default=%d keychain=%p path_ret=%d path_len=%u path=%s open=%d opened=%p find=%d pw_len=%u pw=%p item=%p free=%d null_item=%d pass=%d\n",
         default_ret,
@@ -5377,13 +5480,27 @@ int main(void) {
         static_security_ok
     );
     printf(
-        "compat security-secitem static delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        "compat security-secitem static const=%d class=%s value=%s delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        static_sec_constants_ok,
+        static_sec_class_text,
+        static_sec_value_text,
         static_delete_before,
         static_add_ret,
         static_delete_after,
         (void *)static_delete_query,
         (void *)static_add_query,
         static_secitem_bridge_ok,
+        static_security_ok
+    );
+    printf(
+        "compat security-secitem-mutable static ops=%d delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        static_mut_ops_ok,
+        static_mut_delete_before,
+        static_mut_add_ret,
+        static_mut_delete_after,
+        (void *)static_mut_delete_query,
+        (void *)static_mut_add_query,
+        static_mut_secitem_bridge_ok,
         static_security_ok
     );
 
@@ -5410,6 +5527,14 @@ int main(void) {
     cf_get_type_id_fn dyn_get_type = (cf_get_type_id_fn)dlsym(cf, "CFGetTypeID");
     cf_type_id_fn dyn_string_type = (cf_type_id_fn)dlsym(cf, "CFStringGetTypeID");
     cf_type_id_fn dyn_data_type = (cf_type_id_fn)dlsym(cf, "CFDataGetTypeID");
+    cf_dictionary_create_mutable_fn dyn_dict_create_mutable = (cf_dictionary_create_mutable_fn)dlsym(cf, "CFDictionaryCreateMutable");
+    cf_dictionary_mutate_fn dyn_dict_set = (cf_dictionary_mutate_fn)dlsym(cf, "CFDictionarySetValue");
+    cf_dictionary_mutate_fn dyn_dict_add = (cf_dictionary_mutate_fn)dlsym(cf, "CFDictionaryAddValue");
+    cf_dictionary_mutate_fn dyn_dict_replace = (cf_dictionary_mutate_fn)dlsym(cf, "CFDictionaryReplaceValue");
+    cf_dictionary_remove_fn dyn_dict_remove = (cf_dictionary_remove_fn)dlsym(cf, "CFDictionaryRemoveValue");
+    cf_dictionary_remove_all_fn dyn_dict_remove_all = (cf_dictionary_remove_all_fn)dlsym(cf, "CFDictionaryRemoveAllValues");
+    cf_dictionary_get_value_fn dyn_dict_get = (cf_dictionary_get_value_fn)dlsym(cf, "CFDictionaryGetValue");
+    cf_dictionary_get_count_fn dyn_dict_count = (cf_dictionary_get_count_fn)dlsym(cf, "CFDictionaryGetCount");
     sec_random_fn dyn_random = (sec_random_fn)dlsym(sec, "SecRandomCopyBytes");
     sec_error_fn dyn_error = (sec_error_fn)dlsym(sec, "SecCopyErrorMessageString");
     sec_item_copy_matching_fn dyn_item_copy = (sec_item_copy_matching_fn)dlsym(sec, "SecItemCopyMatching");
@@ -5431,7 +5556,7 @@ int main(void) {
     io_registry_entry_create_cf_property_fn dyn_io_property = (io_registry_entry_create_cf_property_fn)dlsym(iokit, "IORegistryEntryCreateCFProperty");
     io_object_release_fn dyn_io_release = (io_object_release_fn)dlsym(iokit, "IOObjectRelease");
     printf(
-        "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p random=%p error=%p item_copy=%p item_add=%p item_delete=%p kc_default=%p kc_open=%p kc_path=%p kc_find=%p kc_search_create=%p kc_search_next=%p kc_content=%p kc_free=%p\n",
+        "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p dict_mut=%p dict_set=%p dict_add=%p dict_replace=%p dict_remove=%p dict_remove_all=%p dict_get=%p dict_count=%p random=%p error=%p item_copy=%p item_add=%p item_delete=%p kc_default=%p kc_open=%p kc_path=%p kc_find=%p kc_search_create=%p kc_search_next=%p kc_content=%p kc_free=%p\n",
         (void *)dyn_create,
         (void *)dyn_get,
         (void *)dyn_len,
@@ -5441,6 +5566,14 @@ int main(void) {
         (void *)dyn_get_type,
         (void *)dyn_string_type,
         (void *)dyn_data_type,
+        (void *)dyn_dict_create_mutable,
+        (void *)dyn_dict_set,
+        (void *)dyn_dict_add,
+        (void *)dyn_dict_replace,
+        (void *)dyn_dict_remove,
+        (void *)dyn_dict_remove_all,
+        (void *)dyn_dict_get,
+        (void *)dyn_dict_count,
         (void *)dyn_random,
         (void *)dyn_error,
         (void *)dyn_item_copy,
@@ -5544,16 +5677,58 @@ int main(void) {
     OSStatus dyn_null_content_ret = dyn_keychain_content ? dyn_keychain_content(0, &dyn_null_content_class, 0, &dyn_null_content_len, &dyn_null_content_data) : 0;
     OSStatus dyn_add_null_ret = dyn_item_add ? dyn_item_add(0, 0) : 0;
     OSStatus dyn_delete_null_ret = dyn_item_delete ? dyn_item_delete(0) : 0;
+    char dyn_sec_class_text[32] = {0};
+    char dyn_sec_value_text[32] = {0};
+    int dyn_sec_constants_ok = dyn_get
+        && dyn_get(kSecClass, dyn_sec_class_text, sizeof(dyn_sec_class_text), kCFStringEncodingUTF8)
+        && dyn_get(kSecValueData, dyn_sec_value_text, sizeof(dyn_sec_value_text), kCFStringEncodingUTF8)
+        && strcmp(dyn_sec_class_text, "class") == 0
+        && strcmp(dyn_sec_value_text, "v_Data") == 0;
     CFDictionaryRef dyn_delete_query = make_secitem_query("compatra-ci-secitem-dynamic", "bridge-dynamic", 0);
     CFDictionaryRef dyn_add_query = make_secitem_query("compatra-ci-secitem-dynamic", "bridge-dynamic", 1);
     OSStatus dyn_delete_before = dyn_item_delete && dyn_delete_query ? dyn_item_delete(dyn_delete_query) : -1;
     OSStatus dyn_add_ret = dyn_item_add && dyn_add_query ? dyn_item_add(dyn_add_query, 0) : -1;
     OSStatus dyn_delete_after = dyn_item_delete && dyn_delete_query ? dyn_item_delete(dyn_delete_query) : -1;
     int dyn_secitem_bridge_ok = dyn_item_add && dyn_item_delete && dyn_delete_query && dyn_add_query && (dyn_delete_before != -50 || dyn_add_ret != -50 || dyn_delete_after != -50);
+    int dyn_mut_delete_ops_ok = 0;
+    int dyn_mut_add_ops_ok = 0;
+    CFMutableDictionaryRef dyn_mut_delete_query = make_secitem_mutable_query_with(
+        "compatra-ci-secitem-mutable-dynamic",
+        "bridge-mut-dynamic",
+        0,
+        dyn_dict_create_mutable,
+        dyn_dict_set,
+        dyn_dict_add,
+        dyn_dict_replace,
+        dyn_dict_remove,
+        dyn_dict_remove_all,
+        dyn_dict_get,
+        dyn_dict_count,
+        &dyn_mut_delete_ops_ok
+    );
+    CFMutableDictionaryRef dyn_mut_add_query = make_secitem_mutable_query_with(
+        "compatra-ci-secitem-mutable-dynamic",
+        "bridge-mut-dynamic",
+        1,
+        dyn_dict_create_mutable,
+        dyn_dict_set,
+        dyn_dict_add,
+        dyn_dict_replace,
+        dyn_dict_remove,
+        dyn_dict_remove_all,
+        dyn_dict_get,
+        dyn_dict_count,
+        &dyn_mut_add_ops_ok
+    );
+    OSStatus dyn_mut_delete_before = dyn_item_delete && dyn_mut_delete_query ? dyn_item_delete(dyn_mut_delete_query) : -1;
+    OSStatus dyn_mut_add_ret = dyn_item_add && dyn_mut_add_query ? dyn_item_add(dyn_mut_add_query, 0) : -1;
+    OSStatus dyn_mut_delete_after = dyn_item_delete && dyn_mut_delete_query ? dyn_item_delete(dyn_mut_delete_query) : -1;
+    int dyn_mut_ops_ok = dyn_mut_delete_ops_ok && dyn_mut_add_ops_ok;
+    int dyn_mut_secitem_bridge_ok = dyn_item_add && dyn_item_delete && dyn_mut_delete_query && dyn_mut_add_query && dyn_mut_ops_ok && (dyn_mut_delete_before != -50 || dyn_mut_add_ret != -50 || dyn_mut_delete_after != -50);
     int dyn_default_keychain_ok = dyn_default_ret != 0 || (dyn_default_keychain && dyn_path_ret == 0 && dyn_keychain_path_len > 0 && dyn_keychain_path_buf[0] != 0);
     int dyn_find_ok = dyn_find_ret != 0 || dyn_password_data || dyn_item_ref;
     int dyn_search_ok = dyn_search_ret != 0 || dyn_search_ref;
-    int dyn_security_ok = dyn_item_copy && dyn_item_add && dyn_item_delete && dyn_keychain_default && dyn_keychain_open && dyn_keychain_path && dyn_keychain_find && dyn_keychain_search_create && dyn_keychain_search_next && dyn_keychain_content && dyn_keychain_free && dyn_default_keychain_ok && dyn_find_ok && dyn_null_item_ret != 0 && dyn_search_ok && dyn_null_next_ret != 0 && dyn_null_content_ret != 0 && dyn_add_null_ret != 0 && dyn_delete_null_ret != 0 && dyn_secitem_bridge_ok;
+    int dyn_security_ok = dyn_item_copy && dyn_item_add && dyn_item_delete && dyn_keychain_default && dyn_keychain_open && dyn_keychain_path && dyn_keychain_find && dyn_keychain_search_create && dyn_keychain_search_next && dyn_keychain_content && dyn_keychain_free && dyn_default_keychain_ok && dyn_find_ok && dyn_null_item_ret != 0 && dyn_search_ok && dyn_null_next_ret != 0 && dyn_null_content_ret != 0 && dyn_add_null_ret != 0 && dyn_delete_null_ret != 0 && dyn_sec_constants_ok && dyn_secitem_bridge_ok && dyn_mut_secitem_bridge_ok;
     printf(
         "compat security dlsym default=%d keychain=%p path_ret=%d path_len=%u path=%s open=%d opened=%p find=%d pw_len=%u pw=%p item=%p free=%d null_item=%d pass=%d\n",
         dyn_default_ret,
@@ -5589,13 +5764,27 @@ int main(void) {
         dyn_security_ok
     );
     printf(
-        "compat security-secitem dlsym delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        "compat security-secitem dlsym const=%d class=%s value=%s delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        dyn_sec_constants_ok,
+        dyn_sec_class_text,
+        dyn_sec_value_text,
         dyn_delete_before,
         dyn_add_ret,
         dyn_delete_after,
         (void *)dyn_delete_query,
         (void *)dyn_add_query,
         dyn_secitem_bridge_ok,
+        dyn_security_ok
+    );
+    printf(
+        "compat security-secitem-mutable dlsym ops=%d delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        dyn_mut_ops_ok,
+        dyn_mut_delete_before,
+        dyn_mut_add_ret,
+        dyn_mut_delete_after,
+        (void *)dyn_mut_delete_query,
+        (void *)dyn_mut_add_query,
+        dyn_mut_secitem_bridge_ok,
         dyn_security_ok
     );
 
@@ -7448,6 +7637,14 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
             && stdout.contains(" get_type=0x")
             && stdout.contains(" string_type=0x")
             && stdout.contains(" data_type=0x")
+            && stdout.contains(" dict_mut=0x")
+            && stdout.contains(" dict_set=0x")
+            && stdout.contains(" dict_add=0x")
+            && stdout.contains(" dict_replace=0x")
+            && stdout.contains(" dict_remove=0x")
+            && stdout.contains(" dict_remove_all=0x")
+            && stdout.contains(" dict_get=0x")
+            && stdout.contains(" dict_count=0x")
             && stdout.contains(" random=0x")
             && stdout.contains(" error=0x")
             && stdout.contains(" item_copy=0x")
@@ -7490,9 +7687,21 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
         stdout
             .lines()
             .any(|line| line.contains("compat security-secitem static")
+                && line.contains(" const=1")
+                && line.contains(" class=class")
+                && line.contains(" value=v_Data")
                 && line.contains(" bridge=1")
                 && line.contains(" pass=1")),
         "Apple framework fixture did not bridge static guest CFDictionary SecItem queries into host Security; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security-secitem-mutable static")
+                && line.contains(" ops=1")
+                && line.contains(" bridge=1")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not bridge static mutable CFDictionary SecItem queries into host Security; stdout:\n{stdout}"
     );
     assert!(
         stdout
@@ -7535,9 +7744,21 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
         stdout
             .lines()
             .any(|line| line.contains("compat security-secitem dlsym")
+                && line.contains(" const=1")
+                && line.contains(" class=class")
+                && line.contains(" value=v_Data")
                 && line.contains(" bridge=1")
                 && line.contains(" pass=1")),
         "Apple framework fixture did not bridge dlsym guest CFDictionary SecItem queries into host Security; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security-secitem-mutable dlsym")
+                && line.contains(" ops=1")
+                && line.contains(" bridge=1")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not bridge dlsym mutable CFDictionary SecItem queries into host Security; stdout:\n{stdout}"
     );
     assert!(
         stdout

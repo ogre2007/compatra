@@ -15,6 +15,7 @@ use unicorn_engine::Prot;
 #[derive(Debug)]
 pub struct Arm64BootstrapState {
     pub heap_base: u64,
+    pub heap_cursor: u64,
     pub mmap_base: u64,
     pub mmap_end: u64,
     pub mmap_next: Arc<AtomicU64>,
@@ -176,6 +177,7 @@ pub fn setup_arm64_bootstrap_state(
 
     Ok(Arm64BootstrapState {
         heap_base: arena.heap_base,
+        heap_cursor,
         mmap_base: arena.mmap_base,
         mmap_end: arena.mmap_end,
         mmap_next,
