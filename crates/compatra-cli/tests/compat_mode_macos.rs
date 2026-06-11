@@ -5145,10 +5145,15 @@ typedef CFTypeID (*cf_type_id_fn)(void);
 typedef int (*sec_random_fn)(void *, size_t, uint8_t *);
 typedef CFStringRef (*sec_error_fn)(OSStatus, void *);
 typedef OSStatus (*sec_item_copy_matching_fn)(CFDictionaryRef, CFTypeRef *);
+typedef OSStatus (*sec_item_add_fn)(CFDictionaryRef, CFTypeRef *);
+typedef OSStatus (*sec_item_delete_fn)(CFDictionaryRef);
 typedef OSStatus (*sec_keychain_copy_default_fn)(SecKeychainRef *);
 typedef OSStatus (*sec_keychain_open_fn)(const char *, SecKeychainRef *);
 typedef OSStatus (*sec_keychain_get_path_fn)(SecKeychainRef, UInt32 *, char *);
 typedef OSStatus (*sec_keychain_find_generic_password_fn)(CFTypeRef, UInt32, const char *, UInt32, const char *, UInt32 *, void **, SecKeychainItemRef *);
+typedef OSStatus (*sec_keychain_search_create_fn)(CFTypeRef, SecItemClass, const SecKeychainAttributeList *, SecKeychainSearchRef *);
+typedef OSStatus (*sec_keychain_search_next_fn)(SecKeychainSearchRef, SecKeychainItemRef *);
+typedef OSStatus (*sec_keychain_item_copy_content_fn)(SecKeychainItemRef, SecItemClass *, SecKeychainAttributeList *, UInt32 *, void **);
 typedef OSStatus (*sec_keychain_item_free_content_fn)(SecKeychainAttributeList *, void *);
 typedef CFMutableDictionaryRef (*io_service_matching_fn)(const char *);
 typedef io_service_t (*io_service_get_matching_service_fn)(mach_port_t, CFDictionaryRef);
@@ -5165,6 +5170,28 @@ static int any_nonzero(const unsigned char *buf, unsigned long len) {
         }
     }
     return 0;
+}
+
+static CFStringRef compat_cfstr(const char *text) {
+    return CFStringCreateWithCString(0, text, kCFStringEncodingUTF8);
+}
+
+static CFDictionaryRef make_secitem_query(const char *service, const char *account, int include_value) {
+    CFStringRef key_class = compat_cfstr("class");
+    CFStringRef key_service = compat_cfstr("svce");
+    CFStringRef key_account = compat_cfstr("acct");
+    CFStringRef key_value_data = include_value ? compat_cfstr("v_Data") : 0;
+    CFStringRef value_class = compat_cfstr("genp");
+    CFStringRef value_service = compat_cfstr(service);
+    CFStringRef value_account = compat_cfstr(account);
+    CFDataRef value_data = include_value ? CFDataCreate(0, (const UInt8 *)"compatra-secitem-bridge", 23) : 0;
+    const void *keys[4] = {key_class, key_service, key_account, key_value_data};
+    const void *values[4] = {value_class, value_service, value_account, value_data};
+    CFIndex count = include_value ? 4 : 3;
+    if (!key_class || !key_service || !key_account || !value_class || !value_service || !value_account || (include_value && (!key_value_data || !value_data))) {
+        return 0;
+    }
+    return CFDictionaryCreate(0, keys, values, count, 0, 0);
 }
 
 static int exercise_iokit(
@@ -5288,9 +5315,33 @@ int main(void) {
     );
     OSStatus free_ret = password_data ? SecKeychainItemFreeContent(0, password_data) : 0;
     OSStatus null_item_ret = SecItemCopyMatching(0, 0);
+    SecKeychainSearchRef search_ref = 0;
+    OSStatus search_ret = SecKeychainSearchCreateFromAttributes(0, kSecGenericPasswordItemClass, 0, &search_ref);
+    SecKeychainItemRef search_item = 0;
+    OSStatus next_ret = search_ret == 0 ? SecKeychainSearchCopyNext(search_ref, &search_item) : -1;
+    SecItemClass content_class = 0;
+    UInt32 content_len = 0;
+    void *content_data = 0;
+    OSStatus content_ret = next_ret == 0 && search_item ? SecKeychainItemCopyContent(search_item, &content_class, 0, &content_len, &content_data) : -1;
+    OSStatus content_free_ret = content_data ? SecKeychainItemFreeContent(0, content_data) : 0;
+    SecKeychainItemRef null_next_item = 0;
+    OSStatus null_next_ret = SecKeychainSearchCopyNext(0, &null_next_item);
+    SecItemClass null_content_class = 0;
+    UInt32 null_content_len = 0;
+    void *null_content_data = 0;
+    OSStatus null_content_ret = SecKeychainItemCopyContent(0, &null_content_class, 0, &null_content_len, &null_content_data);
+    OSStatus add_null_ret = SecItemAdd(0, 0);
+    OSStatus delete_null_ret = SecItemDelete(0);
+    CFDictionaryRef static_delete_query = make_secitem_query("compatra-ci-secitem-static", "bridge-static", 0);
+    CFDictionaryRef static_add_query = make_secitem_query("compatra-ci-secitem-static", "bridge-static", 1);
+    OSStatus static_delete_before = static_delete_query ? SecItemDelete(static_delete_query) : -1;
+    OSStatus static_add_ret = static_add_query ? SecItemAdd(static_add_query, 0) : -1;
+    OSStatus static_delete_after = static_delete_query ? SecItemDelete(static_delete_query) : -1;
+    int static_secitem_bridge_ok = static_delete_query && static_add_query && (static_delete_before != -50 || static_add_ret != -50 || static_delete_after != -50);
     int default_keychain_ok = default_ret != 0 || (default_keychain && path_ret == 0 && keychain_path_len > 0 && keychain_path[0] != 0);
     int find_ok = find_ret != 0 || password_data || item_ref;
-    int static_security_ok = default_keychain_ok && find_ok && null_item_ret != 0;
+    int search_ok = search_ret != 0 || search_ref;
+    int static_security_ok = default_keychain_ok && find_ok && null_item_ret != 0 && search_ok && null_next_ret != 0 && null_content_ret != 0 && add_null_ret != 0 && delete_null_ret != 0 && static_secitem_bridge_ok;
     printf(
         "compat security static default=%d keychain=%p path_ret=%d path_len=%u path=%s open=%d opened=%p find=%d pw_len=%u pw=%p item=%p free=%d null_item=%d pass=%d\n",
         default_ret,
@@ -5306,6 +5357,33 @@ int main(void) {
         (void *)item_ref,
         free_ret,
         null_item_ret,
+        static_security_ok
+    );
+    printf(
+        "compat security-search static search=%d search_ref=%p next=%d item=%p content=%d class=0x%x len=%u data=%p content_free=%d null_next=%d null_content=%d add_null=%d delete_null=%d pass=%d\n",
+        search_ret,
+        (void *)search_ref,
+        next_ret,
+        (void *)search_item,
+        content_ret,
+        (unsigned int)content_class,
+        content_len,
+        content_data,
+        content_free_ret,
+        null_next_ret,
+        null_content_ret,
+        add_null_ret,
+        delete_null_ret,
+        static_security_ok
+    );
+    printf(
+        "compat security-secitem static delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        static_delete_before,
+        static_add_ret,
+        static_delete_after,
+        (void *)static_delete_query,
+        (void *)static_add_query,
+        static_secitem_bridge_ok,
         static_security_ok
     );
 
@@ -5335,10 +5413,15 @@ int main(void) {
     sec_random_fn dyn_random = (sec_random_fn)dlsym(sec, "SecRandomCopyBytes");
     sec_error_fn dyn_error = (sec_error_fn)dlsym(sec, "SecCopyErrorMessageString");
     sec_item_copy_matching_fn dyn_item_copy = (sec_item_copy_matching_fn)dlsym(sec, "SecItemCopyMatching");
+    sec_item_add_fn dyn_item_add = (sec_item_add_fn)dlsym(sec, "SecItemAdd");
+    sec_item_delete_fn dyn_item_delete = (sec_item_delete_fn)dlsym(sec, "SecItemDelete");
     sec_keychain_copy_default_fn dyn_keychain_default = (sec_keychain_copy_default_fn)dlsym(sec, "SecKeychainCopyDefault");
     sec_keychain_open_fn dyn_keychain_open = (sec_keychain_open_fn)dlsym(sec, "SecKeychainOpen");
     sec_keychain_get_path_fn dyn_keychain_path = (sec_keychain_get_path_fn)dlsym(sec, "SecKeychainGetPath");
     sec_keychain_find_generic_password_fn dyn_keychain_find = (sec_keychain_find_generic_password_fn)dlsym(sec, "SecKeychainFindGenericPassword");
+    sec_keychain_search_create_fn dyn_keychain_search_create = (sec_keychain_search_create_fn)dlsym(sec, "SecKeychainSearchCreateFromAttributes");
+    sec_keychain_search_next_fn dyn_keychain_search_next = (sec_keychain_search_next_fn)dlsym(sec, "SecKeychainSearchCopyNext");
+    sec_keychain_item_copy_content_fn dyn_keychain_content = (sec_keychain_item_copy_content_fn)dlsym(sec, "SecKeychainItemCopyContent");
     sec_keychain_item_free_content_fn dyn_keychain_free = (sec_keychain_item_free_content_fn)dlsym(sec, "SecKeychainItemFreeContent");
     io_service_matching_fn dyn_io_matching = (io_service_matching_fn)dlsym(iokit, "IOServiceMatching");
     io_service_get_matching_service_fn dyn_io_get_service = (io_service_get_matching_service_fn)dlsym(iokit, "IOServiceGetMatchingService");
@@ -5348,7 +5431,7 @@ int main(void) {
     io_registry_entry_create_cf_property_fn dyn_io_property = (io_registry_entry_create_cf_property_fn)dlsym(iokit, "IORegistryEntryCreateCFProperty");
     io_object_release_fn dyn_io_release = (io_object_release_fn)dlsym(iokit, "IOObjectRelease");
     printf(
-        "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p random=%p error=%p item_copy=%p kc_default=%p kc_open=%p kc_path=%p kc_find=%p kc_free=%p\n",
+        "compat apple dlsym ptrs create=%p get=%p len=%p data_create=%p data_len=%p data_bytes=%p get_type=%p string_type=%p data_type=%p random=%p error=%p item_copy=%p item_add=%p item_delete=%p kc_default=%p kc_open=%p kc_path=%p kc_find=%p kc_search_create=%p kc_search_next=%p kc_content=%p kc_free=%p\n",
         (void *)dyn_create,
         (void *)dyn_get,
         (void *)dyn_len,
@@ -5361,10 +5444,15 @@ int main(void) {
         (void *)dyn_random,
         (void *)dyn_error,
         (void *)dyn_item_copy,
+        (void *)dyn_item_add,
+        (void *)dyn_item_delete,
         (void *)dyn_keychain_default,
         (void *)dyn_keychain_open,
         (void *)dyn_keychain_path,
         (void *)dyn_keychain_find,
+        (void *)dyn_keychain_search_create,
+        (void *)dyn_keychain_search_next,
+        (void *)dyn_keychain_content,
         (void *)dyn_keychain_free
     );
     printf(
@@ -5439,9 +5527,33 @@ int main(void) {
     ) : -1;
     OSStatus dyn_free_ret = dyn_password_data && dyn_keychain_free ? dyn_keychain_free(0, dyn_password_data) : 0;
     OSStatus dyn_null_item_ret = dyn_item_copy ? dyn_item_copy(0, 0) : 0;
+    SecKeychainSearchRef dyn_search_ref = 0;
+    OSStatus dyn_search_ret = dyn_keychain_search_create ? dyn_keychain_search_create(0, kSecGenericPasswordItemClass, 0, &dyn_search_ref) : -1;
+    SecKeychainItemRef dyn_search_item = 0;
+    OSStatus dyn_next_ret = dyn_search_ret == 0 && dyn_keychain_search_next ? dyn_keychain_search_next(dyn_search_ref, &dyn_search_item) : -1;
+    SecItemClass dyn_content_class = 0;
+    UInt32 dyn_content_len = 0;
+    void *dyn_content_data = 0;
+    OSStatus dyn_content_ret = dyn_next_ret == 0 && dyn_search_item && dyn_keychain_content ? dyn_keychain_content(dyn_search_item, &dyn_content_class, 0, &dyn_content_len, &dyn_content_data) : -1;
+    OSStatus dyn_content_free_ret = dyn_content_data && dyn_keychain_free ? dyn_keychain_free(0, dyn_content_data) : 0;
+    SecKeychainItemRef dyn_null_next_item = 0;
+    OSStatus dyn_null_next_ret = dyn_keychain_search_next ? dyn_keychain_search_next(0, &dyn_null_next_item) : 0;
+    SecItemClass dyn_null_content_class = 0;
+    UInt32 dyn_null_content_len = 0;
+    void *dyn_null_content_data = 0;
+    OSStatus dyn_null_content_ret = dyn_keychain_content ? dyn_keychain_content(0, &dyn_null_content_class, 0, &dyn_null_content_len, &dyn_null_content_data) : 0;
+    OSStatus dyn_add_null_ret = dyn_item_add ? dyn_item_add(0, 0) : 0;
+    OSStatus dyn_delete_null_ret = dyn_item_delete ? dyn_item_delete(0) : 0;
+    CFDictionaryRef dyn_delete_query = make_secitem_query("compatra-ci-secitem-dynamic", "bridge-dynamic", 0);
+    CFDictionaryRef dyn_add_query = make_secitem_query("compatra-ci-secitem-dynamic", "bridge-dynamic", 1);
+    OSStatus dyn_delete_before = dyn_item_delete && dyn_delete_query ? dyn_item_delete(dyn_delete_query) : -1;
+    OSStatus dyn_add_ret = dyn_item_add && dyn_add_query ? dyn_item_add(dyn_add_query, 0) : -1;
+    OSStatus dyn_delete_after = dyn_item_delete && dyn_delete_query ? dyn_item_delete(dyn_delete_query) : -1;
+    int dyn_secitem_bridge_ok = dyn_item_add && dyn_item_delete && dyn_delete_query && dyn_add_query && (dyn_delete_before != -50 || dyn_add_ret != -50 || dyn_delete_after != -50);
     int dyn_default_keychain_ok = dyn_default_ret != 0 || (dyn_default_keychain && dyn_path_ret == 0 && dyn_keychain_path_len > 0 && dyn_keychain_path_buf[0] != 0);
     int dyn_find_ok = dyn_find_ret != 0 || dyn_password_data || dyn_item_ref;
-    int dyn_security_ok = dyn_item_copy && dyn_keychain_default && dyn_keychain_open && dyn_keychain_path && dyn_keychain_find && dyn_keychain_free && dyn_default_keychain_ok && dyn_find_ok && dyn_null_item_ret != 0;
+    int dyn_search_ok = dyn_search_ret != 0 || dyn_search_ref;
+    int dyn_security_ok = dyn_item_copy && dyn_item_add && dyn_item_delete && dyn_keychain_default && dyn_keychain_open && dyn_keychain_path && dyn_keychain_find && dyn_keychain_search_create && dyn_keychain_search_next && dyn_keychain_content && dyn_keychain_free && dyn_default_keychain_ok && dyn_find_ok && dyn_null_item_ret != 0 && dyn_search_ok && dyn_null_next_ret != 0 && dyn_null_content_ret != 0 && dyn_add_null_ret != 0 && dyn_delete_null_ret != 0 && dyn_secitem_bridge_ok;
     printf(
         "compat security dlsym default=%d keychain=%p path_ret=%d path_len=%u path=%s open=%d opened=%p find=%d pw_len=%u pw=%p item=%p free=%d null_item=%d pass=%d\n",
         dyn_default_ret,
@@ -5457,6 +5569,33 @@ int main(void) {
         (void *)dyn_item_ref,
         dyn_free_ret,
         dyn_null_item_ret,
+        dyn_security_ok
+    );
+    printf(
+        "compat security-search dlsym search=%d search_ref=%p next=%d item=%p content=%d class=0x%x len=%u data=%p content_free=%d null_next=%d null_content=%d add_null=%d delete_null=%d pass=%d\n",
+        dyn_search_ret,
+        (void *)dyn_search_ref,
+        dyn_next_ret,
+        (void *)dyn_search_item,
+        dyn_content_ret,
+        (unsigned int)dyn_content_class,
+        dyn_content_len,
+        dyn_content_data,
+        dyn_content_free_ret,
+        dyn_null_next_ret,
+        dyn_null_content_ret,
+        dyn_add_null_ret,
+        dyn_delete_null_ret,
+        dyn_security_ok
+    );
+    printf(
+        "compat security-secitem dlsym delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        dyn_delete_before,
+        dyn_add_ret,
+        dyn_delete_after,
+        (void *)dyn_delete_query,
+        (void *)dyn_add_query,
+        dyn_secitem_bridge_ok,
         dyn_security_ok
     );
 
@@ -7312,10 +7451,15 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
             && stdout.contains(" random=0x")
             && stdout.contains(" error=0x")
             && stdout.contains(" item_copy=0x")
+            && stdout.contains(" item_add=0x")
+            && stdout.contains(" item_delete=0x")
             && stdout.contains(" kc_default=0x")
             && stdout.contains(" kc_open=0x")
             && stdout.contains(" kc_path=0x")
             && stdout.contains(" kc_find=0x")
+            && stdout.contains(" kc_search_create=0x")
+            && stdout.contains(" kc_search_next=0x")
+            && stdout.contains(" kc_content=0x")
             && stdout.contains(" kc_free=0x"),
         "Apple framework fixture did not receive dlsym Apple trampolines; stdout:\n{stdout}"
     );
@@ -7330,6 +7474,25 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
             .lines()
             .any(|line| line.contains("compat security static") && line.contains(" pass=1")),
         "Apple framework fixture did not complete static Security/keychain calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security-search static")
+                && line.contains(" null_next=")
+                && line.contains(" null_content=")
+                && line.contains(" add_null=")
+                && line.contains(" delete_null=")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not exercise static Security search/content/add/delete calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security-secitem static")
+                && line.contains(" bridge=1")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not bridge static guest CFDictionary SecItem queries into host Security; stdout:\n{stdout}"
     );
     assert!(
         stdout
@@ -7356,6 +7519,25 @@ fn compat_mode_proxies_corefoundation_and_security_imports() {
             .lines()
             .any(|line| line.contains("compat security dlsym") && line.contains(" pass=1")),
         "Apple framework fixture did not complete dlsym Security/keychain calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security-search dlsym")
+                && line.contains(" null_next=")
+                && line.contains(" null_content=")
+                && line.contains(" add_null=")
+                && line.contains(" delete_null=")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not exercise dlsym Security search/content/add/delete calls; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("compat security-secitem dlsym")
+                && line.contains(" bridge=1")
+                && line.contains(" pass=1")),
+        "Apple framework fixture did not bridge dlsym guest CFDictionary SecItem queries into host Security; stdout:\n{stdout}"
     );
     assert!(
         stdout

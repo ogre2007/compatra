@@ -143,10 +143,15 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "SecCertificateCopyData"
             | "SecPolicyCreateSSL"
             | "SecItemCopyMatching"
+            | "SecItemAdd"
+            | "SecItemDelete"
             | "SecKeychainCopyDefault"
             | "SecKeychainOpen"
             | "SecKeychainGetPath"
             | "SecKeychainFindGenericPassword"
+            | "SecKeychainSearchCreateFromAttributes"
+            | "SecKeychainSearchCopyNext"
+            | "SecKeychainItemCopyContent"
             | "SecKeychainItemFreeContent"
             | "SecTrustCreateWithCertificates"
             | "SecTrustEvaluateWithError"
@@ -340,10 +345,15 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_SecRandomCopyBytes",
     "_SecCopyErrorMessageString",
     "_SecItemCopyMatching",
+    "_SecItemAdd",
+    "_SecItemDelete",
     "_SecKeychainCopyDefault",
     "_SecKeychainOpen",
     "_SecKeychainGetPath",
     "_SecKeychainFindGenericPassword",
+    "_SecKeychainSearchCreateFromAttributes",
+    "_SecKeychainSearchCopyNext",
+    "_SecKeychainItemCopyContent",
     "_SecKeychainItemFreeContent",
     "_SCNetworkReachabilityCreateWithName",
     "_SCNetworkReachabilityGetFlags",
@@ -881,6 +891,245 @@ fn host_sec_keychain_find_generic_password(
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct GuestSecKeychainAttribute {
+    tag: u32,
+    data: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct HostSecKeychainAttribute {
+    tag: u32,
+    length: u32,
+    data: *const std::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct HostSecKeychainAttributeList {
+    count: u32,
+    attr: *const HostSecKeychainAttribute,
+}
+
+fn read_sec_keychain_attribute_list(
+    emu: &mut dyn Emulator,
+    list_ptr: u64,
+) -> Vec<GuestSecKeychainAttribute> {
+    const MAX_ATTRS: usize = 64;
+    const MAX_ATTR_DATA: usize = 64 * 1024;
+
+    if list_ptr == 0 {
+        return Vec::new();
+    }
+    let count = read_guest_u32(emu, list_ptr).unwrap_or(0) as usize;
+    let attr_ptr = read_guest_u64(emu, list_ptr + 8).unwrap_or(0);
+    if count == 0 || attr_ptr == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(count.min(MAX_ATTRS));
+    for index in 0..count.min(MAX_ATTRS) {
+        let base = attr_ptr + index as u64 * 16;
+        let Some(tag) = read_guest_u32(emu, base) else {
+            break;
+        };
+        let length = read_guest_u32(emu, base + 4).unwrap_or(0) as usize;
+        let data_ptr = read_guest_u64(emu, base + 8).unwrap_or(0);
+        let data = read_guest_bytes(emu, data_ptr, length, MAX_ATTR_DATA);
+        out.push(GuestSecKeychainAttribute { tag, data });
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_keychain_search_create_from_attributes(
+    keychain_or_array: u64,
+    item_class: u32,
+    attrs: &[GuestSecKeychainAttribute],
+) -> (i32, u64) {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainSearchCreateFromAttributes(
+            keychain_or_array: *mut std::ffi::c_void,
+            item_class: u32,
+            attr_list: *const std::ffi::c_void,
+            search_ref: *mut *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let host_attrs = attrs
+        .iter()
+        .map(|attr| HostSecKeychainAttribute {
+            tag: attr.tag,
+            length: attr.data.len().min(u32::MAX as usize) as u32,
+            data: if attr.data.is_empty() {
+                std::ptr::null()
+            } else {
+                attr.data.as_ptr() as *const std::ffi::c_void
+            },
+        })
+        .collect::<Vec<_>>();
+    let host_list = HostSecKeychainAttributeList {
+        count: host_attrs.len().min(u32::MAX as usize) as u32,
+        attr: host_attrs.as_ptr(),
+    };
+    let attr_list = if host_attrs.is_empty() {
+        std::ptr::null()
+    } else {
+        &host_list as *const HostSecKeychainAttributeList as *const std::ffi::c_void
+    };
+    let mut search_ref = std::ptr::null_mut();
+    let status = unsafe {
+        SecKeychainSearchCreateFromAttributes(
+            keychain_or_array as *mut std::ffi::c_void,
+            item_class,
+            attr_list,
+            &mut search_ref,
+        )
+    };
+    (status, search_ref as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_keychain_search_create_from_attributes(
+    _keychain_or_array: u64,
+    _item_class: u32,
+    _attrs: &[GuestSecKeychainAttribute],
+) -> (i32, u64) {
+    (-25300, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_keychain_search_copy_next(search_ref: u64) -> (i32, u64) {
+    if search_ref == 0 {
+        return (-50, 0);
+    }
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainSearchCopyNext(
+            search_ref: *mut std::ffi::c_void,
+            item_ref: *mut *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut item_ref = std::ptr::null_mut();
+    let status =
+        unsafe { SecKeychainSearchCopyNext(search_ref as *mut std::ffi::c_void, &mut item_ref) };
+    (status, item_ref as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_keychain_search_copy_next(_search_ref: u64) -> (i32, u64) {
+    (-25300, 0)
+}
+
+struct HostKeychainItemContentResult {
+    status: i32,
+    item_class: u32,
+    data: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_keychain_item_copy_content(item_ref: u64) -> HostKeychainItemContentResult {
+    if item_ref == 0 {
+        return HostKeychainItemContentResult {
+            status: -50,
+            item_class: 0,
+            data: Vec::new(),
+        };
+    }
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainItemCopyContent(
+            item_ref: *mut std::ffi::c_void,
+            item_class: *mut u32,
+            attr_list: *const std::ffi::c_void,
+            length: *mut u32,
+            out_data: *mut *mut std::ffi::c_void,
+        ) -> i32;
+        fn SecKeychainItemFreeContent(
+            attr_list: *const std::ffi::c_void,
+            data: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut item_class = 0u32;
+    let mut length = 0u32;
+    let mut out_data = std::ptr::null_mut();
+    let status = unsafe {
+        SecKeychainItemCopyContent(
+            item_ref as *mut std::ffi::c_void,
+            &mut item_class,
+            std::ptr::null(),
+            &mut length,
+            &mut out_data,
+        )
+    };
+    let data = if status == 0 && !out_data.is_null() && length <= 1024 * 1024 {
+        unsafe { std::slice::from_raw_parts(out_data as *const u8, length as usize) }.to_vec()
+    } else {
+        Vec::new()
+    };
+    if !out_data.is_null() {
+        let _ = unsafe { SecKeychainItemFreeContent(std::ptr::null(), out_data) };
+    }
+    HostKeychainItemContentResult {
+        status,
+        item_class,
+        data,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_keychain_item_copy_content(_item_ref: u64) -> HostKeychainItemContentResult {
+    HostKeychainItemContentResult {
+        status: -50,
+        item_class: 0,
+        data: Vec::new(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_item_add(query: u64) -> (i32, u64) {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecItemAdd(
+            attributes: *const std::ffi::c_void,
+            result: *mut *const std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut result = std::ptr::null();
+    let status = unsafe {
+        SecItemAdd(
+            query as *const std::ffi::c_void,
+            &mut result as *mut *const std::ffi::c_void,
+        )
+    };
+    (status, result as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_item_add(_query: u64) -> (i32, u64) {
+    (-50, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn host_sec_item_delete(query: u64) -> i32 {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecItemDelete(query: *const std::ffi::c_void) -> i32;
+    }
+
+    unsafe { SecItemDelete(query as *const std::ffi::c_void) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_sec_item_delete(_query: u64) -> i32 {
+    -50
+}
+
 #[cfg(target_os = "macos")]
 fn host_cf_release(cf: u64) {
     if cf == 0 {
@@ -1130,9 +1379,68 @@ fn host_cfdata_create_from_bytes(_bytes: &[u8]) -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn host_cfarray_create(values: &[u64]) -> Option<u64> {
+fn host_cfnumber_create_i64(value: i64) -> Option<u64> {
+    const K_CFNUMBER_SINT64_TYPE: isize = 4;
+
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
+        fn CFNumberCreate(
+            allocator: *const std::ffi::c_void,
+            the_type: isize,
+            value_ptr: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+    }
+    let number = unsafe {
+        CFNumberCreate(
+            std::ptr::null(),
+            K_CFNUMBER_SINT64_TYPE,
+            &value as *const i64 as *const std::ffi::c_void,
+        )
+    };
+    (!number.is_null()).then_some(number as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cfnumber_create_i64(_value: i64) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_cfboolean_value(value: bool) -> Option<u64> {
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFBooleanTrue: *const std::ffi::c_void;
+        static kCFBooleanFalse: *const std::ffi::c_void;
+    }
+    let boolean = unsafe {
+        if value {
+            kCFBooleanTrue
+        } else {
+            kCFBooleanFalse
+        }
+    };
+    (!boolean.is_null()).then_some(boolean as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cfboolean_value(_value: bool) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_cfarray_create(values: &[u64]) -> Option<u64> {
+    #[repr(C)]
+    struct HostCFArrayCallBacks {
+        version: isize,
+        retain: usize,
+        release: usize,
+        copy_description: usize,
+        equal: usize,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFTypeArrayCallBacks: HostCFArrayCallBacks;
         fn CFArrayCreate(
             allocator: *const std::ffi::c_void,
             values: *const *const std::ffi::c_void,
@@ -1149,7 +1457,7 @@ fn host_cfarray_create(values: &[u64]) -> Option<u64> {
             std::ptr::null(),
             host_values.as_ptr(),
             host_values.len() as isize,
-            std::ptr::null(),
+            &kCFTypeArrayCallBacks as *const HostCFArrayCallBacks as *const std::ffi::c_void,
         )
     };
     (!array.is_null()).then_some(array as u64)
@@ -1162,8 +1470,29 @@ fn host_cfarray_create(_values: &[u64]) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn host_cfdictionary_create(entries: &[(u64, u64)]) -> Option<u64> {
+    #[repr(C)]
+    struct HostCFDictionaryKeyCallBacks {
+        version: isize,
+        retain: usize,
+        release: usize,
+        copy_description: usize,
+        equal: usize,
+        hash: usize,
+    }
+
+    #[repr(C)]
+    struct HostCFDictionaryValueCallBacks {
+        version: isize,
+        retain: usize,
+        release: usize,
+        copy_description: usize,
+        equal: usize,
+    }
+
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: HostCFDictionaryKeyCallBacks;
+        static kCFTypeDictionaryValueCallBacks: HostCFDictionaryValueCallBacks;
         fn CFDictionaryCreate(
             allocator: *const std::ffi::c_void,
             keys: *const *const std::ffi::c_void,
@@ -1187,8 +1516,10 @@ fn host_cfdictionary_create(entries: &[(u64, u64)]) -> Option<u64> {
             keys.as_ptr(),
             values.as_ptr(),
             entries.len() as isize,
-            std::ptr::null(),
-            std::ptr::null(),
+            &kCFTypeDictionaryKeyCallBacks as *const HostCFDictionaryKeyCallBacks
+                as *const std::ffi::c_void,
+            &kCFTypeDictionaryValueCallBacks as *const HostCFDictionaryValueCallBacks
+                as *const std::ffi::c_void,
         )
     };
     (!dict.is_null()).then_some(dict as u64)
@@ -2249,6 +2580,113 @@ fn runtime_value_to_host_arg(runtime: &crate::macos::AppleRuntime, value: u64) -
     runtime.host_ptr_or_raw_unknown(value).unwrap_or(0)
 }
 
+struct HostBridgeValue {
+    ptr: u64,
+    owned: bool,
+}
+
+fn release_host_bridge_values(values: Vec<HostBridgeValue>) {
+    for value in values {
+        if value.owned {
+            host_cf_release(value.ptr);
+        }
+    }
+}
+
+fn bridge_runtime_value_for_retained_container(
+    runtime: &crate::macos::AppleRuntime,
+    value: u64,
+) -> Option<HostBridgeValue> {
+    if value == 0 {
+        return None;
+    }
+    if let Some(host_ptr) = runtime.host_ptr(value) {
+        return Some(HostBridgeValue {
+            ptr: host_ptr,
+            owned: false,
+        });
+    }
+
+    let type_id = runtime.type_id(value);
+    if type_id == runtime.string_type_id() {
+        let data = runtime.object_data(value)?;
+        return host_cfstring_create_from_bytes(&data)
+            .map(|ptr| HostBridgeValue { ptr, owned: true });
+    }
+    if type_id == runtime.data_type_id() {
+        let data = runtime.object_data(value)?;
+        return host_cfdata_create_from_bytes(&data)
+            .map(|ptr| HostBridgeValue { ptr, owned: true });
+    }
+    if type_id == runtime.number_type_id() {
+        let number = runtime.number_value(value)?;
+        return host_cfnumber_create_i64(number).map(|ptr| HostBridgeValue { ptr, owned: true });
+    }
+    if type_id == runtime.boolean_type_id() {
+        let boolean = runtime.boolean_value(value)?;
+        return host_cfboolean_value(boolean).map(|ptr| HostBridgeValue { ptr, owned: false });
+    }
+    if type_id == runtime.dictionary_type_id() {
+        return bridge_runtime_dictionary_to_host(runtime, value)
+            .map(|ptr| HostBridgeValue { ptr, owned: true });
+    }
+
+    runtime
+        .host_ptr_or_raw_unknown(value)
+        .map(|ptr| HostBridgeValue { ptr, owned: false })
+}
+
+fn bridge_runtime_dictionary_entries_to_host(
+    runtime: &crate::macos::AppleRuntime,
+    entries: &[(u64, u64)],
+) -> Option<u64> {
+    let mut bridged = Vec::with_capacity(entries.len() * 2);
+    let mut host_entries = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let key = bridge_runtime_value_for_retained_container(runtime, *key)?;
+        let value = bridge_runtime_value_for_retained_container(runtime, *value)?;
+        host_entries.push((key.ptr, value.ptr));
+        bridged.push(key);
+        bridged.push(value);
+    }
+    let host_dict = host_cfdictionary_create(&host_entries);
+    release_host_bridge_values(bridged);
+    host_dict
+}
+
+fn bridge_runtime_dictionary_to_host(
+    runtime: &crate::macos::AppleRuntime,
+    dict_ref: u64,
+) -> Option<u64> {
+    if let Some(host_ptr) = runtime.host_ptr(dict_ref) {
+        return Some(host_ptr);
+    }
+    let entries = runtime.dictionary_entries(dict_ref)?;
+    bridge_runtime_dictionary_entries_to_host(runtime, &entries)
+}
+
+fn bridge_runtime_dictionary_handle_to_host(
+    runtime: &crate::macos::AppleRuntime,
+    dict_ref: u64,
+) -> Option<HostBridgeValue> {
+    if dict_ref == 0 {
+        return None;
+    }
+    if let Some(host_ptr) = runtime.host_ptr(dict_ref) {
+        return Some(HostBridgeValue {
+            ptr: host_ptr,
+            owned: false,
+        });
+    }
+    if runtime.dictionary_entries(dict_ref).is_some() {
+        return bridge_runtime_dictionary_to_host(runtime, dict_ref)
+            .map(|ptr| HostBridgeValue { ptr, owned: true });
+    }
+    runtime
+        .host_ptr_or_raw_unknown(dict_ref)
+        .map(|ptr| HostBridgeValue { ptr, owned: false })
+}
+
 fn export_runtime_cstring(
     emu: &mut crate::UnicornEmulator,
     runtime: &mut crate::macos::AppleRuntime,
@@ -2581,20 +3019,7 @@ fn make_foundation_dictionary_result(
     runtime: &mut crate::macos::AppleRuntime,
     entries: Vec<(u64, u64)>,
 ) -> (u64, bool) {
-    let host_entries = entries
-        .iter()
-        .map(|(key, value)| {
-            (
-                runtime_value_to_host_arg(runtime, *key),
-                runtime_value_to_host_arg(runtime, *value),
-            )
-        })
-        .collect::<Vec<_>>();
-    let host_dict = host_entries
-        .iter()
-        .all(|(key, value)| *key != 0 && *value != 0)
-        .then(|| host_cfdictionary_create(&host_entries))
-        .flatten();
+    let host_dict = bridge_runtime_dictionary_entries_to_host(runtime, &entries);
     (
         runtime.alloc_dictionary_with_host(entries, host_dict),
         host_dict.is_some(),
@@ -5273,15 +5698,20 @@ fn dispatch_apple_import(
         "SecItemCopyMatching" => {
             let query_ref = emu.read_reg("x0").unwrap_or(0);
             let result_out = emu.read_reg("x1").unwrap_or(0);
-            let host_query = {
+            let query_bridge = {
                 let runtime = apple_runtime.lock().ok()?;
-                runtime.host_ptr_or_raw_unknown(query_ref).unwrap_or(0)
+                bridge_runtime_dictionary_handle_to_host(&runtime, query_ref)
             };
+            let host_query = query_bridge.as_ref().map(|bridge| bridge.ptr).unwrap_or(0);
+            let bridged_query = query_bridge.as_ref().is_some_and(|bridge| bridge.owned);
             let (status, host_result) = if host_query != 0 {
                 host_sec_item_copy_matching(host_query)
             } else {
                 (-50, 0)
             };
+            if let Some(HostBridgeValue { ptr, owned: true }) = query_bridge {
+                host_cf_release(ptr);
+            }
             let result_ref = if status == 0 && host_result != 0 {
                 let mut runtime = apple_runtime.lock().ok()?;
                 register_host_cf_value_with_ownership(
@@ -5302,8 +5732,8 @@ fn dispatch_apple_import(
             record_arm64_import(
                 tracker,
                 format!(
-                    "_SecItemCopyMatching(query=0x{:X}, host=0x{:X}, out=0x{:X}) -> {} result=0x{:X}",
-                    query_ref, host_query, result_out, status, result_ref
+                    "_SecItemCopyMatching(query=0x{:X}, host=0x{:X}, bridged={}, out=0x{:X}) -> {} result=0x{:X}",
+                    query_ref, host_query, bridged_query, result_out, status, result_ref
                 ),
             );
             emit_arm64_event(
@@ -5314,6 +5744,95 @@ fn dispatch_apple_import(
                     .arg("ResultOut", format!("0x{:X}", result_out))
                     .arg("Result", status.to_string())
                     .arg("Item", format!("0x{:X}", result_ref))
+                    .arg("GuestQueryBridge", bridged_query.to_string())
+                    .arg("HostProxy", (host_query != 0).to_string()),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecItemAdd" => {
+            let query_ref = emu.read_reg("x0").unwrap_or(0);
+            let result_out = emu.read_reg("x1").unwrap_or(0);
+            let query_bridge = {
+                let runtime = apple_runtime.lock().ok()?;
+                bridge_runtime_dictionary_handle_to_host(&runtime, query_ref)
+            };
+            let host_query = query_bridge.as_ref().map(|bridge| bridge.ptr).unwrap_or(0);
+            let bridged_query = query_bridge.as_ref().is_some_and(|bridge| bridge.owned);
+            let (status, host_result) = if host_query != 0 {
+                host_sec_item_add(host_query)
+            } else {
+                (-50, 0)
+            };
+            if let Some(HostBridgeValue { ptr, owned: true }) = query_bridge {
+                host_cf_release(ptr);
+            }
+            let result_ref = if status == 0 && host_result != 0 {
+                let mut runtime = apple_runtime.lock().ok()?;
+                register_host_cf_value_with_ownership(
+                    &mut runtime,
+                    host_result,
+                    "SecItemAddResult",
+                    true,
+                )
+            } else {
+                if host_result != 0 {
+                    host_cf_release(host_result);
+                }
+                0
+            };
+            if result_out != 0 {
+                let _ = write_guest_u64(emu, result_out, result_ref);
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecItemAdd(query=0x{:X}, host=0x{:X}, bridged={}, out=0x{:X}) -> {} result=0x{:X}",
+                    query_ref, host_query, bridged_query, result_out, status, result_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "secitem", "SecItemAdd")
+                    .arg("Query", format!("0x{:X}", query_ref))
+                    .arg("HostQuery", format!("0x{:X}", host_query))
+                    .arg("ResultOut", format!("0x{:X}", result_out))
+                    .arg("Result", status.to_string())
+                    .arg("Item", format!("0x{:X}", result_ref))
+                    .arg("GuestQueryBridge", bridged_query.to_string())
+                    .arg("HostProxy", (host_query != 0).to_string()),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecItemDelete" => {
+            let query_ref = emu.read_reg("x0").unwrap_or(0);
+            let query_bridge = {
+                let runtime = apple_runtime.lock().ok()?;
+                bridge_runtime_dictionary_handle_to_host(&runtime, query_ref)
+            };
+            let host_query = query_bridge.as_ref().map(|bridge| bridge.ptr).unwrap_or(0);
+            let bridged_query = query_bridge.as_ref().is_some_and(|bridge| bridge.owned);
+            let status = if host_query != 0 {
+                host_sec_item_delete(host_query)
+            } else {
+                -50
+            };
+            if let Some(HostBridgeValue { ptr, owned: true }) = query_bridge {
+                host_cf_release(ptr);
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecItemDelete(query=0x{:X}, host=0x{:X}, bridged={}) -> {}",
+                    query_ref, host_query, bridged_query, status
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "secitem", "SecItemDelete")
+                    .arg("Query", format!("0x{:X}", query_ref))
+                    .arg("HostQuery", format!("0x{:X}", host_query))
+                    .arg("Result", status.to_string())
+                    .arg("GuestQueryBridge", bridged_query.to_string())
                     .arg("HostProxy", (host_query != 0).to_string()),
             );
             Some(status as i64 as u64)
@@ -5481,6 +6000,171 @@ fn dispatch_apple_import(
                     .arg("Item", format!("0x{:X}", item_ref))
                     .arg("Result", result.status.to_string())
                     .arg("HostProxy", "true"),
+            );
+            Some(result.status as i64 as u64)
+        }
+        "SecKeychainSearchCreateFromAttributes" => {
+            let keychain_ref = emu.read_reg("x0").unwrap_or(0);
+            let item_class = emu.read_reg("x1").unwrap_or(0) as u32;
+            let attr_list = emu.read_reg("x2").unwrap_or(0);
+            let search_out = emu.read_reg("x3").unwrap_or(0);
+            let attrs = read_sec_keychain_attribute_list(emu, attr_list);
+            let host_keychain = if keychain_ref == 0 {
+                0
+            } else {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(keychain_ref).unwrap_or(0)
+            };
+            let (status, host_search) = if keychain_ref == 0 || host_keychain != 0 {
+                host_sec_keychain_search_create_from_attributes(host_keychain, item_class, &attrs)
+            } else {
+                (-50, 0)
+            };
+            let search_ref = if status == 0 && host_search != 0 {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.register_host_opaque("SecKeychainSearch", host_search)
+            } else {
+                0
+            };
+            if search_out != 0 {
+                let _ = write_guest_u64(emu, search_out, search_ref);
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainSearchCreateFromAttributes(keychain=0x{:X}, host=0x{:X}, class=0x{:X}, attrs={}, out=0x{:X}) -> {} search=0x{:X}",
+                    keychain_ref,
+                    host_keychain,
+                    item_class,
+                    attrs.len(),
+                    search_out,
+                    status,
+                    search_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(
+                    metadata,
+                    "seckeychain",
+                    "SecKeychainSearchCreateFromAttributes",
+                )
+                .arg("Keychain", format!("0x{:X}", keychain_ref))
+                .arg("HostKeychain", format!("0x{:X}", host_keychain))
+                .arg("ItemClass", format!("0x{:X}", item_class))
+                .arg("AttributeCount", attrs.len().to_string())
+                .arg("Out", format!("0x{:X}", search_out))
+                .arg("Result", status.to_string())
+                .arg("Search", format!("0x{:X}", search_ref))
+                .arg(
+                    "HostProxy",
+                    (keychain_ref == 0 || host_keychain != 0).to_string(),
+                ),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecKeychainSearchCopyNext" => {
+            let search_ref = emu.read_reg("x0").unwrap_or(0);
+            let item_out = emu.read_reg("x1").unwrap_or(0);
+            let host_search = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(search_ref).unwrap_or(0)
+            };
+            let (status, host_item) = if host_search != 0 {
+                host_sec_keychain_search_copy_next(host_search)
+            } else {
+                (-50, 0)
+            };
+            let item_ref = if status == 0 && host_item != 0 {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.register_host_opaque("SecKeychainItem", host_item)
+            } else {
+                0
+            };
+            if item_out != 0 {
+                let _ = write_guest_u64(emu, item_out, item_ref);
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainSearchCopyNext(search=0x{:X}, host=0x{:X}, out=0x{:X}) -> {} item=0x{:X}",
+                    search_ref, host_search, item_out, status, item_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "seckeychain", "SecKeychainSearchCopyNext")
+                    .arg("Search", format!("0x{:X}", search_ref))
+                    .arg("HostSearch", format!("0x{:X}", host_search))
+                    .arg("ItemOut", format!("0x{:X}", item_out))
+                    .arg("Result", status.to_string())
+                    .arg("Item", format!("0x{:X}", item_ref))
+                    .arg("HostProxy", (host_search != 0).to_string()),
+            );
+            Some(status as i64 as u64)
+        }
+        "SecKeychainItemCopyContent" => {
+            let item_ref = emu.read_reg("x0").unwrap_or(0);
+            let item_class_out = emu.read_reg("x1").unwrap_or(0);
+            let attr_list = emu.read_reg("x2").unwrap_or(0);
+            let length_out = emu.read_reg("x3").unwrap_or(0);
+            let data_out = emu.read_reg("x4").unwrap_or(0);
+            let requested_attrs = read_guest_u32(emu, attr_list).unwrap_or(0);
+            let host_item = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(item_ref).unwrap_or(0)
+            };
+            let result = if host_item != 0 {
+                host_sec_keychain_item_copy_content(host_item)
+            } else {
+                HostKeychainItemContentResult {
+                    status: -50,
+                    item_class: 0,
+                    data: Vec::new(),
+                }
+            };
+            let data_ptr = if result.status == 0 && !result.data.is_empty() {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.export_bytes(emu, &result.data).unwrap_or(0)
+            } else {
+                0
+            };
+            if result.status == 0 {
+                let _ = write_guest_u32(emu, item_class_out, result.item_class);
+                let _ = write_guest_u32(emu, length_out, result.data.len() as u32);
+                if data_out != 0 {
+                    let _ = write_guest_u64(emu, data_out, data_ptr);
+                }
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_SecKeychainItemCopyContent(item=0x{:X}, host=0x{:X}, attrs={}, len_out=0x{:X}, data_out=0x{:X}) -> {} class=0x{:X} len={} data=0x{:X}",
+                    item_ref,
+                    host_item,
+                    requested_attrs,
+                    length_out,
+                    data_out,
+                    result.status,
+                    result.item_class,
+                    result.data.len(),
+                    data_ptr
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "seckeychain", "SecKeychainItemCopyContent")
+                    .arg("Item", format!("0x{:X}", item_ref))
+                    .arg("HostItem", format!("0x{:X}", host_item))
+                    .arg("RequestedAttributes", requested_attrs.to_string())
+                    .arg("ItemClassOut", format!("0x{:X}", item_class_out))
+                    .arg("LengthOut", format!("0x{:X}", length_out))
+                    .arg("DataOut", format!("0x{:X}", data_out))
+                    .arg("Result", result.status.to_string())
+                    .arg("ItemClass", format!("0x{:X}", result.item_class))
+                    .arg("DataLen", result.data.len().to_string())
+                    .arg("GuestData", format!("0x{:X}", data_ptr))
+                    .arg("HostProxy", (host_item != 0).to_string()),
             );
             Some(result.status as i64 as u64)
         }
@@ -8348,10 +9032,15 @@ mod tests {
     fn security_keychain_imports_use_direct_dispatch_hooks() {
         for symbol in [
             "_SecItemCopyMatching",
+            "_SecItemAdd",
+            "_SecItemDelete",
             "_SecKeychainCopyDefault",
             "_SecKeychainOpen",
             "_SecKeychainGetPath",
             "_SecKeychainFindGenericPassword",
+            "_SecKeychainSearchCreateFromAttributes",
+            "_SecKeychainSearchCopyNext",
+            "_SecKeychainItemCopyContent",
             "_SecKeychainItemFreeContent",
         ] {
             assert!(
