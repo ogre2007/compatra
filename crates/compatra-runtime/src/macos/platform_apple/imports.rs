@@ -1,6 +1,6 @@
 //! Synthetic Apple framework imports used by the current macOS userland runner.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,9 +39,26 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "CFArrayCreateMutable"
             | "CFArrayCreate"
             | "CFArrayAppendValue"
+            | "CFArrayInsertValueAtIndex"
+            | "CFArraySetValueAtIndex"
+            | "CFArrayRemoveValueAtIndex"
+            | "CFArrayRemoveAllValues"
+            | "CFArrayContainsValue"
             | "CFArrayGetCount"
             | "CFArrayGetValueAtIndex"
             | "CFArrayGetTypeID"
+            | "CFSetCreate"
+            | "CFSetCreateMutable"
+            | "CFSetAddValue"
+            | "CFSetSetValue"
+            | "CFSetReplaceValue"
+            | "CFSetRemoveValue"
+            | "CFSetRemoveAllValues"
+            | "CFSetContainsValue"
+            | "CFSetGetCount"
+            | "CFSetGetValue"
+            | "CFSetGetValueIfPresent"
+            | "CFSetGetTypeID"
             | "CFDictionaryCreate"
             | "CFDictionaryCreateMutable"
             | "CFDictionarySetValue"
@@ -63,7 +80,9 @@ pub fn is_apple_import_symbol(symbol: &str) -> bool {
             | "CFBooleanGetTypeID"
             | "CFBooleanGetValue"
             | "CFURLCreateWithFileSystemPath"
+            | "CFURLCreateWithString"
             | "CFURLCopyFileSystemPath"
+            | "CFURLGetString"
             | "CFBundleGetMainBundle"
             | "CFBundleCopyBundleURL"
             | "CFRunLoopGetCurrent"
@@ -255,6 +274,16 @@ const K_CFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const K_CFURL_POSIX_PATH_STYLE: u64 = 0;
 
 const APPLE_CFSTRING_DATA_SYMBOLS: &[(&str, &[u8])] = &[
+    ("_kCFRunLoopDefaultMode", b"kCFRunLoopDefaultMode"),
+    ("_kCFRunLoopCommonModes", b"kCFRunLoopCommonModes"),
+    ("_kCFBundleExecutableKey", b"CFBundleExecutable"),
+    ("_kCFBundleIdentifierKey", b"CFBundleIdentifier"),
+    ("_kCFBundleNameKey", b"CFBundleName"),
+    ("_kCFBundleVersionKey", b"CFBundleVersion"),
+    (
+        "_kCFBundleShortVersionStringKey",
+        b"CFBundleShortVersionString",
+    ),
     ("_kSecClass", b"class"),
     ("_kSecClassGenericPassword", b"genp"),
     ("_kSecClassInternetPassword", b"inet"),
@@ -293,29 +322,59 @@ const APPLE_CFSTRING_DATA_SYMBOLS: &[(&str, &[u8])] = &[
     ),
 ];
 
-#[cfg(target_os = "macos")]
-fn host_security_cfstring_data_symbol(symbol: &str) -> Option<u64> {
+fn is_host_cfstring_data_symbol_candidate(symbol: &str) -> bool {
     let name = normalized_apple_symbol(symbol);
-    if !name.starts_with("kSec") {
+    if name.starts_with("kSec") {
+        return true;
+    }
+    if name.starts_with("kCF") {
+        return name.starts_with("kCFStreamProperty")
+            || name.ends_with("Mode")
+            || name.ends_with("Modes")
+            || name.ends_with("Key")
+            || name.ends_with("Name")
+            || name.ends_with("Identifier")
+            || name.ends_with("Notification")
+            || name.ends_with("Property");
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn host_apple_cfstring_data_symbol(symbol: &str) -> Option<u64> {
+    let name = normalized_apple_symbol(symbol);
+    if !is_host_cfstring_data_symbol_candidate(name) {
         return None;
     }
-    let framework =
-        std::ffi::CString::new("/System/Library/Frameworks/Security.framework/Security").ok()?;
     let symbol_name = std::ffi::CString::new(name).ok()?;
-    let handle = unsafe { libc::dlopen(framework.as_ptr(), libc::RTLD_NOW) };
-    if handle.is_null() {
-        return None;
+    let frameworks: &[&str] = if name.starts_with("kSec") {
+        &["/System/Library/Frameworks/Security.framework/Security"]
+    } else {
+        &["/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"]
+    };
+    let string_type = host_cf_type_ids().0;
+    for framework in frameworks {
+        let Ok(framework) = std::ffi::CString::new(*framework) else {
+            continue;
+        };
+        let handle = unsafe { libc::dlopen(framework.as_ptr(), libc::RTLD_NOW) };
+        if handle.is_null() {
+            continue;
+        }
+        let symbol_slot = unsafe { libc::dlsym(handle, symbol_name.as_ptr()) };
+        if symbol_slot.is_null() {
+            continue;
+        }
+        let cfstring_ref = unsafe { *(symbol_slot as *const usize) };
+        if cfstring_ref != 0 && host_cf_get_type_id(cfstring_ref as u64) == Some(string_type) {
+            return Some(cfstring_ref as u64);
+        }
     }
-    let symbol_slot = unsafe { libc::dlsym(handle, symbol_name.as_ptr()) };
-    if symbol_slot.is_null() {
-        return None;
-    }
-    let cfstring_ref = unsafe { *(symbol_slot as *const usize) };
-    (cfstring_ref != 0).then_some(cfstring_ref as u64)
+    None
 }
 
 #[cfg(not(target_os = "macos"))]
-fn host_security_cfstring_data_symbol(_symbol: &str) -> Option<u64> {
+fn host_apple_cfstring_data_symbol(_symbol: &str) -> Option<u64> {
     None
 }
 
@@ -329,6 +388,23 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_CFStringCompare",
     "_CFDataGetTypeID",
     "_CFArrayGetTypeID",
+    "_CFArrayInsertValueAtIndex",
+    "_CFArraySetValueAtIndex",
+    "_CFArrayRemoveValueAtIndex",
+    "_CFArrayRemoveAllValues",
+    "_CFArrayContainsValue",
+    "_CFSetCreate",
+    "_CFSetCreateMutable",
+    "_CFSetAddValue",
+    "_CFSetSetValue",
+    "_CFSetReplaceValue",
+    "_CFSetRemoveValue",
+    "_CFSetRemoveAllValues",
+    "_CFSetContainsValue",
+    "_CFSetGetCount",
+    "_CFSetGetValue",
+    "_CFSetGetValueIfPresent",
+    "_CFSetGetTypeID",
     "_CFDictionaryGetTypeID",
     "_CFDictionaryCreateMutable",
     "_CFDictionarySetValue",
@@ -341,7 +417,9 @@ const APPLE_DIRECT_DISPATCH_IMPORTS: &[&str] = &[
     "_CFBooleanGetTypeID",
     "_CFBooleanGetValue",
     "_CFURLCreateWithFileSystemPath",
+    "_CFURLCreateWithString",
     "_CFURLCopyFileSystemPath",
+    "_CFURLGetString",
     "_CFBundleGetMainBundle",
     "_CFBundleCopyBundleURL",
     "_CFRunLoopGetCurrent",
@@ -442,24 +520,44 @@ pub fn install_apple_data_symbols(
     emulator: &mut UnicornEmulator,
     apple_runtime: &Arc<Mutex<crate::macos::AppleRuntime>>,
     heap_cursor: &mut u64,
+    imported_symbols: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
     let mut data_symbols = HashMap::new();
     *heap_cursor = align_up(*heap_cursor, 8);
     let mut runtime = apple_runtime
         .lock()
         .map_err(|_| "apple runtime lock poisoned while installing data symbols")?;
+    let mut symbols = Vec::new();
+    let mut seen = HashSet::new();
     for (symbol, value) in APPLE_CFSTRING_DATA_SYMBOLS {
-        let cfstring_ref = host_security_cfstring_data_symbol(symbol)
-            .map(|host_ref| runtime.register_host_objc_object("NSString", host_ref))
-            .unwrap_or_else(|| {
-                runtime.alloc_string(value.to_vec(), K_CFSTRING_ENCODING_UTF8 as u64)
-            });
+        if seen.insert(crate::macos::imports::normalize_import_symbol(
+            (*symbol).to_string(),
+        )) {
+            symbols.push(((*symbol).to_string(), Some(*value)));
+        }
+    }
+    for symbol in imported_symbols {
+        let symbol = symbol.as_ref();
+        if !is_host_cfstring_data_symbol_candidate(symbol) {
+            continue;
+        }
+        let normalized = crate::macos::imports::normalize_import_symbol(symbol.to_string());
+        if seen.insert(normalized) {
+            symbols.push((symbol.to_string(), None));
+        }
+    }
+
+    for (symbol, fallback) in symbols {
+        let cfstring_ref = match host_apple_cfstring_data_symbol(&symbol) {
+            Some(host_ref) => runtime.register_host_objc_object("NSString", host_ref),
+            None if fallback.is_some() => {
+                runtime.alloc_string(fallback.unwrap().to_vec(), K_CFSTRING_ENCODING_UTF8 as u64)
+            }
+            None => continue,
+        };
         let slot = alloc_bytes(emulator, heap_cursor, &cfstring_ref.to_le_bytes())?;
-        data_symbols.insert((*symbol).to_string(), slot);
-        data_symbols.insert(
-            crate::macos::imports::normalize_import_symbol((*symbol).to_string()),
-            slot,
-        );
+        data_symbols.insert(symbol.clone(), slot);
+        data_symbols.insert(crate::macos::imports::normalize_import_symbol(symbol), slot);
     }
     Ok(data_symbols)
 }
@@ -1379,7 +1477,7 @@ fn host_cfurl_copy_file_system_path(url: u64, path_style: u64) -> Option<Vec<u8>
 }
 
 #[cfg(target_os = "macos")]
-fn host_cfurl_create_with_string(url: &[u8]) -> Option<u64> {
+fn host_cfurl_create_with_string(url: &[u8], base_url: u64) -> Option<u64> {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFURLCreateWithString(
@@ -1393,7 +1491,7 @@ fn host_cfurl_create_with_string(url: &[u8]) -> Option<u64> {
         CFURLCreateWithString(
             std::ptr::null(),
             cf_url_string as *const std::ffi::c_void,
-            std::ptr::null(),
+            base_url as *const std::ffi::c_void,
         )
     };
     host_cf_release(cf_url_string);
@@ -1401,7 +1499,29 @@ fn host_cfurl_create_with_string(url: &[u8]) -> Option<u64> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn host_cfurl_create_with_string(_url: &[u8]) -> Option<u64> {
+fn host_cfurl_create_with_string(_url: &[u8], _base_url: u64) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_cfurl_get_string(url: u64) -> Option<Vec<u8>> {
+    if url == 0 {
+        return None;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFURLGetString(an_url: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    }
+
+    let cf_string = unsafe { CFURLGetString(url as *const std::ffi::c_void) };
+    if cf_string.is_null() {
+        return None;
+    }
+    host_cfstring_to_bytes(cf_string as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_cfurl_get_string(_url: u64) -> Option<Vec<u8>> {
     None
 }
 
@@ -4169,7 +4289,7 @@ fn dispatch_foundation_msg_send_shim(
                 let runtime = apple_runtime.lock().ok()?;
                 runtime_object_data_or_host_foundation(&runtime, url_ref).unwrap_or_default()
             };
-            let host_url = host_cfurl_create_with_string(&url);
+            let host_url = host_cfurl_create_with_string(&url, 0);
             let result = {
                 let mut runtime = apple_runtime.lock().ok()?;
                 runtime.alloc_url(url.clone(), host_url)
@@ -5107,6 +5227,40 @@ fn dispatch_apple_import(
             );
             Some(url_ref)
         }
+        "CFURLCreateWithString" => {
+            let string_ref = emu.read_reg("x1").unwrap_or(0);
+            let base_ref = emu.read_reg("x2").unwrap_or(0);
+            let url = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime_object_data_or_host_cfstring(&runtime, string_ref)?
+            };
+            let base_host = {
+                let runtime = apple_runtime.lock().ok()?;
+                runtime.host_ptr_or_raw_unknown(base_ref).unwrap_or(0)
+            };
+            let host_ptr = host_cfurl_create_with_string(&url, base_host);
+            let url_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_url(url.clone(), host_ptr)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFURLCreateWithString(string=0x{:X}, base=0x{:X}) -> 0x{:X}",
+                    string_ref, base_ref, url_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfurl", "CFURLCreateWithString")
+                    .arg("String", format!("0x{:X}", string_ref))
+                    .arg("Base", format!("0x{:X}", base_ref))
+                    .arg("Result", format!("0x{:X}", url_ref))
+                    .arg("HostProxy", host_ptr.is_some().to_string())
+                    .arg("Preview", lossy_data_preview(&url, 128)),
+            );
+            Some(url_ref)
+        }
         "CFURLCopyFileSystemPath" => {
             let url_ref = emu.read_reg("x0").unwrap_or(0);
             let path_style = emu.read_reg("x1").unwrap_or(K_CFURL_POSIX_PATH_STYLE);
@@ -5139,6 +5293,36 @@ fn dispatch_apple_import(
                     .arg("PathStyle", path_style.to_string())
                     .arg("Result", format!("0x{:X}", string_ref))
                     .arg("Preview", lossy_data_preview(&path, 128)),
+            );
+            Some(string_ref)
+        }
+        "CFURLGetString" => {
+            let url_ref = emu.read_reg("x0").unwrap_or(0);
+            let (host_ptr, fallback_string) = {
+                let runtime = apple_runtime.lock().ok()?;
+                (
+                    runtime.host_ptr_or_raw_unknown(url_ref),
+                    runtime.url_path(url_ref),
+                )
+            };
+            let string = host_ptr
+                .and_then(host_cfurl_get_string)
+                .or(fallback_string)
+                .unwrap_or_default();
+            let string_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_string(string.clone(), K_CFSTRING_ENCODING_UTF8 as u64)
+            };
+            record_arm64_import(
+                tracker,
+                format!("_CFURLGetString(url=0x{:X}) -> 0x{:X}", url_ref, string_ref),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfurl", "CFURLGetString")
+                    .arg("Url", format!("0x{:X}", url_ref))
+                    .arg("Result", format!("0x{:X}", string_ref))
+                    .arg("Preview", lossy_data_preview(&string, 128)),
             );
             Some(string_ref)
         }
@@ -5338,6 +5522,125 @@ fn dispatch_apple_import(
             );
             Some(0)
         }
+        "CFArrayInsertValueAtIndex" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let index = emu.read_reg("x1").unwrap_or(0) as usize;
+            let value_ref = emu.read_reg("x2").unwrap_or(0);
+            let ok = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.array_insert(array_ref, index, value_ref)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFArrayInsertValueAtIndex(array=0x{:X}, index={}, value=0x{:X}) ok={}",
+                    array_ref, index, value_ref, ok
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfarray", "CFArrayInsertValueAtIndex")
+                    .arg("Array", format!("0x{:X}", array_ref))
+                    .arg("Index", index.to_string())
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFArraySetValueAtIndex" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let index = emu.read_reg("x1").unwrap_or(0) as usize;
+            let value_ref = emu.read_reg("x2").unwrap_or(0);
+            let ok = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.array_set(array_ref, index, value_ref)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFArraySetValueAtIndex(array=0x{:X}, index={}, value=0x{:X}) ok={}",
+                    array_ref, index, value_ref, ok
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfarray", "CFArraySetValueAtIndex")
+                    .arg("Array", format!("0x{:X}", array_ref))
+                    .arg("Index", index.to_string())
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFArrayRemoveValueAtIndex" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let index = emu.read_reg("x1").unwrap_or(0) as usize;
+            let ok = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.array_remove(array_ref, index)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFArrayRemoveValueAtIndex(array=0x{:X}, index={}) ok={}",
+                    array_ref, index, ok
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfarray", "CFArrayRemoveValueAtIndex")
+                    .arg("Array", format!("0x{:X}", array_ref))
+                    .arg("Index", index.to_string())
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFArrayRemoveAllValues" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let ok = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.array_remove_all(array_ref)
+            };
+            record_arm64_import(
+                tracker,
+                format!("_CFArrayRemoveAllValues(array=0x{:X}) ok={}", array_ref, ok),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfarray", "CFArrayRemoveAllValues")
+                    .arg("Array", format!("0x{:X}", array_ref))
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFArrayContainsValue" => {
+            let array_ref = emu.read_reg("x0").unwrap_or(0);
+            let location = emu.read_reg("x1").unwrap_or(0) as usize;
+            let length = emu.read_reg("x2").unwrap_or(0) as usize;
+            let value_ref = emu.read_reg("x3").unwrap_or(0);
+            let contains = apple_runtime
+                .lock()
+                .ok()?
+                .array_contains(array_ref, location, length, value_ref)
+                .unwrap_or(false);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFArrayContainsValue(array=0x{:X}, location={}, length={}, value=0x{:X}) -> {}",
+                    array_ref, location, length, value_ref, contains
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfarray", "CFArrayContainsValue")
+                    .arg("Array", format!("0x{:X}", array_ref))
+                    .arg("Location", location.to_string())
+                    .arg("Length", length.to_string())
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Result", contains.to_string()),
+            );
+            Some(contains as u64)
+        }
         "CFArrayGetCount" => {
             let array_ref = emu.read_reg("x0").unwrap_or(0);
             let count = apple_runtime.lock().ok()?.array_len(array_ref).unwrap_or(0) as u64;
@@ -5367,6 +5670,270 @@ fn dispatch_apple_import(
         "CFArrayGetTypeID" => {
             let type_id = apple_runtime.lock().ok()?.array_type_id();
             record_arm64_import(tracker, format!("_CFArrayGetTypeID() -> 0x{:X}", type_id));
+            Some(type_id)
+        }
+        "CFSetCreate" => {
+            let values_ptr = emu.read_reg("x1").unwrap_or(0);
+            let count = emu.read_reg("x2").unwrap_or(0) as usize;
+            let values = read_guest_u64_array(emu, values_ptr, count, 4096);
+            let set_ref = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                runtime.alloc_set_with_values(values)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetCreate(values=0x{:X}, count={}) -> 0x{:X}",
+                    values_ptr, count, set_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetCreate")
+                    .arg("Values", format!("0x{:X}", values_ptr))
+                    .arg("Count", count.to_string())
+                    .arg("Result", format!("0x{:X}", set_ref)),
+            );
+            Some(set_ref)
+        }
+        "CFSetCreateMutable" => {
+            let capacity = emu.read_reg("x1").unwrap_or(0);
+            let set_ref = apple_runtime.lock().ok()?.alloc_set();
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetCreateMutable(capacity={}) -> 0x{:X}",
+                    capacity, set_ref
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetCreateMutable")
+                    .arg("Capacity", capacity.to_string())
+                    .arg("Result", format!("0x{:X}", set_ref)),
+            );
+            Some(set_ref)
+        }
+        "CFSetAddValue" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let (ok, preview) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let preview = runtime_object_data_or_host_foundation(&runtime, value_ref)
+                    .map(|data| lossy_data_preview(&data, 128))
+                    .unwrap_or_default();
+                (runtime.set_add(set_ref, value_ref), preview)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetAddValue(set=0x{:X}, value=0x{:X}) ok={}",
+                    set_ref, value_ref, ok
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetAddValue")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Preview", preview)
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFSetSetValue" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let (ok, preview) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let preview = runtime_object_data_or_host_foundation(&runtime, value_ref)
+                    .map(|data| lossy_data_preview(&data, 128))
+                    .unwrap_or_default();
+                (runtime.set_set(set_ref, value_ref), preview)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetSetValue(set=0x{:X}, value=0x{:X}) ok={}",
+                    set_ref, value_ref, ok
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetSetValue")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Preview", preview)
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFSetReplaceValue" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let (ok, preview) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let preview = runtime_object_data_or_host_foundation(&runtime, value_ref)
+                    .map(|data| lossy_data_preview(&data, 128))
+                    .unwrap_or_default();
+                (runtime.set_replace(set_ref, value_ref), preview)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetReplaceValue(set=0x{:X}, value=0x{:X}) ok={}",
+                    set_ref, value_ref, ok
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetReplaceValue")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Preview", preview)
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFSetRemoveValue" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let (ok, preview) = {
+                let mut runtime = apple_runtime.lock().ok()?;
+                let preview = runtime_object_data_or_host_foundation(&runtime, value_ref)
+                    .map(|data| lossy_data_preview(&data, 128))
+                    .unwrap_or_default();
+                (runtime.set_remove(set_ref, value_ref), preview)
+            };
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetRemoveValue(set=0x{:X}, value=0x{:X}) ok={}",
+                    set_ref, value_ref, ok
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetRemoveValue")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Preview", preview)
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFSetRemoveAllValues" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let ok = apple_runtime.lock().ok()?.set_remove_all(set_ref);
+            record_arm64_import(
+                tracker,
+                format!("_CFSetRemoveAllValues(set=0x{:X}) ok={}", set_ref, ok),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetRemoveAllValues")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Result", ok.to_string()),
+            );
+            Some(0)
+        }
+        "CFSetContainsValue" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let contains = apple_runtime
+                .lock()
+                .ok()?
+                .set_contains(set_ref, value_ref)
+                .unwrap_or(false);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetContainsValue(set=0x{:X}, value=0x{:X}) -> {}",
+                    set_ref, value_ref, contains
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetContainsValue")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Result", contains.to_string()),
+            );
+            Some(contains as u64)
+        }
+        "CFSetGetCount" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let count = apple_runtime.lock().ok()?.set_len(set_ref).unwrap_or(0) as u64;
+            record_arm64_import(
+                tracker,
+                format!("_CFSetGetCount(set=0x{:X}) -> {}", set_ref, count),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetGetCount")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Result", count.to_string()),
+            );
+            Some(count)
+        }
+        "CFSetGetValue" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let stored = apple_runtime
+                .lock()
+                .ok()?
+                .set_get(set_ref, value_ref)
+                .unwrap_or(0);
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetGetValue(set=0x{:X}, value=0x{:X}) -> 0x{:X}",
+                    set_ref, value_ref, stored
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetGetValue")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Result", format!("0x{:X}", stored)),
+            );
+            Some(stored)
+        }
+        "CFSetGetValueIfPresent" => {
+            let set_ref = emu.read_reg("x0").unwrap_or(0);
+            let value_ref = emu.read_reg("x1").unwrap_or(0);
+            let out_ptr = emu.read_reg("x2").unwrap_or(0);
+            let stored = apple_runtime
+                .lock()
+                .ok()?
+                .set_get(set_ref, value_ref)
+                .unwrap_or(0);
+            let present = stored != 0;
+            if present && out_ptr != 0 {
+                let _ = emu.write_memory(out_ptr, &stored.to_le_bytes());
+            }
+            record_arm64_import(
+                tracker,
+                format!(
+                    "_CFSetGetValueIfPresent(set=0x{:X}, value=0x{:X}, out=0x{:X}) -> {}",
+                    set_ref, value_ref, out_ptr, present as u64
+                ),
+            );
+            emit_arm64_event(
+                trace,
+                process_event(metadata, "cfset", "CFSetGetValueIfPresent")
+                    .arg("Set", format!("0x{:X}", set_ref))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Out", format!("0x{:X}", out_ptr))
+                    .arg("Stored", format!("0x{:X}", stored))
+                    .arg("Result", present.to_string()),
+            );
+            Some(present as u64)
+        }
+        "CFSetGetTypeID" => {
+            let type_id = apple_runtime.lock().ok()?.set_type_id();
+            record_arm64_import(tracker, format!("_CFSetGetTypeID() -> 0x{:X}", type_id));
             Some(type_id)
         }
         "CFDictionaryCreate" => {
@@ -9138,6 +9705,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apple_cfstring_data_symbol_candidates_are_narrow() {
+        for symbol in [
+            "_kSecClass",
+            "_kSecValueData",
+            "_kCFRunLoopDefaultMode",
+            "_kCFRunLoopCommonModes",
+            "_kCFBundleExecutableKey",
+            "_kCFStreamPropertyHTTPProxyHost",
+        ] {
+            assert!(
+                is_host_cfstring_data_symbol_candidate(symbol),
+                "{symbol} should be eligible for host-backed CFString data resolution"
+            );
+        }
+
+        for symbol in [
+            "_CFStringGetLength",
+            "_NSHomeDirectory",
+            "_NSUserName",
+            "_kCFAllocatorDefault",
+            "_kCFBooleanTrue",
+            "_kIOMainPortDefault",
+        ] {
+            assert!(
+                !is_host_cfstring_data_symbol_candidate(symbol),
+                "{symbol} should not be treated as a CFString data symbol"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_apple_data_symbols_cover_security_and_cf_startup_constants() {
+        let symbols = APPLE_CFSTRING_DATA_SYMBOLS
+            .iter()
+            .map(|(symbol, _)| *symbol)
+            .collect::<Vec<_>>();
+
+        for symbol in [
+            "_kCFRunLoopDefaultMode",
+            "_kCFRunLoopCommonModes",
+            "_kCFBundleExecutableKey",
+            "_kSecClass",
+            "_kSecValueData",
+        ] {
+            assert!(
+                symbols.contains(&symbol),
+                "{symbol} should have a non-mac fallback value"
+            );
+        }
+    }
+
+    #[test]
     fn iokit_notification_port_import_is_apple_dispatched() {
         assert!(is_apple_import_symbol("_IONotificationPortCreate"));
         assert!(is_apple_import_symbol("IONotificationPortCreate"));
@@ -9150,7 +9769,9 @@ mod tests {
         assert!(is_apple_import_symbol("_CFStringCreateCopy"));
         assert!(is_apple_import_symbol("_CFStringGetCStringPtr"));
         assert!(is_apple_import_symbol("_CFURLCreateWithFileSystemPath"));
+        assert!(is_apple_import_symbol("_CFURLCreateWithString"));
         assert!(is_apple_import_symbol("_CFURLCopyFileSystemPath"));
+        assert!(is_apple_import_symbol("_CFURLGetString"));
         assert!(is_apple_import_symbol("_CFBundleGetMainBundle"));
         assert!(is_apple_import_symbol("_CFBundleCopyBundleURL"));
     }
@@ -9175,7 +9796,9 @@ mod tests {
             "_CFStringCreateCopy",
             "_CFStringCompare",
             "_CFURLCreateWithFileSystemPath",
+            "_CFURLCreateWithString",
             "_CFURLCopyFileSystemPath",
+            "_CFURLGetString",
             "_CFBundleGetMainBundle",
             "_CFBundleCopyBundleURL",
             "_IONotificationPortDestroy",
@@ -9209,9 +9832,26 @@ mod tests {
             "_CFArrayCreateMutable",
             "_CFArrayCreate",
             "_CFArrayAppendValue",
+            "_CFArrayInsertValueAtIndex",
+            "_CFArraySetValueAtIndex",
+            "_CFArrayRemoveValueAtIndex",
+            "_CFArrayRemoveAllValues",
+            "_CFArrayContainsValue",
             "_CFArrayGetCount",
             "_CFArrayGetValueAtIndex",
             "_CFArrayGetTypeID",
+            "_CFSetCreate",
+            "_CFSetCreateMutable",
+            "_CFSetAddValue",
+            "_CFSetSetValue",
+            "_CFSetReplaceValue",
+            "_CFSetRemoveValue",
+            "_CFSetRemoveAllValues",
+            "_CFSetContainsValue",
+            "_CFSetGetCount",
+            "_CFSetGetValue",
+            "_CFSetGetValueIfPresent",
+            "_CFSetGetTypeID",
             "_CFDictionaryCreate",
             "_CFDictionaryCreateMutable",
             "_CFDictionarySetValue",
@@ -9249,6 +9889,23 @@ mod tests {
             "_CFStringGetTypeID",
             "_CFDataGetTypeID",
             "_CFArrayGetTypeID",
+            "_CFArrayInsertValueAtIndex",
+            "_CFArraySetValueAtIndex",
+            "_CFArrayRemoveValueAtIndex",
+            "_CFArrayRemoveAllValues",
+            "_CFArrayContainsValue",
+            "_CFSetCreate",
+            "_CFSetCreateMutable",
+            "_CFSetAddValue",
+            "_CFSetSetValue",
+            "_CFSetReplaceValue",
+            "_CFSetRemoveValue",
+            "_CFSetRemoveAllValues",
+            "_CFSetContainsValue",
+            "_CFSetGetCount",
+            "_CFSetGetValue",
+            "_CFSetGetValueIfPresent",
+            "_CFSetGetTypeID",
             "_CFDictionaryGetTypeID",
             "_CFDictionaryCreateMutable",
             "_CFDictionarySetValue",

@@ -18,6 +18,10 @@ pub enum AppleObject {
         values: Vec<u64>,
         host_ptr: Option<u64>,
     },
+    Set {
+        values: Vec<u64>,
+        host_ptr: Option<u64>,
+    },
     Enumerator {
         values: Vec<u64>,
         index: usize,
@@ -109,6 +113,7 @@ impl AppleRuntime {
     const TYPE_ID_DATE: u64 = 0x1009;
     const TYPE_ID_ERROR: u64 = 0x100A;
     const TYPE_ID_BOOLEAN: u64 = 0x100B;
+    const TYPE_ID_SET: u64 = 0x100C;
 
     pub fn retain(&self, handle: u64) -> u64 {
         handle
@@ -167,6 +172,21 @@ impl AppleRuntime {
                 host_ptr: None,
             })
         }
+    }
+
+    pub fn alloc_set(&mut self) -> u64 {
+        self.alloc(AppleObject::Set {
+            values: Vec::new(),
+            host_ptr: None,
+        })
+    }
+
+    pub fn alloc_set_with_values(&mut self, values: Vec<u64>) -> u64 {
+        let set_ref = self.alloc_set();
+        for value in values {
+            let _ = self.set_add(set_ref, value);
+        }
+        set_ref
     }
 
     pub fn alloc_dictionary(&mut self, entries: Vec<(u64, u64)>) -> u64 {
@@ -332,8 +352,53 @@ impl AppleRuntime {
 
     pub fn array_append(&mut self, array_ref: u64, value: u64) -> bool {
         match self.objects.get_mut(&array_ref) {
-            Some(AppleObject::Array { values, .. }) => {
+            Some(AppleObject::Array { values, host_ptr }) => {
                 values.push(value);
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn array_insert(&mut self, array_ref: u64, index: usize, value: u64) -> bool {
+        match self.objects.get_mut(&array_ref) {
+            Some(AppleObject::Array { values, host_ptr }) if index <= values.len() => {
+                values.insert(index, value);
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn array_set(&mut self, array_ref: u64, index: usize, value: u64) -> bool {
+        match self.objects.get_mut(&array_ref) {
+            Some(AppleObject::Array { values, host_ptr }) if index < values.len() => {
+                values[index] = value;
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn array_remove(&mut self, array_ref: u64, index: usize) -> bool {
+        match self.objects.get_mut(&array_ref) {
+            Some(AppleObject::Array { values, host_ptr }) if index < values.len() => {
+                values.remove(index);
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn array_remove_all(&mut self, array_ref: u64) -> bool {
+        match self.objects.get_mut(&array_ref) {
+            Some(AppleObject::Array { values, host_ptr }) => {
+                values.clear();
+                *host_ptr = None;
                 true
             }
             _ => false,
@@ -350,6 +415,146 @@ impl AppleRuntime {
     pub fn array_get(&self, array_ref: u64, index: usize) -> Option<u64> {
         match self.objects.get(&array_ref) {
             Some(AppleObject::Array { values, .. }) => values.get(index).copied(),
+            _ => None,
+        }
+    }
+
+    pub fn array_contains(
+        &self,
+        array_ref: u64,
+        location: usize,
+        length: usize,
+        value_ref: u64,
+    ) -> Option<bool> {
+        let values = match self.objects.get(&array_ref) {
+            Some(AppleObject::Array { values, .. }) => values,
+            _ => return None,
+        };
+        let needle = self.object_data(value_ref);
+        let end = location.saturating_add(length).min(values.len());
+        if location >= end {
+            return Some(false);
+        }
+        Some(values[location..end].iter().any(|candidate| {
+            if *candidate == value_ref {
+                return true;
+            }
+            let Some(needle) = needle.as_ref() else {
+                return false;
+            };
+            self.object_data(*candidate)
+                .map(|candidate| candidate == *needle)
+                .unwrap_or(false)
+        }))
+    }
+
+    fn set_value_index(&self, set_ref: u64, value_ref: u64) -> Option<usize> {
+        let needle = self.object_data(value_ref);
+        match self.objects.get(&set_ref) {
+            Some(AppleObject::Set { values, .. }) => values.iter().position(|candidate| {
+                if *candidate == value_ref {
+                    return true;
+                }
+                let Some(needle) = needle.as_ref() else {
+                    return false;
+                };
+                self.object_data(*candidate)
+                    .map(|candidate| candidate == *needle)
+                    .unwrap_or(false)
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn set_add(&mut self, set_ref: u64, value_ref: u64) -> bool {
+        if self.set_value_index(set_ref, value_ref).is_some() {
+            return false;
+        }
+        match self.objects.get_mut(&set_ref) {
+            Some(AppleObject::Set { values, host_ptr }) => {
+                values.push(value_ref);
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_set(&mut self, set_ref: u64, value_ref: u64) -> bool {
+        let existing_index = self.set_value_index(set_ref, value_ref);
+        match self.objects.get_mut(&set_ref) {
+            Some(AppleObject::Set { values, host_ptr }) => {
+                if let Some(index) = existing_index {
+                    values[index] = value_ref;
+                } else {
+                    values.push(value_ref);
+                }
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_replace(&mut self, set_ref: u64, value_ref: u64) -> bool {
+        let Some(index) = self.set_value_index(set_ref, value_ref) else {
+            return false;
+        };
+        match self.objects.get_mut(&set_ref) {
+            Some(AppleObject::Set { values, host_ptr }) => {
+                values[index] = value_ref;
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_remove(&mut self, set_ref: u64, value_ref: u64) -> bool {
+        let Some(index) = self.set_value_index(set_ref, value_ref) else {
+            return false;
+        };
+        match self.objects.get_mut(&set_ref) {
+            Some(AppleObject::Set { values, host_ptr }) => {
+                values.remove(index);
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_remove_all(&mut self, set_ref: u64) -> bool {
+        match self.objects.get_mut(&set_ref) {
+            Some(AppleObject::Set { values, host_ptr }) => {
+                values.clear();
+                *host_ptr = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_contains(&self, set_ref: u64, value_ref: u64) -> Option<bool> {
+        match self.objects.get(&set_ref) {
+            Some(AppleObject::Set { .. }) => {
+                Some(self.set_value_index(set_ref, value_ref).is_some())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn set_get(&self, set_ref: u64, value_ref: u64) -> Option<u64> {
+        let index = self.set_value_index(set_ref, value_ref)?;
+        match self.objects.get(&set_ref) {
+            Some(AppleObject::Set { values, .. }) => values.get(index).copied(),
+            _ => None,
+        }
+    }
+
+    pub fn set_len(&self, set_ref: u64) -> Option<usize> {
+        match self.objects.get(&set_ref) {
+            Some(AppleObject::Set { values, .. }) => Some(values.len()),
             _ => None,
         }
     }
@@ -616,6 +821,7 @@ impl AppleRuntime {
             Some(AppleObject::String { .. }) => Some("NSString".to_string()),
             Some(AppleObject::Data { .. }) => Some("NSData".to_string()),
             Some(AppleObject::Array { .. }) => Some("NSArray".to_string()),
+            Some(AppleObject::Set { .. }) => Some("NSSet".to_string()),
             Some(AppleObject::Enumerator { .. }) => Some("NSEnumerator".to_string()),
             Some(AppleObject::Dictionary { .. }) => Some("NSDictionary".to_string()),
             Some(AppleObject::Number { .. }) | Some(AppleObject::Boolean { .. }) => {
@@ -661,6 +867,10 @@ impl AppleRuntime {
                 host_ptr: Some(host_ptr),
                 ..
             })
+            | Some(AppleObject::Set {
+                host_ptr: Some(host_ptr),
+                ..
+            })
             | Some(AppleObject::Dictionary {
                 host_ptr: Some(host_ptr),
                 ..
@@ -689,6 +899,7 @@ impl AppleRuntime {
             Some(AppleObject::String { .. }) => Self::TYPE_ID_STRING,
             Some(AppleObject::Data { .. }) => Self::TYPE_ID_DATA,
             Some(AppleObject::Array { .. }) => Self::TYPE_ID_ARRAY,
+            Some(AppleObject::Set { .. }) => Self::TYPE_ID_SET,
             Some(AppleObject::Dictionary { .. }) => Self::TYPE_ID_DICTIONARY,
             Some(AppleObject::Number { .. }) => Self::TYPE_ID_NUMBER,
             Some(AppleObject::Boolean { .. }) => Self::TYPE_ID_BOOLEAN,
@@ -722,6 +933,10 @@ impl AppleRuntime {
 
     pub fn array_type_id(&self) -> u64 {
         Self::TYPE_ID_ARRAY
+    }
+
+    pub fn set_type_id(&self) -> u64 {
+        Self::TYPE_ID_SET
     }
 
     pub fn dictionary_type_id(&self) -> u64 {
@@ -791,6 +1006,10 @@ impl AppleRuntime {
             Some(AppleObject::Array { values, host_ptr }) => match host_ptr {
                 Some(host_ptr) => format!("CFArray(count={}, host=0x{:X})", values.len(), host_ptr),
                 None => format!("CFArray(count={})", values.len()),
+            },
+            Some(AppleObject::Set { values, host_ptr }) => match host_ptr {
+                Some(host_ptr) => format!("CFSet(count={}, host=0x{:X})", values.len(), host_ptr),
+                None => format!("CFSet(count={})", values.len()),
             },
             Some(AppleObject::Enumerator { values, index }) => {
                 format!("NSEnumerator(index={}, count={})", index, values.len())
@@ -1013,6 +1232,68 @@ mod tests {
     }
 
     #[test]
+    fn array_mutation_matches_string_values_and_invalidates_host_proxy() {
+        let mut runtime = AppleRuntime::default();
+
+        let alpha = runtime.alloc_string(b"alpha".to_vec(), 0x8000_0100);
+        let beta = runtime.alloc_string(b"beta".to_vec(), 0x8000_0100);
+        let beta_equivalent = runtime.alloc_string(b"beta".to_vec(), 0x8000_0100);
+        let gamma = runtime.alloc_string(b"gamma".to_vec(), 0x8000_0100);
+        let delta = runtime.alloc_string(b"delta".to_vec(), 0x8000_0100);
+        let array_ref = runtime.alloc_array_with_values_and_host(vec![alpha], Some(0x1234_D000));
+
+        assert_eq!(runtime.host_ptr(array_ref), Some(0x1234_D000));
+        assert!(runtime.array_append(array_ref, beta));
+        assert_eq!(runtime.host_ptr(array_ref), None);
+        assert!(runtime.array_insert(array_ref, 1, gamma));
+        assert_eq!(runtime.array_len(array_ref), Some(3));
+        assert_eq!(runtime.array_get(array_ref, 1), Some(gamma));
+        assert_eq!(
+            runtime.array_contains(array_ref, 0, 3, beta_equivalent),
+            Some(true)
+        );
+        assert!(runtime.array_set(array_ref, 2, delta));
+        assert_eq!(runtime.array_contains(array_ref, 1, 1, gamma), Some(true));
+        assert_eq!(
+            runtime.array_contains(array_ref, 0, 3, beta_equivalent),
+            Some(false)
+        );
+        assert!(runtime.array_remove(array_ref, 0));
+        assert_eq!(runtime.array_get(array_ref, 0), Some(gamma));
+        assert!(runtime.array_remove_all(array_ref));
+        assert_eq!(runtime.array_len(array_ref), Some(0));
+    }
+
+    #[test]
+    fn set_mutation_matches_string_values_and_keeps_unique_entries() {
+        let mut runtime = AppleRuntime::default();
+
+        let alpha = runtime.alloc_string(b"alpha".to_vec(), 0x8000_0100);
+        let beta = runtime.alloc_string(b"beta".to_vec(), 0x8000_0100);
+        let beta_equivalent = runtime.alloc_string(b"beta".to_vec(), 0x8000_0100);
+        let gamma = runtime.alloc_string(b"gamma".to_vec(), 0x8000_0100);
+
+        let set_ref = runtime.alloc_set();
+        assert!(runtime.set_add(set_ref, alpha));
+        assert!(runtime.set_add(set_ref, beta));
+        assert!(!runtime.set_add(set_ref, beta_equivalent));
+        assert_eq!(runtime.set_len(set_ref), Some(2));
+        assert_eq!(runtime.set_contains(set_ref, beta_equivalent), Some(true));
+        assert_eq!(runtime.set_get(set_ref, beta_equivalent), Some(beta));
+
+        assert!(runtime.set_set(set_ref, beta_equivalent));
+        assert_eq!(runtime.set_get(set_ref, beta), Some(beta_equivalent));
+        assert!(!runtime.set_replace(set_ref, gamma));
+        assert!(runtime.set_add(set_ref, gamma));
+        assert_eq!(runtime.set_len(set_ref), Some(3));
+        assert!(runtime.set_remove(set_ref, alpha));
+        assert_eq!(runtime.set_contains(set_ref, alpha), Some(false));
+        assert_eq!(runtime.set_len(set_ref), Some(2));
+        assert!(runtime.set_remove_all(set_ref));
+        assert_eq!(runtime.set_len(set_ref), Some(0));
+    }
+
+    #[test]
     fn dictionary_mutation_matches_string_keys_and_invalidates_host_proxy() {
         let mut runtime = AppleRuntime::default();
 
@@ -1069,6 +1350,7 @@ mod tests {
         let string_ref = runtime.alloc_string(b"hello".to_vec(), 0x0800_0100);
         let data_ref = runtime.alloc_data(b"bytes".to_vec());
         let array_ref = runtime.alloc_array_with_values(vec![string_ref]);
+        let set_ref = runtime.alloc_set_with_values(vec![string_ref]);
         let dict_ref = runtime.alloc_dictionary(vec![(string_ref, data_ref)]);
         let number_ref = runtime.alloc_number(42);
         let boolean_ref = runtime.alloc_boolean(true);
@@ -1076,6 +1358,7 @@ mod tests {
         assert_eq!(runtime.type_id(string_ref), runtime.string_type_id());
         assert_eq!(runtime.type_id(data_ref), runtime.data_type_id());
         assert_eq!(runtime.type_id(array_ref), runtime.array_type_id());
+        assert_eq!(runtime.type_id(set_ref), runtime.set_type_id());
         assert_eq!(runtime.type_id(dict_ref), runtime.dictionary_type_id());
         assert_eq!(runtime.type_id(number_ref), runtime.number_type_id());
         assert_eq!(runtime.type_id(boolean_ref), runtime.boolean_type_id());

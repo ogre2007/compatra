@@ -761,8 +761,12 @@ pub fn emulate_macos_arm64_binary_with_mode(
     shared_state.main_image_header = binary.header_address();
     shared_state.main_image_slide = 0;
 
-    let apple_data_symbols =
-        install_apple_data_symbols(&mut emulator, &shared_state.apple_runtime, &mut heap_cursor)?;
+    let apple_data_symbols = install_apple_data_symbols(
+        &mut emulator,
+        &shared_state.apple_runtime,
+        &mut heap_cursor,
+        undefs.iter().map(|(name, _)| name.as_str()),
+    )?;
     if let Some(bus) = &trace_bus {
         let preview = apple_data_symbols
             .iter()

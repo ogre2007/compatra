@@ -228,8 +228,25 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_CFArrayAppendValue"
             | "_CFArrayCreate"
             | "_CFArrayCreateMutable"
+            | "_CFArrayContainsValue"
             | "_CFArrayGetCount"
             | "_CFArrayGetValueAtIndex"
+            | "_CFArrayInsertValueAtIndex"
+            | "_CFArrayRemoveAllValues"
+            | "_CFArrayRemoveValueAtIndex"
+            | "_CFArraySetValueAtIndex"
+            | "_CFSetAddValue"
+            | "_CFSetContainsValue"
+            | "_CFSetCreate"
+            | "_CFSetCreateMutable"
+            | "_CFSetGetCount"
+            | "_CFSetGetTypeID"
+            | "_CFSetGetValue"
+            | "_CFSetGetValueIfPresent"
+            | "_CFSetRemoveAllValues"
+            | "_CFSetRemoveValue"
+            | "_CFSetReplaceValue"
+            | "_CFSetSetValue"
             | "_CFDataCreate"
             | "_CFDataGetBytePtr"
             | "_CFDataGetLength"
@@ -246,6 +263,10 @@ pub(crate) fn arm64_import_has_runtime_hook(symbol: &str, runtime_mode: RuntimeM
             | "_CFRetain"
             | "_CFStringCreateExternalRepresentation"
             | "_CFStringCreateWithBytes"
+            | "_CFURLCopyFileSystemPath"
+            | "_CFURLCreateWithFileSystemPath"
+            | "_CFURLCreateWithString"
+            | "_CFURLGetString"
             | "_CGMainDisplayID"
             | "_CGDisplayPixelsWide"
             | "_CGDisplayPixelsHigh"
@@ -403,7 +424,9 @@ mod tests {
             "_CFStringCreateCopy",
             "_CFStringCompare",
             "_CFURLCreateWithFileSystemPath",
+            "_CFURLCreateWithString",
             "_CFURLCopyFileSystemPath",
+            "_CFURLGetString",
             "_CFBundleGetMainBundle",
             "_CFBundleCopyBundleURL",
             "_IONotificationPortDestroy",
@@ -437,9 +460,26 @@ mod tests {
             "_CFArrayCreateMutable",
             "_CFArrayCreate",
             "_CFArrayAppendValue",
+            "_CFArrayInsertValueAtIndex",
+            "_CFArraySetValueAtIndex",
+            "_CFArrayRemoveValueAtIndex",
+            "_CFArrayRemoveAllValues",
+            "_CFArrayContainsValue",
             "_CFArrayGetCount",
             "_CFArrayGetValueAtIndex",
             "_CFArrayGetTypeID",
+            "_CFSetCreate",
+            "_CFSetCreateMutable",
+            "_CFSetAddValue",
+            "_CFSetSetValue",
+            "_CFSetReplaceValue",
+            "_CFSetRemoveValue",
+            "_CFSetRemoveAllValues",
+            "_CFSetContainsValue",
+            "_CFSetGetCount",
+            "_CFSetGetValue",
+            "_CFSetGetValueIfPresent",
+            "_CFSetGetTypeID",
             "_CFDictionaryCreate",
             "_CFDictionaryGetCount",
             "_CFDictionaryGetValue",
