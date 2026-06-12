@@ -121,21 +121,85 @@ fn dispatch_once_should_call(
     if token_ptr == 0 {
         return false;
     }
-    let memory_done =
-        read_guest_u64(emu, token_ptr).is_some_and(|value| value == DISPATCH_ONCE_DONE_SENTINEL);
+
+    match read_guest_u64(emu, token_ptr) {
+        Some(DISPATCH_ONCE_DONE_SENTINEL) => return false,
+        Some(_) => {
+            let _ = emu.write_memory(token_ptr, &DISPATCH_ONCE_DONE_SENTINEL.to_le_bytes());
+            return true;
+        }
+        None => {}
+    }
+
     let set_done = shared_state
         .dispatch_once_tokens
         .lock()
         .ok()
         .is_some_and(|tokens| tokens.contains(&token_ptr));
-    if memory_done || set_done {
+    if set_done {
         return false;
     }
-    let _ = emu.write_memory(token_ptr, &DISPATCH_ONCE_DONE_SENTINEL.to_le_bytes());
+
     if let Ok(mut tokens) = shared_state.dispatch_once_tokens.lock() {
         tokens.insert(token_ptr);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::macos::arm64_runner_support::initialize_arm64_shared_state_with_mode;
+    use crate::macos::{GuestProcessBootstrap, RuntimeMode};
+
+    fn empty_bootstrap() -> GuestProcessBootstrap {
+        GuestProcessBootstrap {
+            argc: 0,
+            arg0_addr: 0,
+            env0_addr: 0,
+            apple0_addr: 0,
+            argv_addr: 0,
+            envp_addr: 0,
+            argc_addr: 0,
+            ns_argv_ptr_addr: 0,
+            ns_envp_ptr_addr: 0,
+        }
+    }
+
+    #[test]
+    fn dispatch_once_rechecks_guest_token_memory_for_reused_stack_addresses() {
+        let mut emu = UnicornEmulator::new_arm64().expect("create arm64 emulator");
+        emu.map_data_memory(0x1000, 0x1000)
+            .expect("map token memory");
+        let shared_state = initialize_arm64_shared_state_with_mode(
+            std::env::temp_dir(),
+            empty_bootstrap(),
+            RuntimeMode::Compat,
+        );
+        let token_ptr = 0x1080;
+
+        emu.write_memory(token_ptr, &0u64.to_le_bytes())
+            .expect("initialize token");
+        assert!(dispatch_once_should_call(
+            &mut emu,
+            &shared_state,
+            token_ptr
+        ));
+        assert!(!dispatch_once_should_call(
+            &mut emu,
+            &shared_state,
+            token_ptr
+        ));
+
+        emu.write_memory(token_ptr, &0u64.to_le_bytes())
+            .expect("reuse stack slot with a fresh token");
+        assert!(dispatch_once_should_call(
+            &mut emu,
+            &shared_state,
+            token_ptr
+        ));
+    }
 }
 
 fn handle_dispatch_import(

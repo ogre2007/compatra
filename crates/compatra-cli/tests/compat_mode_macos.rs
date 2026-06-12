@@ -5155,6 +5155,7 @@ typedef const void *(*cf_array_get_value_fn)(CFArrayRef, CFIndex);
 typedef CFSetRef (*cf_set_create_fn)(CFAllocatorRef, const void **, CFIndex, const CFSetCallBacks *);
 typedef CFMutableSetRef (*cf_set_create_mutable_fn)(CFAllocatorRef, CFIndex, const CFSetCallBacks *);
 typedef void (*cf_set_mutate_fn)(CFMutableSetRef, const void *);
+typedef void (*cf_set_remove_all_fn)(CFMutableSetRef);
 typedef Boolean (*cf_set_contains_fn)(CFSetRef, const void *);
 typedef CFIndex (*cf_set_get_count_fn)(CFSetRef);
 typedef const void *(*cf_set_get_value_fn)(CFSetRef, const void *);
@@ -5407,7 +5408,7 @@ static int exercise_cfset(
     cf_set_mutate_fn set_impl,
     cf_set_mutate_fn replace_impl,
     cf_set_mutate_fn remove_impl,
-    cf_set_mutate_fn remove_all_impl,
+    cf_set_remove_all_fn remove_all_impl,
     cf_set_contains_fn contains_impl,
     cf_set_get_count_fn count_impl,
     cf_set_get_value_fn get_impl,
@@ -5704,7 +5705,7 @@ int main(void) {
     cf_set_mutate_fn dyn_set_set = (cf_set_mutate_fn)dlsym(cf, "CFSetSetValue");
     cf_set_mutate_fn dyn_set_replace = (cf_set_mutate_fn)dlsym(cf, "CFSetReplaceValue");
     cf_set_mutate_fn dyn_set_remove = (cf_set_mutate_fn)dlsym(cf, "CFSetRemoveValue");
-    cf_set_mutate_fn dyn_set_remove_all = (cf_set_mutate_fn)dlsym(cf, "CFSetRemoveAllValues");
+    cf_set_remove_all_fn dyn_set_remove_all = (cf_set_remove_all_fn)dlsym(cf, "CFSetRemoveAllValues");
     cf_set_contains_fn dyn_set_contains = (cf_set_contains_fn)dlsym(cf, "CFSetContainsValue");
     cf_set_get_count_fn dyn_set_count = (cf_set_get_count_fn)dlsym(cf, "CFSetGetCount");
     cf_set_get_value_fn dyn_set_get = (cf_set_get_value_fn)dlsym(cf, "CFSetGetValue");
