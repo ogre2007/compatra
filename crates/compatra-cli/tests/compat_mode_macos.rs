@@ -5426,21 +5426,16 @@ int main(void) {
         && CFStringGetCString(kSecValueData, static_sec_value_text, sizeof(static_sec_value_text), kCFStringEncodingUTF8)
         && strcmp(static_sec_class_text, "class") == 0
         && strcmp(static_sec_value_text, "v_Data") == 0;
-    CFDictionaryRef static_delete_query = make_secitem_query("compatra-ci-secitem-static", "bridge-static", 0);
-    CFDictionaryRef static_add_query = make_secitem_query("compatra-ci-secitem-static", "bridge-static", 1);
-    OSStatus static_delete_before = static_delete_query ? SecItemDelete(static_delete_query) : -1;
-    OSStatus static_add_ret = static_add_query ? SecItemAdd(static_add_query, 0) : -1;
-    OSStatus static_delete_after = static_delete_query ? SecItemDelete(static_delete_query) : -1;
-    int static_secitem_bridge_ok = static_delete_query && static_add_query && (static_delete_before != -50 || static_add_ret != -50 || static_delete_after != -50);
+    CFDictionaryRef static_lookup_query = make_secitem_query("compatra-ci-secitem-static", "bridge-static", 0);
+    OSStatus static_lookup_ret = static_lookup_query ? SecItemCopyMatching(static_lookup_query, 0) : -1;
+    int static_secitem_bridge_ok = static_lookup_query && static_lookup_ret != -50;
     int static_mut_delete_ops_ok = 0;
     int static_mut_add_ops_ok = 0;
-    CFMutableDictionaryRef static_mut_delete_query = make_secitem_mutable_query("compatra-ci-secitem-mutable-static", "bridge-mut-static", 0, &static_mut_delete_ops_ok);
-    CFMutableDictionaryRef static_mut_add_query = make_secitem_mutable_query("compatra-ci-secitem-mutable-static", "bridge-mut-static", 1, &static_mut_add_ops_ok);
-    OSStatus static_mut_delete_before = static_mut_delete_query ? SecItemDelete(static_mut_delete_query) : -1;
-    OSStatus static_mut_add_ret = static_mut_add_query ? SecItemAdd(static_mut_add_query, 0) : -1;
-    OSStatus static_mut_delete_after = static_mut_delete_query ? SecItemDelete(static_mut_delete_query) : -1;
+    CFMutableDictionaryRef static_mut_lookup_query = make_secitem_mutable_query("compatra-ci-secitem-mutable-static", "bridge-mut-static", 0, &static_mut_delete_ops_ok);
+    CFMutableDictionaryRef static_mut_value_query = make_secitem_mutable_query("compatra-ci-secitem-mutable-static", "bridge-mut-static", 1, &static_mut_add_ops_ok);
+    OSStatus static_mut_lookup_ret = static_mut_lookup_query ? SecItemCopyMatching(static_mut_lookup_query, 0) : -1;
     int static_mut_ops_ok = static_mut_delete_ops_ok && static_mut_add_ops_ok;
-    int static_mut_secitem_bridge_ok = static_mut_delete_query && static_mut_add_query && static_mut_ops_ok && (static_mut_delete_before != -50 || static_mut_add_ret != -50 || static_mut_delete_after != -50);
+    int static_mut_secitem_bridge_ok = static_mut_lookup_query && static_mut_value_query && static_mut_ops_ok && static_mut_lookup_ret != -50;
     int default_keychain_ok = default_ret != 0 || (default_keychain && path_ret == 0 && keychain_path_len > 0 && keychain_path[0] != 0);
     int find_ok = find_ret != 0 || password_data || item_ref;
     int search_ok = search_ret != 0 || search_ref;
@@ -5480,26 +5475,21 @@ int main(void) {
         static_security_ok
     );
     printf(
-        "compat security-secitem static const=%d class=%s value=%s delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        "compat security-secitem static const=%d class=%s value=%s lookup=%d lookup_query=%p bridge=%d pass=%d\n",
         static_sec_constants_ok,
         static_sec_class_text,
         static_sec_value_text,
-        static_delete_before,
-        static_add_ret,
-        static_delete_after,
-        (void *)static_delete_query,
-        (void *)static_add_query,
+        static_lookup_ret,
+        (void *)static_lookup_query,
         static_secitem_bridge_ok,
         static_security_ok
     );
     printf(
-        "compat security-secitem-mutable static ops=%d delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        "compat security-secitem-mutable static ops=%d lookup=%d lookup_query=%p value_query=%p bridge=%d pass=%d\n",
         static_mut_ops_ok,
-        static_mut_delete_before,
-        static_mut_add_ret,
-        static_mut_delete_after,
-        (void *)static_mut_delete_query,
-        (void *)static_mut_add_query,
+        static_mut_lookup_ret,
+        (void *)static_mut_lookup_query,
+        (void *)static_mut_value_query,
         static_mut_secitem_bridge_ok,
         static_security_ok
     );
@@ -5684,15 +5674,12 @@ int main(void) {
         && dyn_get(kSecValueData, dyn_sec_value_text, sizeof(dyn_sec_value_text), kCFStringEncodingUTF8)
         && strcmp(dyn_sec_class_text, "class") == 0
         && strcmp(dyn_sec_value_text, "v_Data") == 0;
-    CFDictionaryRef dyn_delete_query = make_secitem_query("compatra-ci-secitem-dynamic", "bridge-dynamic", 0);
-    CFDictionaryRef dyn_add_query = make_secitem_query("compatra-ci-secitem-dynamic", "bridge-dynamic", 1);
-    OSStatus dyn_delete_before = dyn_item_delete && dyn_delete_query ? dyn_item_delete(dyn_delete_query) : -1;
-    OSStatus dyn_add_ret = dyn_item_add && dyn_add_query ? dyn_item_add(dyn_add_query, 0) : -1;
-    OSStatus dyn_delete_after = dyn_item_delete && dyn_delete_query ? dyn_item_delete(dyn_delete_query) : -1;
-    int dyn_secitem_bridge_ok = dyn_item_add && dyn_item_delete && dyn_delete_query && dyn_add_query && (dyn_delete_before != -50 || dyn_add_ret != -50 || dyn_delete_after != -50);
+    CFDictionaryRef dyn_lookup_query = make_secitem_query("compatra-ci-secitem-dynamic", "bridge-dynamic", 0);
+    OSStatus dyn_lookup_ret = dyn_item_copy && dyn_lookup_query ? dyn_item_copy(dyn_lookup_query, 0) : -1;
+    int dyn_secitem_bridge_ok = dyn_item_copy && dyn_lookup_query && dyn_lookup_ret != -50;
     int dyn_mut_delete_ops_ok = 0;
     int dyn_mut_add_ops_ok = 0;
-    CFMutableDictionaryRef dyn_mut_delete_query = make_secitem_mutable_query_with(
+    CFMutableDictionaryRef dyn_mut_lookup_query = make_secitem_mutable_query_with(
         "compatra-ci-secitem-mutable-dynamic",
         "bridge-mut-dynamic",
         0,
@@ -5706,7 +5693,7 @@ int main(void) {
         dyn_dict_count,
         &dyn_mut_delete_ops_ok
     );
-    CFMutableDictionaryRef dyn_mut_add_query = make_secitem_mutable_query_with(
+    CFMutableDictionaryRef dyn_mut_value_query = make_secitem_mutable_query_with(
         "compatra-ci-secitem-mutable-dynamic",
         "bridge-mut-dynamic",
         1,
@@ -5720,11 +5707,9 @@ int main(void) {
         dyn_dict_count,
         &dyn_mut_add_ops_ok
     );
-    OSStatus dyn_mut_delete_before = dyn_item_delete && dyn_mut_delete_query ? dyn_item_delete(dyn_mut_delete_query) : -1;
-    OSStatus dyn_mut_add_ret = dyn_item_add && dyn_mut_add_query ? dyn_item_add(dyn_mut_add_query, 0) : -1;
-    OSStatus dyn_mut_delete_after = dyn_item_delete && dyn_mut_delete_query ? dyn_item_delete(dyn_mut_delete_query) : -1;
+    OSStatus dyn_mut_lookup_ret = dyn_item_copy && dyn_mut_lookup_query ? dyn_item_copy(dyn_mut_lookup_query, 0) : -1;
     int dyn_mut_ops_ok = dyn_mut_delete_ops_ok && dyn_mut_add_ops_ok;
-    int dyn_mut_secitem_bridge_ok = dyn_item_add && dyn_item_delete && dyn_mut_delete_query && dyn_mut_add_query && dyn_mut_ops_ok && (dyn_mut_delete_before != -50 || dyn_mut_add_ret != -50 || dyn_mut_delete_after != -50);
+    int dyn_mut_secitem_bridge_ok = dyn_item_copy && dyn_mut_lookup_query && dyn_mut_value_query && dyn_mut_ops_ok && dyn_mut_lookup_ret != -50;
     int dyn_default_keychain_ok = dyn_default_ret != 0 || (dyn_default_keychain && dyn_path_ret == 0 && dyn_keychain_path_len > 0 && dyn_keychain_path_buf[0] != 0);
     int dyn_find_ok = dyn_find_ret != 0 || dyn_password_data || dyn_item_ref;
     int dyn_search_ok = dyn_search_ret != 0 || dyn_search_ref;
@@ -5764,26 +5749,21 @@ int main(void) {
         dyn_security_ok
     );
     printf(
-        "compat security-secitem dlsym const=%d class=%s value=%s delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        "compat security-secitem dlsym const=%d class=%s value=%s lookup=%d lookup_query=%p bridge=%d pass=%d\n",
         dyn_sec_constants_ok,
         dyn_sec_class_text,
         dyn_sec_value_text,
-        dyn_delete_before,
-        dyn_add_ret,
-        dyn_delete_after,
-        (void *)dyn_delete_query,
-        (void *)dyn_add_query,
+        dyn_lookup_ret,
+        (void *)dyn_lookup_query,
         dyn_secitem_bridge_ok,
         dyn_security_ok
     );
     printf(
-        "compat security-secitem-mutable dlsym ops=%d delete_before=%d add=%d delete_after=%d delete_query=%p add_query=%p bridge=%d pass=%d\n",
+        "compat security-secitem-mutable dlsym ops=%d lookup=%d lookup_query=%p value_query=%p bridge=%d pass=%d\n",
         dyn_mut_ops_ok,
-        dyn_mut_delete_before,
-        dyn_mut_add_ret,
-        dyn_mut_delete_after,
-        (void *)dyn_mut_delete_query,
-        (void *)dyn_mut_add_query,
+        dyn_mut_lookup_ret,
+        (void *)dyn_mut_lookup_query,
+        (void *)dyn_mut_value_query,
         dyn_mut_secitem_bridge_ok,
         dyn_security_ok
     );
