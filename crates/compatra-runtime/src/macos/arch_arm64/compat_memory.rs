@@ -161,4 +161,12 @@ impl compatra::GuestMemory for Arm64CompatGuestMemory<'_> {
     fn guest_main_image_slide(&mut self) -> i64 {
         self.shared_state.main_image_slide
     }
+
+    fn guest_standard_stream_fd(&mut self, stream: u64) -> Option<i32> {
+        self.shared_state
+            .standard_stream_fds
+            .lock()
+            .ok()
+            .and_then(|streams| streams.get(&stream).copied())
+    }
 }

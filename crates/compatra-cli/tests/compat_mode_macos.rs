@@ -359,8 +359,14 @@ fn compile_arm64_exec_model_fixture() -> PathBuf {
 #include <unistd.h>
 
 int main(void) {
-    puts("compat exec before");
+    int stdin_fd = fileno(stdin);
+    int stdout_fd = fileno(stdout);
+    int stderr_fd = fileno(stderr);
+    int stdout_puts = fputs("compat exec stdio stdout\n", stdout);
+    int stderr_puts = fputs("compat exec stdio stderr\n", stderr);
+    printf("compat exec before stdin_fd=%d stdout_fd=%d stderr_fd=%d stdout_puts=%d stderr_puts=%d\n", stdin_fd, stdout_fd, stderr_fd, stdout_puts, stderr_puts);
     fflush(stdout);
+    fflush(stderr);
     execl("/bin/echo", "echo", "compat exec child", (char *)0);
     printf("compat exec after errno=%d\n", errno);
     return 7;
@@ -7233,7 +7239,7 @@ fn compat_mode_models_exec_as_nonreturning_spawn() {
         .arg("--compat-log")
         .arg("verbose")
         .arg("--compat-log-filter")
-        .arg("execl")
+        .arg("execl,fflush,fputs,fileno")
         .arg(&fixture)
         .env("COMPATRA_PLUGIN_TRACE", "1")
         .env("COMPATRA_TRACE_FORMAT", "jsonl")
@@ -7249,7 +7255,7 @@ fn compat_mode_models_exec_as_nonreturning_spawn() {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     eprintln!(
-        "compat proof(exec): command={} --mode compat --compat-log verbose --compat-log-filter execl {}",
+        "compat proof(exec): command={} --mode compat --compat-log verbose --compat-log-filter execl,fflush,fputs,fileno {}",
         compatra.display(),
         fixture.display()
     );
@@ -7267,8 +7273,14 @@ fn compat_mode_models_exec_as_nonreturning_spawn() {
         stderr
     );
     assert!(
-        stdout.contains("compat exec before") && stdout.contains("compat exec child"),
+        stdout.contains("compat exec stdio stdout")
+            && stdout.contains("compat exec before stdin_fd=0 stdout_fd=1 stderr_fd=2")
+            && stdout.contains("compat exec child"),
         "exec model fixture did not run pre-exec code and spawned /bin/echo child; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("compat exec stdio stderr"),
+        "exec model fixture did not write through guest stderr before execl; stderr:\n{stderr}"
     );
     assert!(
         !stdout.contains("compat exec after"),
@@ -7280,6 +7292,18 @@ fn compat_mode_models_exec_as_nonreturning_spawn() {
             && stderr.contains("\"Path\":\"/bin/echo\"")
             && stderr.contains("\"ExitStatus\":\"0\""),
         "exec model did not log spawned non-returning execl; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"fflush\"")
+            && stderr.contains("\"return\":\"0\"")
+            && stderr.contains("\"FailedProxies\":0"),
+        "exec model did not successfully flush guest stdout before execl; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"fileno\"")
+            && stderr.contains("\"Call\":\"fputs\"")
+            && stderr.contains("\"transferred\":\"25\""),
+        "exec model did not log successful standard stream fileno/fputs proxies; stderr:\n{stderr}"
     );
 }
 

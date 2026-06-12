@@ -31,6 +31,7 @@ use crate::macos::{
 use crate::{ArchType, Emulator, MachoBinary, UnicornEmulator};
 
 use crate::macos::{memory_event, SharedTraceBus};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -43,6 +44,52 @@ fn section_pointer_values(
     section_name: &str,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     section_pointer_values_with_slide(emulator, binary, 0, section_name)
+}
+
+fn register_standard_stream_fds(
+    emulator: &mut UnicornEmulator,
+    shared_state: &crate::macos::arm64_state::Arm64SharedState,
+    data_symbols: &HashMap<String, u64>,
+) {
+    let Ok(mut streams) = shared_state.standard_stream_fds.lock() else {
+        return;
+    };
+    for (symbol, fd) in [("__stdinp", 0), ("__stdoutp", 1), ("__stderrp", 2)] {
+        let normalized = crate::macos::imports::normalize_import_symbol(symbol.to_string());
+        for key in [symbol, normalized.as_str()] {
+            let Some(&slot) = data_symbols.get(key) else {
+                continue;
+            };
+            streams.insert(slot, fd);
+            let pointee = emulator
+                .read_memory(slot, 8)
+                .ok()
+                .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_le_bytes));
+            if let Some(pointee) = pointee.filter(|pointee| *pointee != 0) {
+                streams.insert(pointee, fd);
+            }
+        }
+    }
+}
+
+fn install_standard_stream_data_symbols(
+    emulator: &mut UnicornEmulator,
+    heap_cursor: &mut u64,
+) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
+    let mut data_symbols = HashMap::new();
+    for symbol in ["__stdinp", "__stdoutp", "__stderrp"] {
+        *heap_cursor = align_up(*heap_cursor, 8);
+        let slot = *heap_cursor;
+        *heap_cursor = (*heap_cursor).saturating_add(8);
+        emulator.write_memory(slot, &slot.to_le_bytes())?;
+
+        let mach_symbol = format!("_{symbol}");
+        for key in [symbol.to_string(), mach_symbol] {
+            data_symbols.insert(key.clone(), slot);
+            data_symbols.insert(crate::macos::imports::normalize_import_symbol(key), slot);
+        }
+    }
+    Ok(data_symbols)
 }
 
 fn section_pointer_values_with_slide(
@@ -841,12 +888,17 @@ pub fn emulate_macos_arm64_binary_with_mode(
         &metadata,
     );
     let mut data_symbols = apple_data_symbols;
+    data_symbols.extend(install_standard_stream_data_symbols(
+        &mut emulator,
+        &mut heap_cursor,
+    )?);
     data_symbols.extend(
         analysis_hook_plan
             .cpp_data_symbols
             .iter()
             .map(|(name, addr)| (name.clone(), *addr)),
     );
+    register_standard_stream_fds(&mut emulator, &shared_state, &data_symbols);
 
     // Apply LC_DYLD_CHAINED_FIXUPS: walk every chain in the data
     // segments and patch each pointer slot in guest memory. Without

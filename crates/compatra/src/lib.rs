@@ -105,6 +105,10 @@ pub trait GuestMemory {
     fn guest_main_image_slide(&mut self) -> i64 {
         0
     }
+
+    fn guest_standard_stream_fd(&mut self, _stream: u64) -> Option<i32> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1093,10 +1097,10 @@ impl CompatibilityServices {
                     Some(self.fgets_stream(memory, args[0], args[1], args[2])?)
                 }
                 HostImportKind::FPutS => Some(self.fputs_stream(memory, args[0], args[1])?.into()),
-                HostImportKind::FEOF => Some(self.feof_stream(args[0])?),
-                HostImportKind::FError => Some(self.ferror_stream(args[0])?),
-                HostImportKind::ClearErr => Some(self.clearerr_stream(args[0])?),
-                HostImportKind::Fileno => Some(self.fileno_stream(args[0])?.into()),
+                HostImportKind::FEOF => Some(self.feof_stream(memory, args[0])?),
+                HostImportKind::FError => Some(self.ferror_stream(memory, args[0])?),
+                HostImportKind::ClearErr => Some(self.clearerr_stream(memory, args[0])?),
+                HostImportKind::Fileno => Some(self.fileno_stream(memory, args[0])?.into()),
                 HostImportKind::Malloc => Some(self.malloc(memory, args[0])?),
                 HostImportKind::Calloc => Some(self.calloc(memory, args[0], args[1])?),
                 HostImportKind::Realloc => Some(self.realloc(memory, args[0], args[1])?),

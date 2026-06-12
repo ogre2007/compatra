@@ -1489,50 +1489,66 @@ impl CompatibilityServices {
         }
     }
 
-    pub fn feof_stream(&self, stream: u64) -> Option<HostCallResult> {
+    pub fn feof_stream<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        stream: u64,
+    ) -> Option<HostCallResult> {
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_feof(stream);
+            return proxy_host_feof(memory, stream);
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = stream;
+            let _ = (&mut *memory, stream);
             None
         }
     }
 
-    pub fn ferror_stream(&self, stream: u64) -> Option<HostCallResult> {
+    pub fn ferror_stream<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        stream: u64,
+    ) -> Option<HostCallResult> {
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_ferror(stream);
+            return proxy_host_ferror(memory, stream);
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = stream;
+            let _ = (&mut *memory, stream);
             None
         }
     }
 
-    pub fn clearerr_stream(&self, stream: u64) -> Option<HostCallResult> {
+    pub fn clearerr_stream<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        stream: u64,
+    ) -> Option<HostCallResult> {
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_clearerr(stream);
+            return proxy_host_clearerr(memory, stream);
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = stream;
+            let _ = (&mut *memory, stream);
             None
         }
     }
 
-    pub fn fileno_stream(&self, stream: u64) -> Option<HostIoResult> {
+    pub fn fileno_stream<M: GuestMemory + ?Sized>(
+        &self,
+        memory: &mut M,
+        stream: u64,
+    ) -> Option<HostIoResult> {
         #[cfg(target_os = "macos")]
         {
-            return proxy_host_fileno(stream);
+            return proxy_host_fileno(memory, stream);
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = stream;
+            let _ = (&mut *memory, stream);
             None
         }
     }
@@ -4237,10 +4253,7 @@ fn proxy_host_fflush(stream: u64) -> Option<HostIoResult> {
     let file = if stream == 0 {
         ptr::null_mut()
     } else {
-        let Some(file) = host_file_ptr(stream) else {
-            return Some(host_io_error(libc::EBADF as u32));
-        };
-        file
+        host_file_ptr(stream).unwrap_or(ptr::null_mut())
     };
     clear_errno();
     let ret = unsafe { libc::fflush(file) };
@@ -4320,6 +4333,24 @@ fn proxy_host_fputs<M: GuestMemory + ?Sized>(
     let text = read_cstring(memory, text_ptr, MAX_GUEST_STDIO_BYTES).ok()?;
     let bytes = text.as_bytes().to_vec();
     let host_text = CString::new(text).ok()?;
+    if let Some(fd) = memory.guest_standard_stream_fd(stream) {
+        clear_errno();
+        let ret = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+        let transferred = ret.max(0) as usize;
+        let ok = ret >= 0 && transferred == bytes.len();
+        return Some(HostIoResult {
+            return_value: if ok { 0 } else { u64::MAX },
+            errno: if ok {
+                0
+            } else if ret < 0 {
+                host_errno()
+            } else {
+                libc::EIO as u32
+            },
+            transferred,
+            preview: bytes[..bytes.len().min(128)].to_vec(),
+        });
+    }
     let Some(file) = host_file_ptr(stream) else {
         return Some(host_io_error(libc::EBADF as u32));
     };
@@ -4334,7 +4365,10 @@ fn proxy_host_fputs<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
-fn proxy_host_feof(stream: u64) -> Option<HostCallResult> {
+fn proxy_host_feof<M: GuestMemory + ?Sized>(memory: &mut M, stream: u64) -> Option<HostCallResult> {
+    if memory.guest_standard_stream_fd(stream).is_some() {
+        return Some(host_call_value(0));
+    }
     let Some(file) = host_file_ptr(stream) else {
         return Some(host_call_error(libc::EBADF as u32));
     };
@@ -4343,7 +4377,13 @@ fn proxy_host_feof(stream: u64) -> Option<HostCallResult> {
 }
 
 #[cfg(target_os = "macos")]
-fn proxy_host_ferror(stream: u64) -> Option<HostCallResult> {
+fn proxy_host_ferror<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    stream: u64,
+) -> Option<HostCallResult> {
+    if memory.guest_standard_stream_fd(stream).is_some() {
+        return Some(host_call_value(0));
+    }
     let Some(file) = host_file_ptr(stream) else {
         return Some(host_call_error(libc::EBADF as u32));
     };
@@ -4352,7 +4392,13 @@ fn proxy_host_ferror(stream: u64) -> Option<HostCallResult> {
 }
 
 #[cfg(target_os = "macos")]
-fn proxy_host_clearerr(stream: u64) -> Option<HostCallResult> {
+fn proxy_host_clearerr<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    stream: u64,
+) -> Option<HostCallResult> {
+    if memory.guest_standard_stream_fd(stream).is_some() {
+        return Some(host_call_value(0));
+    }
     let Some(file) = host_file_ptr(stream) else {
         return Some(host_call_error(libc::EBADF as u32));
     };
@@ -4363,7 +4409,15 @@ fn proxy_host_clearerr(stream: u64) -> Option<HostCallResult> {
 }
 
 #[cfg(target_os = "macos")]
-fn proxy_host_fileno(stream: u64) -> Option<HostIoResult> {
+fn proxy_host_fileno<M: GuestMemory + ?Sized>(memory: &mut M, stream: u64) -> Option<HostIoResult> {
+    if let Some(fd) = memory.guest_standard_stream_fd(stream) {
+        return Some(HostIoResult {
+            return_value: fd as u64,
+            errno: 0,
+            transferred: 0,
+            preview: Vec::new(),
+        });
+    }
     let Some(file) = host_file_ptr(stream) else {
         return Some(host_io_error(libc::EBADF as u32));
     };
