@@ -7302,7 +7302,9 @@ fn compat_mode_models_exec_as_nonreturning_spawn() {
     assert!(
         stderr.contains("\"Call\":\"fileno\"")
             && stderr.contains("\"Call\":\"fputs\"")
-            && stderr.contains("\"transferred\":\"25\""),
+            && stderr.contains("\"return\":\"0\"")
+            && stderr.contains("\"return\":\"1\"")
+            && stderr.contains("\"return\":\"2\""),
         "exec model did not log successful standard stream fileno/fputs proxies; stderr:\n{stderr}"
     );
 }
