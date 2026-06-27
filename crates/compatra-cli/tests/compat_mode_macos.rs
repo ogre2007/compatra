@@ -150,6 +150,52 @@ int main(void) {
 }
 
 #[cfg(target_os = "macos")]
+fn compile_arm64_spin_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_spin_budget.c");
+    let binary = out_dir.join("arm64_spin_budget");
+    fs::write(
+        &source,
+        r#"#include <stdint.h>
+
+static volatile uint64_t sink;
+
+int main(void) {
+    for (;;) {
+        sink++;
+    }
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 spin fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 spin fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 spin fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_identity_fixture() -> PathBuf {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -1783,6 +1829,64 @@ int main(void) {
     assert!(
         output.status.success(),
         "failed to compile generated arm64 startup glue fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(target_os = "macos")]
+fn compile_arm64_system_truncation_fixture() -> PathBuf {
+    let out_dir = generated_fixture_dir();
+    fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
+    let source = out_dir.join("arm64_system_truncation_compat.c");
+    let binary = out_dir.join("arm64_system_truncation_compat");
+    fs::write(
+        &source,
+        r#"#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    char command[256];
+    memset(command, 'A', sizeof(command));
+    command[0] = '#';
+    command[1] = ' ';
+    command[200] = '\n';
+    memcpy(command + 201, "exit 0", 6);
+    command[207] = '\0';
+
+    errno = 0;
+    int ret = system(command);
+    int err = errno;
+    int ok = ret == -1 && err == E2BIG;
+    printf("compat system trunc ret=%d errno=%d e2big=%d ok=%d\n", ret, err, E2BIG, ok);
+    return ok ? 0 : 9;
+}
+"#,
+    )
+    .expect("failed to write generated arm64 system truncation fixture");
+
+    let output = Command::new("xcrun")
+        .arg("clang")
+        .arg("-target")
+        .arg("arm64-apple-macos11")
+        .arg("-mmacosx-version-min=11.0")
+        .arg("-fno-builtin")
+        .arg("-fno-builtin-printf")
+        .arg("-fno-stack-protector")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch xcrun clang for generated arm64 system truncation fixture");
+    assert!(
+        output.status.success(),
+        "failed to compile generated arm64 system truncation fixture with status {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -6871,15 +6975,7 @@ fn compat_mode_emits_runtime_stop_diagnostics_on_budget_exhaustion() {
         return;
     }
 
-    let fixture = fixture_path();
-    if !fixture.is_file() {
-        eprintln!(
-            "skipping compat-mode stop diagnostics test: fixture not present at {}",
-            fixture.display()
-        );
-        return;
-    }
-
+    let fixture = compile_arm64_spin_fixture();
     let compatra = compatra_binary();
     let output = Command::new(&compatra)
         .arg("--mode")
@@ -6888,7 +6984,7 @@ fn compat_mode_emits_runtime_stop_diagnostics_on_budget_exhaustion() {
         .env("COMPATRA_PLUGIN_TRACE", "1")
         .env("COMPATRA_TRACE_FORMAT", "jsonl")
         .env("COMPATRA_TRACE_PROFILE", "full")
-        .env("COMPATRA_MAX_INSTRUCTIONS", "1")
+        .env("COMPATRA_MAX_INSTRUCTIONS", "10000")
         .env("COMPATRA_TIMEOUT_USECS", "5000000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -7880,7 +7976,7 @@ fn compat_mode_rejects_truncated_system_command() {
         return;
     }
 
-    let fixture = compile_arm64_startup_glue_fixture();
+    let fixture = compile_arm64_system_truncation_fixture();
     let compatra = compatra_binary();
     let output = Command::new(&compatra)
         .arg("--mode")
@@ -7916,12 +8012,12 @@ fn compat_mode_rejects_truncated_system_command() {
     }
 
     assert!(
-        !status.success(),
-        "truncated system command fixture unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        status.success(),
+        "truncated system command fixture failed unexpectedly\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("system=-1") && stdout.contains("ok=0"),
-        "truncated system command did not fail in guest-visible output; stdout:\n{stdout}"
+        stdout.contains("compat system trunc ret=-1") && stdout.contains("ok=1"),
+        "truncated system command did not fail with guest-visible E2BIG; stdout:\n{stdout}"
     );
     assert!(
         stderr.contains("\"Call\":\"system\"")

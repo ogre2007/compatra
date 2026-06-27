@@ -160,8 +160,8 @@ pub use runner::{
     emulate_macos_binary_with_mode,
 };
 pub use runner_plugins::{
-    emit_event as emit_runner_trace_event, shared_trace_bus_for_mode_from_env,
-    shared_trace_bus_from_env, SharedTraceBus,
+    emit_event as emit_runner_trace_event, flush_shared_trace_bus,
+    shared_trace_bus_for_mode_from_env, shared_trace_bus_from_env, SharedTraceBus,
 };
 pub use runtime::{
     bind_process_fd_target, block_active_arm64_thread_on_cond, block_current_arm64_thread_on_cond,

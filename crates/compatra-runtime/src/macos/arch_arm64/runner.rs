@@ -1246,6 +1246,7 @@ pub fn emulate_macos_arm64_binary_with_mode(
                 .arg("RecentImports", recent_preview),
         );
     }
+    crate::macos::flush_shared_trace_bus(&trace_bus);
 
     result
 }

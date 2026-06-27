@@ -253,6 +253,7 @@ where
             .arg("Skip", summary.skipped.to_string())
             .arg("Fail", summary.failed.to_string()),
     );
+    crate::macos::flush_shared_trace_bus(&trace_bus);
 
     summary
 }

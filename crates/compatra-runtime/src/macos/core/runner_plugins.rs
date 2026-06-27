@@ -7,8 +7,36 @@
 use crate::macos::plugin_events::TraceMetadata;
 use crate::macos::trace::{StdoutTraceSink, TraceConfig, TraceEvent};
 use crate::macos::{EmulationOptions, MacosEmulator, RuntimeMode};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
-pub type SharedTraceBus = std::sync::mpsc::Sender<TraceEvent>;
+#[derive(Clone)]
+pub struct SharedTraceBus {
+    tx: mpsc::Sender<TraceEvent>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl SharedTraceBus {
+    pub fn send(&self, event: TraceEvent) -> Result<(), mpsc::SendError<TraceEvent>> {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        match self.tx.send(event) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.pending.fetch_sub(1, Ordering::Release);
+                Err(err)
+            }
+        }
+    }
+
+    fn mark_delivered(&self) {
+        self.pending.fetch_sub(1, Ordering::Release);
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+}
 
 pub fn shared_trace_bus_from_env() -> Option<SharedTraceBus> {
     let mode = RuntimeMode::from_env().unwrap_or_default();
@@ -61,15 +89,31 @@ pub fn shared_trace_bus_for_mode_from_env(mode: RuntimeMode) -> Option<SharedTra
         _ => TraceConfig::compact_jsonl(),
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<TraceEvent>();
+    let (tx, rx) = mpsc::channel::<TraceEvent>();
+    let bus = SharedTraceBus {
+        tx,
+        pending: Arc::new(AtomicUsize::new(0)),
+    };
+    let worker_bus = bus.clone();
     std::thread::spawn(move || {
         let mut emulator = MacosEmulator::<StdoutTraceSink>::stdout(options);
         while let Ok(event) = rx.recv() {
             emulator.emit_trace(event);
+            worker_bus.mark_delivered();
         }
     });
 
-    Some(tx)
+    Some(bus)
+}
+
+pub fn flush_shared_trace_bus(bus: &Option<SharedTraceBus>) {
+    let Some(bus) = bus else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while bus.pending_count() != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 pub fn emit_event(bus: &Option<SharedTraceBus>, metadata: &TraceMetadata, event: TraceEvent) {
