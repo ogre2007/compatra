@@ -445,8 +445,12 @@ mod tests {
             .running_process("sample");
 
         emulator.emit_syscall_event(&meta, "write");
+        emulator.emit_process_event(&meta, "emulation-stop", "emulation-stop");
 
         let output = String::from_utf8(emulator.into_tracer().into_sink().into_inner()).unwrap();
-        assert!(output.is_empty());
+        assert!(output.contains("\"plugin\":\"runtime\""));
+        assert!(output.contains("\"Call\":\"emulation-stop\""));
+        assert!(!output.contains("\"plugin\":\"procmon\""));
+        assert!(!output.contains("\"plugin\":\"syscalls\""));
     }
 }

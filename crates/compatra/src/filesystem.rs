@@ -10,9 +10,9 @@ use crate::{
 use crate::{
     allocate_guest_bytes, arm64_variadic_open_mode, clear_errno, host_call_error, host_call_result,
     host_call_value, host_errno, host_io_error, host_io_result, host_null_error, io_error_errno,
-    read_cstring, read_darwin_timeval, read_guest_i32, read_i16_at, read_i32_at, read_u64_at,
-    signed_return_value, write_guest_host_struct, write_guest_i32, write_guest_u64, write_i16_at,
-    write_i32_at,
+    read_cstring, read_cstring_with_truncation, read_darwin_timeval, read_guest_i32, read_i16_at,
+    read_i32_at, read_u64_at, signed_return_value, write_guest_host_struct, write_guest_i32,
+    write_guest_u64, write_i16_at, write_i32_at,
 };
 
 #[cfg(target_os = "macos")]
@@ -4076,7 +4076,11 @@ fn proxy_host_popen<M: GuestMemory + ?Sized>(
     command_ptr: u64,
     mode_ptr: u64,
 ) -> Option<HostCallResult> {
-    let command = read_cstring(memory, command_ptr, HOST_PATH_BUFFER_SIZE).ok()?;
+    let (command, truncated) =
+        read_cstring_with_truncation(memory, command_ptr, crate::max_guest_command_bytes()).ok()?;
+    if truncated {
+        return Some(host_null_error(libc::E2BIG as u32));
+    }
     let mode = read_cstring(memory, mode_ptr, 64).ok()?;
     let host_command = CString::new(command).ok()?;
     let host_mode = CString::new(mode).ok()?;

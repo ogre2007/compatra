@@ -3,7 +3,8 @@ use crate::macos::emulation::MacosEmulator;
 #[cfg(feature = "analysis")]
 use crate::macos::plugin_events::{capture_event, detect_event, TraceMetadata};
 #[cfg(feature = "analysis")]
-use crate::macos::trace::{CallTracePlugin, PluginRegistry, TraceCategory, TraceSink};
+use crate::macos::trace::TraceSink;
+use crate::macos::trace::{CallTracePlugin, PluginRegistry, TraceCategory};
 use crate::macos::RuntimeMode;
 
 #[cfg(feature = "analysis")]
@@ -53,18 +54,31 @@ pub fn register_analysis_plugins(registry: &mut PluginRegistry) {
 #[cfg(not(feature = "analysis"))]
 pub fn register_analysis_plugins(_registry: &mut crate::macos::trace::PluginRegistry) {}
 
+fn register_compat_runtime_plugins(registry: &mut PluginRegistry) {
+    registry.register(
+        CallTracePlugin::new("runtime")
+            .category(TraceCategory::Process)
+            .category(TraceCategory::Thread),
+    );
+}
+
 #[cfg(feature = "analysis")]
 pub fn register_trace_plugins_for_mode(registry: &mut PluginRegistry, mode: RuntimeMode) {
-    if AnalysisServices::for_mode(mode).is_some() {
+    if mode.is_compat() {
+        register_compat_runtime_plugins(registry);
+    } else if AnalysisServices::for_mode(mode).is_some() {
         register_analysis_plugins(registry);
     }
 }
 
 #[cfg(not(feature = "analysis"))]
 pub fn register_trace_plugins_for_mode(
-    _registry: &mut crate::macos::trace::PluginRegistry,
-    _mode: RuntimeMode,
+    registry: &mut crate::macos::trace::PluginRegistry,
+    mode: RuntimeMode,
 ) {
+    if mode.is_compat() {
+        register_compat_runtime_plugins(registry);
+    }
 }
 
 #[cfg(feature = "analysis")]

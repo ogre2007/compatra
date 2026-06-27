@@ -1616,6 +1616,7 @@ pub fn install_arm64_pthread_imports(
     if let Some(&addr) = stub_map.get("_pthread_mutex_init") {
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1642,6 +1643,12 @@ pub fn install_arm64_pthread_imports(
                         mutex, attr, thread_id
                     ),
                 );
+                let event =
+                    arm64_thread_event(thread_id, "pthread-mutex-init", "pthread_mutex_init")
+                        .arg("Mutex", format!("0x{:X}", mutex))
+                        .arg("Attr", format!("0x{:X}", attr))
+                        .arg("Result", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
 
                 println!(
                     "[IMPORT][arm64] _pthread_mutex_init mutex=0x{:X} attr=0x{:X} tid={} -> 0",
@@ -1654,6 +1661,7 @@ pub fn install_arm64_pthread_imports(
     if let Some(&addr) = stub_map.get("_pthread_mutex_lock") {
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1681,6 +1689,12 @@ pub fn install_arm64_pthread_imports(
                         mutex, thread_id, owner_before
                     ),
                 );
+                let event =
+                    arm64_thread_event(thread_id, "pthread-mutex-lock", "pthread_mutex_lock")
+                        .arg("Mutex", format!("0x{:X}", mutex))
+                        .arg("PrevOwner", owner_before.to_string())
+                        .arg("Result", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
                 println!(
                     "[IMPORT][arm64] _pthread_mutex_lock mutex=0x{:X} tid={} prev_owner={} -> 0",
                     mutex, thread_id, owner_before
@@ -1692,6 +1706,7 @@ pub fn install_arm64_pthread_imports(
     if let Some(&addr) = stub_map.get("_pthread_mutex_unlock") {
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -1718,6 +1733,12 @@ pub fn install_arm64_pthread_imports(
                         mutex, thread_id, owner_before
                     ),
                 );
+                let event =
+                    arm64_thread_event(thread_id, "pthread-mutex-unlock", "pthread_mutex_unlock")
+                        .arg("Mutex", format!("0x{:X}", mutex))
+                        .arg("PrevOwner", owner_before.to_string())
+                        .arg("Result", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
                 println!(
                     "[IMPORT][arm64] _pthread_mutex_unlock mutex=0x{:X} tid={} prev_owner={} -> 0",
                     mutex, thread_id, owner_before

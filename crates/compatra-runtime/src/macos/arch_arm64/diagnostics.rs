@@ -116,6 +116,22 @@ fn read_byte_preview(emu: &mut UnicornEmulator, addr: u64, count: usize) -> Opti
     Some(lossy_data_preview(&bytes, count))
 }
 
+fn hex_byte_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn read_hex_preview(emu: &mut UnicornEmulator, addr: u64, count: usize) -> Option<String> {
+    if addr < 0x1000 || count == 0 {
+        return None;
+    }
+    let bytes = emu.read_memory(addr, count).ok()?;
+    Some(hex_byte_preview(&bytes))
+}
+
 fn current_arm64_brk_immediate(emu: &mut UnicornEmulator) -> Option<u16> {
     let pc = emu.read_reg("pc").ok()?;
     let bytes = emu.read_memory(pc, 4).ok()?;
@@ -348,7 +364,7 @@ pub fn run_arm64_with_diagnostics(
         let x0 = emulator.read_reg("x0").unwrap_or(0);
         let x1 = emulator.read_reg("x1").unwrap_or(0);
         let x2 = emulator.read_reg("x2").unwrap_or(0);
-        let event = process_event(&metadata, "emulation-stop", "emulation-stop")
+        let mut event = process_event(&metadata, "emulation-stop", "emulation-stop")
             .arg("Status", status)
             .arg("Detail", detail.to_string())
             .arg("Pc", format!("0x{:X}", pc))
@@ -378,6 +394,63 @@ pub fn run_arm64_with_diagnostics(
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .to_string(),
             );
+        if let Some(last_stub) = report
+            .last_stub
+            .lock()
+            .ok()
+            .and_then(|last_stub| last_stub.clone())
+        {
+            event = event.arg("LastStub", last_stub);
+        }
+        if let Some(recent_imports) = report
+            .recent_imports
+            .lock()
+            .ok()
+            .map(|items| items.iter().cloned().collect::<Vec<_>>().join(" | "))
+        {
+            if !recent_imports.is_empty() {
+                event = event.arg("RecentImports", recent_imports);
+            }
+        }
+        if let Some(bytes) = read_hex_preview(emulator, pc, 32) {
+            event = event.arg("PcBytes", bytes);
+        }
+        if let Some(window_start) = pc.checked_sub(16) {
+            if let Some(bytes) = read_hex_preview(emulator, window_start, 64) {
+                event = event
+                    .arg("PcWindowStart", format!("0x{:X}", window_start))
+                    .arg("PcWindowBytes", bytes);
+            }
+        }
+        if let Some(preview) = read_qword_preview(emulator, sp, 8) {
+            event = event.arg("SpQwords", preview);
+        }
+        if let Some(preview) = read_qword_preview(emulator, x0, 4) {
+            event = event.arg("X0Qwords", preview);
+        }
+        if let Some(preview) = read_qword_preview(emulator, x1, 4) {
+            event = event.arg("X1Qwords", preview);
+        }
+        if let Some(preview) = read_qword_preview(emulator, x2, 4) {
+            event = event.arg("X2Qwords", preview);
+        }
+        if matches!(
+            detail,
+            "instruction_budget_exhausted" | "timeout_budget_exhausted"
+        ) {
+            let trace_start = pc.saturating_sub(0x40);
+            let trace_end = pc.saturating_add(0x40);
+            event = event
+                .arg("TraceWindowHintStart", format!("0x{:X}", trace_start))
+                .arg("TraceWindowHintEnd", format!("0x{:X}", trace_end))
+                .arg(
+                    "TraceWindowHintEnv",
+                    format!(
+                        "COMPATRA_TRACE_WINDOW_START=0x{:X} COMPATRA_TRACE_WINDOW_END=0x{:X} COMPATRA_TRACE_WINDOW_HITS=128",
+                        trace_start, trace_end
+                    ),
+                );
+        }
         emit_runner_trace_event(&report.trace_bus, &metadata, event);
     };
 
@@ -464,4 +537,14 @@ pub fn run_arm64_with_diagnostics(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_byte_preview;
+
+    #[test]
+    fn hex_byte_preview_is_compact_and_stable() {
+        assert_eq!(hex_byte_preview(&[0x00, 0xAB, 0x10, 0xFF]), "00 AB 10 FF");
+    }
 }

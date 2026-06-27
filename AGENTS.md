@@ -149,6 +149,11 @@ add new ones):
   is `--compat-log-filter`.
 - `COMPATRA_COMPAT_LOG_PREVIEW_BYTES` — byte cap for escaped text/hex previews
   in compat I/O logs; CLI form is `--compat-log-preview-bytes`.
+- `COMPATRA_COMPAT_MAX_COMMAND_BYTES` — maximum length read for a guest
+  `system()`/`popen()` command string; default is 1 MiB (`MAX_GUEST_STRING_BYTES`),
+  matching macOS's own `ARG_MAX`. Hitting the cap without finding the guest
+  string's NUL terminator is logged as `Truncated: true` and rejected with
+  `E2BIG` rather than silently executing a cut-off command.
 - `COMPATRA_COMPAT_REPORT` — emit a final compat capability JSONL summary to
   stderr with proxied call counts, failed proxies, unresolved import-stub hits,
   unresolved `dlsym` symbols, and top framework families. Values `1`, `true`,

@@ -655,6 +655,71 @@ mod tests {
             stub_region.bucket(0x2000_0A00)
         ));
     }
+
+    #[test]
+    fn tlv_bootstrap_and_tlv_atexit_are_recognized_runtime_hook_symbols() {
+        // Both TLS runtime symbols must be recognised so their code hooks
+        // fire when a stub is hit, regardless of which runtime mode is active.
+        for mode in [RuntimeMode::Analysis, RuntimeMode::Compat] {
+            assert!(
+                arm64_import_has_runtime_hook("__tlv_bootstrap", mode),
+                "__tlv_bootstrap must have a runtime hook in {mode:?}"
+            );
+            assert!(
+                arm64_import_has_runtime_hook("__tlv_atexit", mode),
+                "__tlv_atexit must have a runtime hook in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tlv_bootstrap_stub_bytes_are_valid_for_both_modes() {
+        // arm64_stub_bytes must produce non-empty bytes for __tlv_bootstrap
+        // in both runtime modes; an empty result would mean the symbol was
+        // not handled and the emulator would write nothing into the stub slot,
+        // leaving the __thread_vars entry pointing at garbage on the stack.
+        assert!(
+            !arm64_stub_bytes("__tlv_bootstrap", RuntimeMode::Analysis).is_empty(),
+            "analysis-mode stub bytes for __tlv_bootstrap must not be empty"
+        );
+        assert!(
+            !arm64_stub_bytes("__tlv_bootstrap", RuntimeMode::Compat).is_empty(),
+            "compat-mode stub bytes for __tlv_bootstrap must not be empty"
+        );
+    }
+
+    #[test]
+    fn tlv_bootstrap_absent_from_typical_rust_binary_undefs() {
+        // Rust binaries typically import __tlv_atexit explicitly (it appears
+        // in their undefined-symbol table and gets a stub via the normal
+        // undefs loop) but NOT __tlv_bootstrap (dyld provides it privately
+        // without the binary declaring it). This test documents that asymmetry
+        // and acts as a canary: if __tlv_bootstrap ever starts appearing in
+        // the explicit undefs of common Rust samples, the synthetic-stub path
+        // in install_arm64_return_stubs becomes a harmless no-op (guarded by
+        // `if !stub_map.contains_key("__tlv_bootstrap")`), so the fix remains
+        // correct in both the current and the hypothetical future case.
+        //
+        // We can't instantiate a real stub_map here without an emulator, so
+        // we verify the asymmetry at the hook-classifier level: __tlv_atexit
+        // has a runtime hook (it's in the recognised-symbols list and will be
+        // processed by the undefs loop when present), and the same is true for
+        // __tlv_bootstrap (so the synthetic stub, once inserted, fires the
+        // correct hook).
+        assert!(arm64_import_has_runtime_hook(
+            "__tlv_atexit",
+            RuntimeMode::Analysis
+        ));
+        assert!(arm64_import_has_runtime_hook(
+            "__tlv_bootstrap",
+            RuntimeMode::Analysis
+        ));
+        // A generic unknown symbol, by contrast, must not claim a hook.
+        assert!(!arm64_import_has_runtime_hook(
+            "_no_such_symbol_xyz",
+            RuntimeMode::Analysis
+        ));
+    }
 }
 
 pub fn install_arm64_return_stubs(
@@ -694,6 +759,49 @@ pub fn install_arm64_return_stubs(
             )
             .arg("Symbol", name.clone())
             .arg("StubAddr", format!("0x{:X}", stub_addr)),
+        );
+        stub_addr += IMPORT_STUB_STRIDE;
+    }
+
+    // Force-install __tlv_bootstrap as a synthetic stub even when the binary
+    // does not declare it as an explicit undefined symbol. On real macOS,
+    // dyld provides __tlv_bootstrap privately as part of its TLS runtime and
+    // writes its address into the first slot of every __thread_vars section
+    // entry at load time, without the binary needing to list it in its
+    // undefined-symbol table. Because machoscope replaces dyld with its own
+    // loader, it must perform the same patching step. If __tlv_bootstrap is
+    // absent from stub_map, binary_setup.rs silently skips all __thread_vars
+    // patching (those slots remain zero), and any binary that accesses a
+    // thread-local variable will execute `ldr x8, [x0]; blr x8` with x8=0,
+    // causing UC_ERR_FETCH_PROT at PC=0x0.
+    //
+    // All Rust binaries hit this path: the Rust standard library accesses
+    // TLS for its stack-overflow guard immediately after the guard-page
+    // mmap/mprotect sequence, before any other meaningful work. The binary
+    // imports __tlv_atexit explicitly (to register TLS destructors) but not
+    // __tlv_bootstrap (dyld fills that in), so it is always absent from the
+    // undefs-driven stub_map unless we add it here.
+    if !stub_map.contains_key("__tlv_bootstrap") {
+        while stub_addr == stub_region.done_addr || Some(stub_addr) == stub_region.thread_exit_stub
+        {
+            stub_addr += IMPORT_STUB_STRIDE;
+        }
+        let tlv_bootstrap_stub_addr = stub_addr;
+        let _ = emulator.write_memory(
+            tlv_bootstrap_stub_addr,
+            arm64_stub_bytes("__tlv_bootstrap", runtime_mode),
+        );
+        stub_map.insert("__tlv_bootstrap".to_string(), tlv_bootstrap_stub_addr);
+        emit_arm64_event(
+            trace_bus,
+            process_event(
+                &runtime_process_metadata(process_name.to_string()),
+                "import-stub",
+                "install_import_stub",
+            )
+            .arg("Symbol", "__tlv_bootstrap".to_string())
+            .arg("StubAddr", format!("0x{:X}", tlv_bootstrap_stub_addr))
+            .arg("Synthetic", "true"),
         );
         stub_addr += IMPORT_STUB_STRIDE;
     }

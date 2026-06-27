@@ -1272,18 +1272,23 @@ impl CompatibilityServices {
                 }
             }
             if matches!(kind, HostImportKind::System) {
-                let command = if args[0] == 0 {
-                    "<null>".to_string()
+                let (command, truncated) = if args[0] == 0 {
+                    ("<null>".to_string(), false)
                 } else {
-                    read_cstring(memory, args[0], 4096).unwrap_or_else(|_| "<invalid>".to_string())
+                    read_cstring_with_truncation(memory, args[0], max_guest_command_bytes())
+                        .unwrap_or_else(|_| ("<invalid>".to_string(), false))
                 };
                 log_arg_pairs.push(("Command".to_string(), command));
+                if truncated {
+                    log_arg_pairs.push(("Truncated".to_string(), "true".to_string()));
+                }
             }
             if matches!(kind, HostImportKind::POpen) {
-                let command = if args[0] == 0 {
-                    "<null>".to_string()
+                let (command, truncated) = if args[0] == 0 {
+                    ("<null>".to_string(), false)
                 } else {
-                    read_cstring(memory, args[0], 4096).unwrap_or_else(|_| "<invalid>".to_string())
+                    read_cstring_with_truncation(memory, args[0], max_guest_command_bytes())
+                        .unwrap_or_else(|_| ("<invalid>".to_string(), false))
                 };
                 let mode = if args[1] == 0 {
                     "<null>".to_string()
@@ -1291,6 +1296,9 @@ impl CompatibilityServices {
                     read_cstring(memory, args[1], 64).unwrap_or_else(|_| "<invalid>".to_string())
                 };
                 log_arg_pairs.push(("Command".to_string(), command));
+                if truncated {
+                    log_arg_pairs.push(("Truncated".to_string(), "true".to_string()));
+                }
                 log_arg_pairs.push(("Mode".to_string(), mode));
             }
             if matches!(kind, HostImportKind::GetPwNam) {
@@ -2730,7 +2738,8 @@ fn proxy_guest_system<M: GuestMemory + ?Sized>(
     if command_ptr == 0 {
         return Some(host_call_value(1));
     }
-    let command = match read_cstring(memory, command_ptr, 4096) {
+    let max_len = max_guest_command_bytes();
+    let (command, truncated) = match read_cstring_with_truncation(memory, command_ptr, max_len) {
         Ok(command) => command,
         Err(_) => return Some(host_call_error(libc::EFAULT as u32)),
     };
@@ -2738,6 +2747,22 @@ fn proxy_guest_system<M: GuestMemory + ?Sized>(
         ("Command", Some(command.clone())),
         ("Shell", Some("/bin/sh".to_string())),
     ];
+    if truncated {
+        fields.push(("Truncated", Some("true".to_string())));
+        fields.push(("Model", Some("command-too-large".to_string())));
+        fields.push((
+            "Reason",
+            Some("guest command string exceeded configured byte cap before NUL".to_string()),
+        ));
+        let result = host_call_error(libc::E2BIG as u32);
+        emit_exec_model_log(
+            "system",
+            vec![("command", hex_arg(command_ptr))],
+            fields,
+            &result,
+        );
+        return Some(result);
+    }
     let result = match Command::new("/bin/sh").arg("-c").arg(&command).status() {
         Ok(status) => {
             let wait_status = status
@@ -3388,24 +3413,64 @@ fn read_cstring<M: GuestMemory + ?Sized>(
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn read_cstring_with_truncation<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    max_len: usize,
+) -> Result<(String, bool), GuestMemoryError> {
+    let (bytes, truncated) = read_cstring_bytes_with_truncation(memory, addr, max_len)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
+#[cfg(target_os = "macos")]
 fn read_cstring_bytes<M: GuestMemory + ?Sized>(
     memory: &mut M,
     addr: u64,
     max_len: usize,
 ) -> Result<Vec<u8>, GuestMemoryError> {
+    Ok(read_cstring_bytes_with_truncation(memory, addr, max_len)?.0)
+}
+
+#[cfg(target_os = "macos")]
+fn read_cstring_bytes_with_truncation<M: GuestMemory + ?Sized>(
+    memory: &mut M,
+    addr: u64,
+    max_len: usize,
+) -> Result<(Vec<u8>, bool), GuestMemoryError> {
     let mut bytes = Vec::new();
-    for offset in 0..max_len {
-        let byte = memory
-            .read_memory(addr.saturating_add(offset as u64), 1)?
-            .first()
-            .copied()
-            .ok_or(GuestMemoryError)?;
-        if byte == 0 {
-            break;
+    let mut offset = 0usize;
+    while offset < max_len {
+        let chunk_len = CSTRING_READ_CHUNK_BYTES.min(max_len - offset);
+        let chunk_addr = addr.saturating_add(offset as u64);
+        match memory.read_memory(chunk_addr, chunk_len) {
+            Ok(chunk) => {
+                if let Some(nul_index) = chunk.iter().position(|&byte| byte == 0) {
+                    bytes.extend_from_slice(&chunk[..nul_index]);
+                    return Ok((bytes, false));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                // The chunk spans into unmapped memory. Fall back to a
+                // byte-at-a-time scan over just this chunk so we still find
+                // a terminator that lies before the unmapped boundary,
+                // matching the original byte-at-a-time behavior exactly.
+                for sub_offset in 0..chunk_len {
+                    let byte = memory
+                        .read_memory(chunk_addr.saturating_add(sub_offset as u64), 1)?
+                        .first()
+                        .copied()
+                        .ok_or(GuestMemoryError)?;
+                    if byte == 0 {
+                        return Ok((bytes, false));
+                    }
+                    bytes.push(byte);
+                }
+            }
         }
-        bytes.push(byte);
+        offset += chunk_len;
     }
-    Ok(bytes)
+    Ok((bytes, guest_command_was_truncated(offset, max_len)))
 }
 
 #[cfg(target_os = "macos")]
@@ -3464,6 +3529,43 @@ const MAX_GUEST_SYSCTL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GUEST_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_GUEST_STRING_BYTES: usize = 1024 * 1024;
+
+/// Chunk size used by `read_cstring_bytes` when scanning guest memory for a
+/// NUL terminator. Reads are attempted a whole chunk at a time and only fall
+/// back to a byte-at-a-time scan if a chunk read fails (e.g. the string ends
+/// near an unmapped boundary), so this is a performance knob only: it must
+/// never change the bytes a caller observes, only how many guest-memory
+/// round trips it costs to get them.
+#[cfg(target_os = "macos")]
+const CSTRING_READ_CHUNK_BYTES: usize = 4096;
+
+/// Environment override for the maximum length of a guest `system()`/
+/// `popen()` command string. Defaults to `MAX_GUEST_STRING_BYTES` (1 MiB),
+/// which mirrors macOS's own `ARG_MAX` (`sysctl kern.argmax`): a command
+/// longer than that would not run via `system()`/`popen()` on real macOS
+/// either, so 1 MiB is a realistic ceiling rather than an arbitrary one.
+#[cfg(target_os = "macos")]
+const COMPAT_MAX_COMMAND_BYTES_ENV: &str = "COMPATRA_COMPAT_MAX_COMMAND_BYTES";
+
+/// Resolves the maximum number of bytes read for a guest `system()`/
+/// `popen()` command string, honoring `COMPATRA_COMPAT_MAX_COMMAND_BYTES`
+/// when it is set to a valid, non-zero value.
+#[cfg(target_os = "macos")]
+pub(crate) fn max_guest_command_bytes() -> usize {
+    std::env::var(COMPAT_MAX_COMMAND_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(MAX_GUEST_STRING_BYTES)
+}
+
+/// True when a guest cstring read consumed its entire length budget without
+/// finding a NUL terminator, i.e. the returned bytes are a truncated prefix
+/// of a longer (or unterminated) guest string rather than the whole thing.
+#[cfg(target_os = "macos")]
+fn guest_command_was_truncated(read_len: usize, max_len: usize) -> bool {
+    read_len >= max_len
+}
 
 #[cfg(any(target_os = "macos", test))]
 fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -5632,6 +5734,38 @@ fn proxy_guest_strto_integral<M: GuestMemory + ?Sized>(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn command_cap_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[cfg(target_os = "macos")]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn analysis_mode_has_no_compat_services() {
         assert_eq!(CompatibilityServices::for_mode(RuntimeMode::Analysis), None);
@@ -6125,6 +6259,177 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn guest_command_truncation_is_detected_at_cap() {
+        assert!(!guest_command_was_truncated(10, 4096));
+        assert!(!guest_command_was_truncated(4095, 4096));
+        assert!(guest_command_was_truncated(4096, 4096));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_cstring_bytes_falls_back_to_byte_scan_past_unmapped_chunk_boundary() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        // Only 3 bytes are actually mapped, so any chunk read larger than 3
+        // bytes starting at 0x9000 fails (mirroring Unicorn refusing a read
+        // that spans into unmapped guest memory). The chunked scan must fall
+        // back to a byte-at-a-time read for that chunk and still find the
+        // terminator that lies before the unmapped boundary.
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x9000, b"hi\0");
+
+        let bytes = read_cstring_bytes(&mut memory, 0x9000, CSTRING_READ_CHUNK_BYTES).expect(
+            "short, properly-terminated string should still read past an unmapped chunk tail",
+        );
+
+        assert_eq!(bytes, b"hi");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_proxy_runs_shell_command_longer_than_old_4096_byte_cap() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        // A long shell comment (> the old 4096-byte cap) followed by a real
+        // `exit 7`. Under the old hardcoded 4096-byte read, this would be
+        // truncated to just the comment line, which is valid-but-harmless
+        // shell and exits 0. With the fix, the full command including
+        // `exit 7` is read and executed, so the wait status reflects it.
+        let padding = "A".repeat(5000);
+        let mut command = format!("# {padding}\nexit 7").into_bytes();
+        command.push(0);
+        assert!(
+            command.len() > 4096,
+            "test command must exceed the old hardcoded cap"
+        );
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, &command);
+
+        let result = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_system", &[0x1000, 0, 0, 0, 0, 0, 0, 0])
+            .expect("system should be proxied");
+
+        assert_eq!(
+            result.return_value,
+            7 << 8,
+            "command longer than 4096 bytes must not be silently truncated"
+        );
+        assert_eq!(result.errno, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_proxy_rejects_command_without_nul_before_cap() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let _env_lock = command_cap_env_lock().lock().unwrap();
+        let _env = EnvVarGuard::set(COMPAT_MAX_COMMAND_BYTES_ENV, "16");
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, b"# harmless prefix that must not run\nexit 7\0");
+
+        let result = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_system", &[0x1000, 0, 0, 0, 0, 0, 0, 0])
+            .expect("system should be proxied");
+
+        assert_eq!(
+            result.return_value,
+            u64::MAX,
+            "truncated shell commands must not execute a guest prefix"
+        );
+        assert_eq!(result.errno, Some(libc::E2BIG as u32));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn popen_proxy_returns_host_stdout_readable_by_fgets() {
         struct TestMemory {
             bytes: std::collections::HashMap<u64, u8>,
@@ -6209,6 +6514,164 @@ mod tests {
             .proxy_arm64_import(&mut memory, "_pclose", &[stream, 0, 0, 0, 0, 0, 0, 0])
             .expect("pclose should close proxied popen stream");
         assert_eq!(pclose.return_value, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn popen_proxy_runs_command_longer_than_old_4096_byte_cap() {
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+            next_alloc: u64,
+        }
+
+        impl Default for TestMemory {
+            fn default() -> Self {
+                Self {
+                    bytes: std::collections::HashMap::new(),
+                    next_alloc: 0x8000,
+                }
+            }
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+
+            fn allocate_memory(
+                &mut self,
+                size: usize,
+                alignment: usize,
+            ) -> Result<u64, GuestMemoryError> {
+                let align = alignment.max(1) as u64;
+                let addr = (self.next_alloc + align - 1) & !(align - 1);
+                self.next_alloc = addr.saturating_add(size as u64).saturating_add(align);
+                self.write_guest(addr, &vec![0; size]);
+                Ok(addr)
+            }
+
+            fn free_memory(&mut self, addr: u64) -> Result<(), GuestMemoryError> {
+                for offset in 0..64 {
+                    self.bytes.remove(&(addr + offset));
+                }
+                Ok(())
+            }
+        }
+
+        // Same idea as the `_system` regression test: a long comment line
+        // (> the old 4096-byte cap) followed by a real `printf`. Truncation
+        // would cut the command down to just the harmless comment, and
+        // `fgets` would observe end-of-stream instead of the expected line.
+        let padding = "A".repeat(5000);
+        let mut command = format!("# {padding}\nprintf 'compatra-popen-long\\n'").into_bytes();
+        command.push(0);
+        assert!(
+            command.len() > 4096,
+            "test command must exceed the old hardcoded cap"
+        );
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(0x1000, &command);
+        memory.write_guest(0x20000, b"r\0");
+
+        let stream = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_popen", &[0x1000, 0x20000, 0, 0, 0, 0, 0, 0])
+            .expect("popen should be proxied")
+            .return_value;
+        assert_ne!(stream, 0);
+
+        let fgets = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_fgets", &[0x21000, 64, stream, 0, 0, 0, 0, 0])
+            .expect("fgets should read proxied popen stream");
+        assert_eq!(
+            fgets.return_value, 0x21000,
+            "command longer than 4096 bytes must not be silently truncated"
+        );
+
+        let output = memory
+            .read_memory(0x21000, "compatra-popen-long\n\0".len())
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output), "compatra-popen-long\n\0");
+
+        let pclose = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_pclose", &[stream, 0, 0, 0, 0, 0, 0, 0])
+            .expect("pclose should close proxied popen stream");
+        assert_eq!(pclose.return_value, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn popen_proxy_rejects_command_without_nul_before_cap() {
+        #[derive(Default)]
+        struct TestMemory {
+            bytes: std::collections::HashMap<u64, u8>,
+        }
+
+        impl TestMemory {
+            fn write_guest(&mut self, addr: u64, data: &[u8]) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.bytes.insert(addr + offset as u64, *byte);
+                }
+            }
+        }
+
+        impl GuestMemory for TestMemory {
+            fn read_memory(&mut self, addr: u64, size: usize) -> Result<Vec<u8>, GuestMemoryError> {
+                (0..size)
+                    .map(|offset| {
+                        self.bytes
+                            .get(&(addr + offset as u64))
+                            .copied()
+                            .ok_or(GuestMemoryError)
+                    })
+                    .collect()
+            }
+
+            fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), GuestMemoryError> {
+                self.write_guest(addr, data);
+                Ok(())
+            }
+        }
+
+        let _env_lock = command_cap_env_lock().lock().unwrap();
+        let _env = EnvVarGuard::set(COMPAT_MAX_COMMAND_BYTES_ENV, "16");
+
+        let mut memory = TestMemory::default();
+        memory.write_guest(
+            0x1000,
+            b"# harmless prefix that must not run\nprintf nope\n\0",
+        );
+        memory.write_guest(0x2000, b"r\0");
+
+        let result = CompatibilityServices
+            .proxy_arm64_import(&mut memory, "_popen", &[0x1000, 0x2000, 0, 0, 0, 0, 0, 0])
+            .expect("popen should be proxied");
+
+        assert_eq!(
+            result.return_value, 0,
+            "truncated popen commands must fail with a null FILE*"
+        );
+        assert_eq!(result.errno, Some(libc::E2BIG as u32));
     }
 
     #[cfg(target_os = "macos")]

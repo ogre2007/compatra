@@ -78,6 +78,24 @@ fn stderr_log_excerpt(stderr: &str, max_lines: usize) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn has_line_with(trace: &str, parts: &[&str]) -> bool {
+    trace
+        .lines()
+        .any(|line| parts.iter().all(|part| line.contains(part)))
+}
+
+#[cfg(target_os = "macos")]
+fn assert_line_with(trace: &str, parts: &[&str], description: &str) {
+    assert!(
+        has_line_with(trace, parts),
+        "compat trace did not contain {}.\nrequired fragments: {:?}\ntrace excerpt:\n{}",
+        description,
+        parts,
+        text_excerpt(trace, 4000)
+    );
+}
+
+#[cfg(target_os = "macos")]
 fn compile_arm64_write_fixture() -> PathBuf {
     let out_dir = generated_fixture_dir();
     fs::create_dir_all(&out_dir).expect("failed to create generated fixture directory");
@@ -1224,7 +1242,14 @@ static int exercise_startup_glue(
     int exec_ret = execl_impl("/compatra/compat/no-such-helper", "no-such-helper", (char *)0);
     int exec_errno = errno;
 
-    int system_ret = system_impl("exit 0");
+    char long_system_command[5024];
+    memset(long_system_command, 'A', sizeof(long_system_command));
+    long_system_command[0] = '#';
+    long_system_command[1] = ' ';
+    long_system_command[5002] = '\n';
+    memcpy(long_system_command + 5003, "exit 0", 6);
+    long_system_command[5009] = '\0';
+    int system_ret = system_impl(long_system_command);
 
     size_t prime = next_prime_impl(1000);
     uint64_t guard = 0;
@@ -6748,7 +6773,7 @@ fn compat_mode_executes_arm64_hello_without_analysis_trace_plugins() {
         .env("COMPATRA_TRACE_FORMAT", "jsonl")
         .env("COMPATRA_PROFILE", "short")
         // The compat trace bus intentionally has no analysis plugin preset,
-        // so enable legacy startup diagnostics only for this smoke test. These
+        // so keep legacy startup diagnostics in this smoke test too. These
         // markers prove Unicorn entered guest arm64 code and returned through
         // the synthetic done address instead of merely accepting the CLI input.
         .env("COMPATRA_DEBUG_STDOUT", "1")
@@ -6833,6 +6858,85 @@ fn compat_mode_executes_arm64_hello_without_analysis_trace_plugins() {
             "compat mode emitted analysis trace fragment {forbidden:?}\nstdout:\n{stdout}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_emits_runtime_stop_diagnostics_on_budget_exhaustion() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode stop diagnostics test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = fixture_path();
+    if !fixture.is_file() {
+        eprintln!(
+            "skipping compat-mode stop diagnostics test: fixture not present at {}",
+            fixture.display()
+        );
+        return;
+    }
+
+    let compatra = compatra_binary();
+    let output = Command::new(&compatra)
+        .arg("--mode")
+        .arg("compat")
+        .arg(&fixture)
+        .env("COMPATRA_PLUGIN_TRACE", "1")
+        .env("COMPATRA_TRACE_FORMAT", "jsonl")
+        .env("COMPATRA_TRACE_PROFILE", "full")
+        .env("COMPATRA_MAX_INSTRUCTIONS", "1")
+        .env("COMPATRA_TIMEOUT_USECS", "5000000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch compatra binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("compatra stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stop_line = stdout
+        .lines()
+        .find(|line| line.contains("\"Call\":\"emulation-stop\""))
+        .unwrap_or("<missing emulation-stop>");
+
+    eprintln!(
+        "compat proof(stop diagnostics): command={} --mode compat {}",
+        compatra.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(stop diagnostics): status={status}");
+    eprintln!("compat proof(stop diagnostics): stop={stop_line}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(stop diagnostics): stderr:\n{stderr}");
+    }
+
+    assert!(
+        status.success(),
+        "compatra exited with non-zero status {:?}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout,
+        stderr
+    );
+    assert_line_with(
+        &stdout,
+        &[
+            "\"plugin\":\"runtime\"",
+            "\"Call\":\"emulation-stop\"",
+            "\"Detail\":\"instruction_budget_exhausted\"",
+            "\"PcBytes\":\"",
+            "\"SpQwords\":\"",
+            "\"TraceWindowHintEnv\":\"COMPATRA_TRACE_WINDOW_START=0x",
+        ],
+        "runtime emulation-stop diagnostics for an instruction-budget stop",
+    );
+    assert!(
+        !stdout.contains("\"plugin\":\"procmon\""),
+        "compat stop diagnostics used analysis procmon plugin; stdout:\n{stdout}"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -7751,7 +7855,7 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
         "issetugid",
         "\"Call\":\"execl\"",
         "\"Call\":\"system\"",
-        "\"Command\":\"exit 0\"",
+        "exit 0",
         "\"Call\":\"next_prime\"",
         "\"Symbol\":\"__next_prime\"",
         "__cxa_guard_acquire",
@@ -7763,6 +7867,68 @@ fn compat_mode_proxies_startup_glue_and_libcpp_scalar_imports() {
             "startup glue compat log missing fragment {fragment:?}\nstderr:\n{stderr}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compat_mode_rejects_truncated_system_command() {
+    if std::env::consts::ARCH != "x86_64" {
+        eprintln!(
+            "skipping Intel macOS compat-mode truncated system test on {}",
+            std::env::consts::ARCH
+        );
+        return;
+    }
+
+    let fixture = compile_arm64_startup_glue_fixture();
+    let compatra = compatra_binary();
+    let output = Command::new(&compatra)
+        .arg("--mode")
+        .arg("compat")
+        .arg("--compat-log")
+        .arg("verbose")
+        .arg("--compat-log-filter")
+        .arg("system")
+        .arg(&fixture)
+        .env("COMPATRA_PLUGIN_TRACE", "1")
+        .env("COMPATRA_TRACE_FORMAT", "jsonl")
+        .env("COMPATRA_PROFILE", "short")
+        .env("COMPATRA_DEBUG_STDOUT", "1")
+        .env("COMPATRA_COMPAT_MAX_COMMAND_BYTES", "64")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch compatra binary");
+
+    let status = output.status;
+    let stdout = String::from_utf8(output.stdout).expect("compatra stdout was not UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    eprintln!(
+        "compat proof(system truncation): command={} --mode compat --compat-log verbose --compat-log-filter system COMPATRA_COMPAT_MAX_COMMAND_BYTES=64 {}",
+        compatra.display(),
+        fixture.display()
+    );
+    eprintln!("compat proof(system truncation): status={status}");
+    eprintln!("compat proof(system truncation): stdout={stdout:?}");
+    if !stderr.trim().is_empty() {
+        eprintln!("compat proof(system truncation): stderr:\n{stderr}");
+    }
+
+    assert!(
+        !status.success(),
+        "truncated system command fixture unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("system=-1") && stdout.contains("ok=0"),
+        "truncated system command did not fail in guest-visible output; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("\"Call\":\"system\"")
+            && stderr.contains("\"Truncated\":\"true\"")
+            && stderr.contains("\"Model\":\"command-too-large\""),
+        "truncated system command was not logged as command-too-large; stderr:\n{stderr}"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -9140,6 +9306,7 @@ fn compat_mode_keeps_usleep_cooperative_when_guest_threads_are_runnable() {
         .arg(&fixture)
         .env("COMPATRA_PLUGIN_TRACE", "1")
         .env("COMPATRA_TRACE_FORMAT", "jsonl")
+        .env("COMPATRA_TRACE_PROFILE", "full")
         .env("COMPATRA_MAX_INSTRUCTIONS", "3000000")
         .env("COMPATRA_TIMEOUT_USECS", "5000000")
         .env("COMPATRA_DEBUG_STDOUT", "1")
@@ -9185,6 +9352,45 @@ fn compat_mode_keeps_usleep_cooperative_when_guest_threads_are_runnable() {
     assert!(
         stdout.contains("compat pthread scheduler ready=1"),
         "pthread scheduler fixture did not reach the signaling worker; stdout:\n{stdout}"
+    );
+    assert_line_with(
+        &stdout,
+        &[
+            "\"plugin\":\"runtime\"",
+            "\"Event\":\"pthread-mutex-init\"",
+            "\"Call\":\"pthread_mutex_init\"",
+            "\"Mutex\":\"0x",
+            "\"Result\":\"0\"",
+        ],
+        "structured pthread mutex init runtime event",
+    );
+    assert_line_with(
+        &stdout,
+        &[
+            "\"plugin\":\"runtime\"",
+            "\"Event\":\"pthread-mutex-lock\"",
+            "\"Call\":\"pthread_mutex_lock\"",
+            "\"Mutex\":\"0x",
+            "\"PrevOwner\":\"",
+            "\"Result\":\"0\"",
+        ],
+        "structured pthread mutex lock runtime event",
+    );
+    assert_line_with(
+        &stdout,
+        &[
+            "\"plugin\":\"runtime\"",
+            "\"Event\":\"pthread-mutex-unlock\"",
+            "\"Call\":\"pthread_mutex_unlock\"",
+            "\"Mutex\":\"0x",
+            "\"PrevOwner\":\"",
+            "\"Result\":\"0\"",
+        ],
+        "structured pthread mutex unlock runtime event",
+    );
+    assert!(
+        !stdout.contains("\"plugin\":\"procmon\""),
+        "compat pthread scheduler trace used analysis procmon plugin; stdout:\n{stdout}"
     );
 }
 
